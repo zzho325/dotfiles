@@ -24,3 +24,21 @@ lspconfig.rust_analyzer.setup({
   },
 })
 
+-- gopls
+lspconfig.gopls.setup({
+	on_attach = on_attach,
+	settings = {
+ 		gopls = {
+			gofumpt = true,
+ 			usePlaceholders = true,
+ 			staticcheck = true,
+ 		},
+ 	},
+})
+
+-- React / TypeScript / JavaScript
+lspconfig.tsserver.setup({
+	on_attach = on_attach,
+	filetypes = { "javascript", "javascriptreact", "typescript", "typescriptreact" },
+	root_dir = lspconfig.util.root_pattern("package.json", "tsconfig.json", ".git"),
+})
