@@ -1,0 +1,3 @@
+# Ignore compiled plugin cache (packer)
+**/packer_compiled.lua
+
