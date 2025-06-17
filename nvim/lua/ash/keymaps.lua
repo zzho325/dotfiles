@@ -72,11 +72,44 @@ keymap("t", "<C-k>", "<C-\\><C-N><C-w>k", term_opts)
 keymap("t", "<C-l>", "<C-\\><C-N><C-w>l", term_opts)
 
 -- LSP --
--- telescope gd
-vim.keymap.set('n', 'gd', require('telescope.builtin').lsp_definitions, opts)
 -- open float
 vim.keymap.set('n', '<leader>e', vim.diagnostic.open_float, opts) 
 -- formating
-vim.keymap.set('n', '<leader>f', function () vim.lsp.buf.format({ async = true }) end, opts)
+vim.keymap.set('n', '<leader>p', function () vim.lsp.buf.format({ async = true }) end, opts)
 -- code action for auto-import
-vim.keymap.set('n', '<leader>.', vim.lsp.buf.code_action, opts) 
+vim.keymap.set('n', '<leader>.', vim.lsp.buf.code_action, opts)
+-- yank diagnostics
+vim.keymap.set("n", "<leader>yd", function()
+	local line = vim.api.nvim_win_get_cursor(0)[1] - 1 -- zero-indexed
+	local diagnostics = vim.diagnostic.get(0, { lnum = line })
+
+	if vim.tbl_isempty(diagnostics) then
+		vim.notify(("No diagnostics on line %s"):format(line + 1), vim.log.levels.ERROR)
+    	return
+  	end
+
+  	local messages = {}
+  	for _, diag in ipairs(diagnostics) do
+    	table.insert(messages, diag.message)
+  	end
+
+	if vim.fn.setreg("+", messages) ~= 0 then
+    	vim.notify(("An error occurred while copying diagnostics from line %s"):format(line + 1))
+    	return
+  	end
+
+  	vim.notify(([[Diagnostics from line %s copied to clipboard.
+
+%s]]):format(line + 1, table.concat(messages, "\n")))
+end, opts, { desc = "Copy current line diagnostics" })
+
+-- Telescope --
+-- telescope gd
+local builtin = require("telescope.builtin")
+vim.keymap.set('n', 'gd', builtin.lsp_definitions, opts)
+vim.keymap.set('n', 'gr', builtin.lsp_references, opts)
+vim.keymap.set('n', '<leader>f', builtin.builtin, opts, { desc = "Telescope Builtins" })
+vim.keymap.set('n', '<leader>ff', builtin.find_files, opts, { desc = "Find Files" })
+vim.keymap.set('n', '<leader>fg', builtin.live_grep, opts, { desc = "Live Grep" })
+vim.keymap.set('n', '<leader>fb', builtin.buffers, opts, { desc = "Buffers" })
+vim.keymap.set('n', '<leader>fh', builtin.help_tags, opts, { desc = "Help Tags" })
