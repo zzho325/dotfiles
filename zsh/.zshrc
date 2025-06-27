@@ -26,13 +26,6 @@ for f in $XDG_CONFIG_HOME/zsh/*.nix.zsh; do
   source $f
 done
 
-# symlink ghostty config depending on OS
-if [[ "$OSTYPE" == "darwin"* ]]; then
-  ln -sf $XDG_CONFIG_HOME/ghostty/config.macos $XDG_CONFIG_HOME/ghostty/config
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-  ln -sf $XDG_CONFIG_HOME/ghostty/config.linux $XDG_CONFIG_HOME/ghostty/config
-fi
-
 eval "$(starship init zsh)"
 
 # “history-search” on up/down arrows#
