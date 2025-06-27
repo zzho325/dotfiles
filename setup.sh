@@ -24,15 +24,12 @@ echo "→ Removing legacy files…"
 [ -f ~/.bash_history ] && rm ~/.bash_history
 [ -f ~/.bash_functions ] && rm ~/.bash_functions
 [ -f ~/.bashrc ] && rm ~/.bashrc
-[ -f ~/.zsh_history ] && rm ~/.zsh_history
-[ -f ~/.viminfo ] && rm ~/.viminfo
+# [ -f ~/.zsh_history ] && rm ~/.zsh_history # if override zsh history
 [ -f ~/.zcompdump* ] && rm ~/.zcompdump*
+# unnecessary with nvim
 [ -f ~/.vim_history ] && rm ~/.vim_history
+[ -f ~/.viminfo ] && rm ~/.viminfo
 [ -f ~/.DS_Store ] && rm ~/.DS_Store
-
-# Clear Zsh compdump cache
-echo "→ Clearing Zsh compdump cache…"
-rm -f ~/.zcompdump* 2>/dev/null
 
 # Stow application configs
 if command -v stow >/dev/null; then
