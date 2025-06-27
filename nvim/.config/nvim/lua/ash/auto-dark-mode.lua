@@ -1,18 +1,23 @@
-require("gruvbox").setup({ contrast = "hard" })
+require("rose-pine").setup({
+  variant     = "auto",    -- automatically choose based on background
+  dark_variant = "moon",   -- use “moon” when background = dark
+})
 
-require('auto-dark-mode').setup({
-  -- how often to poll (in ms)
+-- apply once for initial colorscheme
+vim.cmd("colorscheme rose-pine")
+
+require("auto-dark-mode").setup({
   update_interval = 3000,
-  -- what to do when switching *to* dark
+
   set_dark_mode = function()
-    vim.opt.background = 'dark'
-	vim.cmd('colorscheme gruvbox')
+    vim.opt.background = "dark"
+    vim.cmd("colorscheme rose-pine")
   end,
-  -- what to do when switching *to* lightset_light_mode
-  set_light_mode = function() 
-	vim.opt.background = 'light'
-	vim.cmd('colorscheme gruvbox')
+
+  set_light_mode = function()
+    vim.opt.background = "light"
+    vim.cmd("colorscheme rose-pine")
   end,
-  -- fallback if detection fails
-  fallback = 'dark',
+
+  fallback = "dark",
 })

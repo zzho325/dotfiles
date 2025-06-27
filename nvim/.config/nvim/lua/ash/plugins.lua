@@ -53,7 +53,7 @@ return packer.startup(function(use)
   -- UI
   use({"ellisonleao/gruvbox.nvim"})
   use 'f-person/auto-dark-mode.nvim' -- switch light/dark to match system
-  
+  use 'rose-pine/neovim' 
 
   -- cmp plugins
   use "hrsh7th/nvim-cmp" -- The completion plugin
