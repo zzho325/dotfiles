@@ -1,0 +1,17 @@
+# CLI tools
+brew "python"
+brew "ffmpeg"
+brew "git"
+brew "wget"
+brew "tree"
+brew "stow"
+brew "fzf"
+brew "node"
+brew "bash"
+brew "neovim"
+brew "starship"
+
+#GUI apps
+cask "google-chrome"
+cask "alfred"
+cask "vlc"

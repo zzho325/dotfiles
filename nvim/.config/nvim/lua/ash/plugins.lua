@@ -38,9 +38,8 @@ packer.init {
   },
 }
 
--- Install your plugins here
 return packer.startup(function(use)
-  -- My plugins here
+  -- utilities
   use "wbthomason/packer.nvim" -- Have packer manage itself
   use "nvim-lua/popup.nvim" -- An implementation of the Popup API from vim in Neovim
   use "nvim-lua/plenary.nvim" -- Useful lua functions used ny lots of plugins
@@ -49,8 +48,12 @@ return packer.startup(function(use)
     'nvim-telescope/telescope.nvim', tag = '0.1.5',
     requires = { {'nvim-lua/plenary.nvim'} }
   }
+  use 'nvim-tree/nvim-tree.lua'
+
+  -- UI
   use({"ellisonleao/gruvbox.nvim"})
-  use 'preservim/nerdtree'
+  use 'f-person/auto-dark-mode.nvim' -- switch light/dark to match system
+  
 
   -- cmp plugins
   use "hrsh7th/nvim-cmp" -- The completion plugin

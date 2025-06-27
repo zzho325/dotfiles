@@ -1,0 +1,5 @@
+theme = dark:Monokai Soda,light:Monokai Pro Light
+macos-titlebar-style = "transparent"
+font-family = "Iosevka Term"
+background-opacity = 0.95
+window-inherit-font-size = true

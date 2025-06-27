@@ -2,7 +2,7 @@ local opts = { noremap = true, silent = true }
 local term_opts = { silent = true }
 
 -- Shorten function name
-local keymap = vim.api.nvim_set_keymap
+local keymap = vim.keymap.set
 
 -- Remap space as leader key
 keymap("", "<Space>", "<Nop>", opts)
@@ -23,8 +23,6 @@ keymap("n", "<C-h>", "<C-w>h", opts)
 keymap("n", "<C-j>", "<C-w>j", opts)
 keymap("n", "<C-k>", "<C-w>k", opts)
 keymap("n", "<C-l>", "<C-w>l", opts)
-
-keymap("n", "<leader>b", ":NERDTreeToggle<CR>", { noremap = true, silent = false })
 
 -- Resize with arrows
 keymap("n", "<C-Up>", ":resize +2<CR>", opts)
@@ -71,15 +69,19 @@ keymap("t", "<C-j>", "<C-\\><C-N><C-w>j", term_opts)
 keymap("t", "<C-k>", "<C-\\><C-N><C-w>k", term_opts)
 keymap("t", "<C-l>", "<C-\\><C-N><C-w>l", term_opts)
 
+-- Nvim-Tree --
+keymap("n", "<leader>e", ":NvimTreeToggle<CR>", opts)
+
+
 -- LSP --
--- open float
-vim.keymap.set('n', '<leader>e', vim.diagnostic.open_float, opts) 
+-- open diagnostic
+keymap('n', '<leader>d', vim.diagnostic.open_float, opts) 
 -- formating
-vim.keymap.set('n', '<leader>p', function () vim.lsp.buf.format({ async = true }) end, opts)
+keymap('n', '<leader>p', function () vim.lsp.buf.format({ async = true }) end, opts)
 -- code action for auto-import
-vim.keymap.set('n', '<leader>.', vim.lsp.buf.code_action, opts)
+keymap('n', '<leader>.', vim.lsp.buf.code_action, opts)
 -- yank diagnostics
-vim.keymap.set("n", "<leader>yd", function()
+keymap("n", "<leader>yd", function()
 	local line = vim.api.nvim_win_get_cursor(0)[1] - 1 -- zero-indexed
 	local diagnostics = vim.diagnostic.get(0, { lnum = line })
 
@@ -106,10 +108,10 @@ end, opts, { desc = "Copy current line diagnostics" })
 -- Telescope --
 -- telescope gd
 local builtin = require("telescope.builtin")
-vim.keymap.set('n', 'gd', builtin.lsp_definitions, opts)
-vim.keymap.set('n', 'gr', builtin.lsp_references, opts)
-vim.keymap.set('n', '<leader>f', builtin.builtin, opts, { desc = "Telescope Builtins" })
-vim.keymap.set('n', '<leader>ff', builtin.find_files, opts, { desc = "Find Files" })
-vim.keymap.set('n', '<leader>fg', builtin.live_grep, opts, { desc = "Live Grep" })
-vim.keymap.set('n', '<leader>fb', builtin.buffers, opts, { desc = "Buffers" })
-vim.keymap.set('n', '<leader>fh', builtin.help_tags, opts, { desc = "Help Tags" })
+keymap('n', 'gd', builtin.lsp_definitions, opts)
+keymap('n', 'gr', builtin.lsp_references, opts)
+keymap('n', '<leader>f', builtin.builtin, opts, { desc = "Telescope Builtins" })
+keymap('n', '<leader>ff', builtin.find_files, opts, { desc = "Find Files" })
+keymap('n', '<leader>fg', builtin.live_grep, opts, { desc = "Live Grep" })
+keymap('n', '<leader>fb', builtin.buffers, opts, { desc = "Buffers" })
+keymap('n', '<leader>fh', builtin.help_tags, opts, { desc = "Help Tags" })

@@ -1,0 +1,80 @@
+mkdir .config 
+cd .config
+mkdir zsh
+cd zsh
+vi fzf_completion.nix.zsh
+vi fzf_keybindings.nix.zsh
+la
+ll
+ls
+which sh
+mkdir starship
+mkdir -p starship/.config
+vi starship/.config/starship.toml
+sudo sh setup.sh
+zsh
+startship
+cat .zshrc
+brew install starship
+pwg
+nvim setup/Brewfile
+ls ~/.config/
+nvim ghostty
+nvim setup.sh
+ls ghostty/
+ll ghostty/
+ls -a ghostty
+fdf
+echo $XDG_CONFIG_HOME
+cat $HOME/Library/Application\ Support/com.mitchellh.ghostty/config.
+vi $HOME/Library/Application\ Support/com.mitchellh.ghostty/config
+echo $HOME/Library/Application\ Support/com.mitchellh.ghostty/config.
+ cat ~/.config/ghostty/config
+vi ghostty/.config/ghostty
+vi ghostty/.config/ghostty/config
+vi setup.sh
+nvim dotfiles/ghostty/.config/ghostty/config
+test
+pwd
+starship explain
+conda config --set changeps1 False
+cd 
+sh setup
+cd .docker
+cd ~/dotfiles
+lazygit
+sh setup.s
+nvim ghostty/.config/ghostty/config.macos
+cat .config/ghostty/config
+nvim dotfiles/ghostty/.config/ghostty/config.macos
+ghostty +show-config --default --docs | grep ^window-inherit-font-size\
+window-inherit-font-size = true
+ghostty +list-themes
+ssh devbox
+exe zsh
+cat .zshrc 
+cd dotfiles
+sh setup.sh
+nvim dotfiles/zsh/.zshrc
+sh test
+sh tet
+cddfasd
+source .zshrc
+nvim zsh/.zshrc
+source ~/.zshrc
+autoload -U up-line-or-beginning-search
+zle -N up-line-or-beginning-search
+source ~/.zshrccat
+cat 
+bindkey | grep '\^[[A'
+bindkey '^[[A' up-line-or-beginning-search\
+bindkey '^[[B' down-line-or-beginning-search
+bindkey "${terminfo[kcuu1]}" up-line-or-beginning-search
+echo -n "${terminfo[kcuu1]}" | cat -v
+echo $TERM
+nvim
+: 1751013303:0;lazygit
+: 1751013309:0;nvim setup
+: 1751013312:0;nvim setup.up
+: 1751013317:0;nvim setup.sh
+: 1751013390:0;lazygit
