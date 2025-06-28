@@ -1,4 +1,4 @@
-theme = dark:Monokai Soda,light:Monokai Pro Light
+theme = dark:rose-pine,light:rose-pine-dawn
 macos-titlebar-style = transparent
 macos-titlebar-proxy-icon = hidden
 font-family = "Iosevka Term"
