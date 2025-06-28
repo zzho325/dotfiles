@@ -75,9 +75,9 @@ keymap("n", "<leader>e", ":NvimTreeToggle<CR>", opts)
 
 -- LSP --
 -- open diagnostic
-keymap('n', '<leader>d', vim.diagnostic.open_float, opts) 
+keymap('n', '<leader>d', vim.diagnostic.open_float, opts)
 -- formating
-keymap('n', '<leader>p', function () vim.lsp.buf.format({ async = true }) end, opts)
+keymap('n', '<leader>p', function() vim.lsp.buf.format({ async = true }) end, opts)
 -- code action for auto-import
 keymap('n', '<leader>.', vim.lsp.buf.code_action, opts)
 -- yank diagnostics
@@ -87,20 +87,20 @@ keymap("n", "<leader>yd", function()
 
 	if vim.tbl_isempty(diagnostics) then
 		vim.notify(("No diagnostics on line %s"):format(line + 1), vim.log.levels.ERROR)
-    	return
-  	end
+		return
+	end
 
-  	local messages = {}
-  	for _, diag in ipairs(diagnostics) do
-    	table.insert(messages, diag.message)
-  	end
+	local messages = {}
+	for _, diag in ipairs(diagnostics) do
+		table.insert(messages, diag.message)
+	end
 
 	if vim.fn.setreg("+", messages) ~= 0 then
-    	vim.notify(("An error occurred while copying diagnostics from line %s"):format(line + 1))
-    	return
-  	end
+		vim.notify(("An error occurred while copying diagnostics from line %s"):format(line + 1))
+		return
+	end
 
-  	vim.notify(([[Diagnostics from line %s copied to clipboard.
+	vim.notify(([[Diagnostics from line %s copied to clipboard.
 
 %s]]):format(line + 1, table.concat(messages, "\n")))
 end, opts, { desc = "Copy current line diagnostics" })
