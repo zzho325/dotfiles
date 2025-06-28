@@ -14,7 +14,7 @@ export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border'
 eval "$(direnv hook zsh)"
 
 export PATH="$HOME/go/bin:$PATH"
-# export HISTFILE="$XDG_CONFIG_HOME/zsh/history.zsh_history"
+export HISTFILE="$XDG_CONFIG_HOME/zsh/.zsh_history"
 export HISTSIZE=999999999
 export SAVEHIST=$HISTSIZE
 setopt share_history          # share across all running shells

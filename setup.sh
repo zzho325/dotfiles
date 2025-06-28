@@ -24,7 +24,7 @@ echo "→ Removing legacy files…"
 [ -f ~/.bash_history ] && rm ~/.bash_history
 [ -f ~/.bash_functions ] && rm ~/.bash_functions
 [ -f ~/.bashrc ] && rm ~/.bashrc
-# [ -f ~/.zsh_history ] && rm ~/.zsh_history # if override zsh history
+[ -f ~/.zsh_history ] && rm ~/.zsh_history # if override zsh history
 [ -f ~/.zcompdump* ] && rm ~/.zcompdump*
 # unnecessary with nvim
 [ -f ~/.vim_history ] && rm ~/.vim_history
@@ -35,7 +35,7 @@ echo "→ Removing legacy files…"
 if command -v stow >/dev/null; then
   cd "$HOME/dotfiles"
   stow --adopt zsh nvim starship ghostty --target="$HOME"
-  stow zsh nvim starship ghostty --target="$HOME"
+  stow zsh nvim starship ghostty --target="$HOME" --no-folding
   echo "✔ Stowed all dotfiles into $HOME"
 else
   echo "⚠ stow not installed; skipping config stow"
