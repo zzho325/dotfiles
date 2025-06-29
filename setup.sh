@@ -34,8 +34,7 @@ echo "→ Removing legacy files…"
 # Stow application configs
 if command -v stow >/dev/null; then
   cd "$HOME/dotfiles"
-  stow --adopt zsh nvim starship ghostty --target="$HOME"
-  stow zsh nvim starship ghostty --target="$HOME" --no-folding
+  stow --adopt --no-folding zsh nvim starship ghostty --target="$HOME"
   echo "✔ Stowed all dotfiles into $HOME"
 else
   echo "⚠ stow not installed; skipping config stow"
