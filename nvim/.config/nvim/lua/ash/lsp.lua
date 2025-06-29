@@ -1,4 +1,4 @@
-local lspconfig = require('lspconfig')
+local lspconfig = require("lspconfig")
 
 local on_attach = function(client, bufnr)
 	-- format on save
@@ -43,9 +43,25 @@ lspconfig.ts_ls.setup({
 	root_dir = lspconfig.util.root_pattern("package.json", "tsconfig.json", ".git"),
 })
 
+-- Eslint
+lspconfig.eslint.setup({
+	on_attach = on_attach,
+	filetypes = { "javascript", "javascriptreact", "typescript", "typescriptreact" },
+	settings = {
+		eslint = { workingDirectory = { mode = "auto" }, format = { enable = true } },
+	},
+	root_dir = require("lspconfig.util").root_pattern(
+		".eslintrc.js", ".eslintrc.json", ".eslintignore", "package.json", ".git"
+	),
+})
+
 -- lua
 lspconfig.lua_ls.setup({
 	on_attach = on_attach,
+	root_dir = function(fname)
+		return require("lspconfig.util").root_pattern("lua")(fname)
+			or require("lspconfig.util").root_pattern(".git")(fname)
+	end,
 	settings = {
 		Lua = {
 			format = {

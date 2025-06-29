@@ -74,14 +74,14 @@ keymap("n", "<leader>e", ":NvimTreeToggle<CR>", opts)
 
 
 -- LSP --
--- open diagnostic
-keymap('n', '<leader>d', vim.diagnostic.open_float, opts)
 -- formating
 keymap('n', '<leader>p', function() vim.lsp.buf.format({ async = true }) end, opts)
 -- code action for auto-import
 keymap('n', '<leader>.', vim.lsp.buf.code_action, opts)
+-- open diagnostics float
+keymap('n', '<leader>d', vim.diagnostic.open_float, opts)
 -- yank diagnostics
-keymap("n", "<leader>yd", function()
+keymap("n", "<leader>dy", function()
 	local line = vim.api.nvim_win_get_cursor(0)[1] - 1 -- zero-indexed
 	local diagnostics = vim.diagnostic.get(0, { lnum = line })
 
@@ -103,15 +103,17 @@ keymap("n", "<leader>yd", function()
 	vim.notify(([[Diagnostics from line %s copied to clipboard.
 
 %s]]):format(line + 1, table.concat(messages, "\n")))
-end, opts, { desc = "Copy current line diagnostics" })
+end, vim.tbl_extend("force", opts, {
+	desc = "Copy current line diagnostics to system clipboard"
+}))
 
 -- Telescope --
 -- telescope gd
-local builtin = require("telescope.builtin")
-keymap('n', 'gd', builtin.lsp_definitions, opts)
-keymap('n', 'gr', builtin.lsp_references, opts)
-keymap('n', '<leader>f', builtin.builtin, opts, { desc = "Telescope Builtins" })
-keymap('n', '<leader>ff', builtin.find_files, opts, { desc = "Find Files" })
-keymap('n', '<leader>fg', builtin.live_grep, opts, { desc = "Live Grep" })
-keymap('n', '<leader>fb', builtin.buffers, opts, { desc = "Buffers" })
-keymap('n', '<leader>fh', builtin.help_tags, opts, { desc = "Help Tags" })
+local fzf = require("fzf-lua")
+keymap("n", "gd", fzf.lsp_definitions, { desc = "fzf go-to-def" })
+keymap("n", "gr", fzf.lsp_references, { desc = "fzf find-refs" })
+keymap("n", "<leader>f", fzf.builtin, { desc = "fzf buildin" })
+keymap("n", "<leader>ff", fzf.files, { desc = "fzf files" })
+keymap("n", "<leader>fg", fzf.live_grep_glob, { desc = "fzf live-grep-glob" })
+keymap("n", "<leader>fb", fzf.buffers, { desc = "fzf buffers" })
+keymap("n", "<leader>fh", fzf.help_tags, { desc = "fzf help" })

@@ -45,11 +45,8 @@ return packer.startup(function(use)
 	use "nvim-lua/plenary.nvim" -- Useful lua functions used ny lots of plugins
 	use "tpope/vim-sensible"
 	use "tpope/vim-fugitive"  -- Git
-	use {
-		'nvim-telescope/telescope.nvim', tag = '0.1.5',
-		requires = { { 'nvim-lua/plenary.nvim' } }
-	}
 	use 'nvim-tree/nvim-tree.lua'
+	use 'ibhagwan/fzf-lua'
 
 	-- UI
 	use({ "ellisonleao/gruvbox.nvim" })
@@ -75,7 +72,6 @@ return packer.startup(function(use)
 			require("mason").setup()
 		end,
 	})
-
 	use({
 		"mason-org/mason-lspconfig.nvim",
 		after = "mason.nvim",
