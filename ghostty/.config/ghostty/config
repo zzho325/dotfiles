@@ -5,3 +5,5 @@ font-family = "Iosevka Term"
 background-opacity = 0.95
 window-inherit-font-size = true
 confirm-close-surface = false
+clipboard-read = allow
+clipboard-write = allow

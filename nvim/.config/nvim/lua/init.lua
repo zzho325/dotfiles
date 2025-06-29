@@ -1,3 +1,4 @@
+require "ash.clipboard"
 require "ash.options"
 require "ash.keymaps"
 require "ash.plugins"
