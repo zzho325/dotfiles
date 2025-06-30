@@ -45,6 +45,7 @@ return packer.startup(function(use)
 	use "nvim-lua/plenary.nvim" -- Useful lua functions used ny lots of plugins
 	use "tpope/vim-sensible"
 	use "tpope/vim-fugitive"  -- Git
+	use "tpope/vim-rhubarb"   -- Github
 	use 'nvim-tree/nvim-tree.lua'
 	use 'ibhagwan/fzf-lua'
 
