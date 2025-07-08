@@ -10,9 +10,27 @@ local on_attach = function(client, bufnr)
 	})
 end
 
+local cmp_nvim_lsp_ok, cmp_nvim_lsp = pcall(require, "cmp_nvim_lsp")
+if not cmp_nvim_lsp_ok then
+	return
+end
+
+local capabilities = vim.lsp.protocol.make_client_capabilities()
+capabilities = cmp_nvim_lsp.default_capabilities(capabilities)
+
+local lsp_defaults = {
+	on_attach = on_attach,
+	capabilities = capabilities,
+}
+
+lspconfig.util.default_config = vim.tbl_deep_extend(
+  'force',
+  lspconfig.util.default_config,
+  lsp_defaults
+)
+
 -- rust-analyzer
 lspconfig.rust_analyzer.setup({
-	on_attach = on_attach,
 	settings = {
 		["rust-analyzer"] = {
 			cargo = { allFeatures = true },
@@ -26,7 +44,6 @@ lspconfig.rust_analyzer.setup({
 
 -- gopls
 lspconfig.gopls.setup({
-	on_attach = on_attach,
 	settings = {
 		gopls = {
 			gofumpt = true,
@@ -38,14 +55,12 @@ lspconfig.gopls.setup({
 
 -- React / TypeScript / JavaScript
 lspconfig.ts_ls.setup({
-	on_attach = on_attach,
 	filetypes = { "javascript", "javascriptreact", "typescript", "typescriptreact" },
 	root_dir = lspconfig.util.root_pattern("package.json", "tsconfig.json", ".git"),
 })
 
 -- Eslint
 lspconfig.eslint.setup({
-	on_attach = on_attach,
 	filetypes = { "javascript", "javascriptreact", "typescript", "typescriptreact" },
 	settings = {
 		eslint = { workingDirectory = { mode = "auto" }, format = { enable = true } },
@@ -57,7 +72,6 @@ lspconfig.eslint.setup({
 
 -- lua
 lspconfig.lua_ls.setup({
-	on_attach = on_attach,
 	root_dir = function(fname)
 		return require("lspconfig.util").root_pattern("lua")(fname)
 			or require("lspconfig.util").root_pattern(".git")(fname)
