@@ -44,12 +44,6 @@ keymap("v", "<", "<gv", opts)
 keymap("v", ">", ">gv", opts)
 
 -- Move text up and down
--- nnoremap <A-j> :m .+1<CR>==
--- nnoremap <A-k> :m .-2<CR>==
--- inoremap <A-j> <Esc>:m .+1<CR>==gi
--- inoremap <A-k> <Esc>:m .-2<CR>==gi
--- vnoremap <A-j> :m '>+1<CR>gv=gv
--- vnoremap <A-k> :m '<-2<CR>gv=gv
 keymap("n", "<A-j>", ":m .+1<CR>==", opts)
 keymap("n", "<A-k>", ":m .-2<CR>==", opts)
 keymap("i", "<A-j>", "<Esc>:m .+1<CR>==gi", opts)
@@ -59,8 +53,6 @@ keymap("v", "<A-k>", ":m '<-2<CR>gv=gv", opts)
 keymap("v", "p", '"_dP', opts)
 keymap("x", "<A-j>", ":move '>+1<CR>gv-gv", opts)
 keymap("x", "<A-k>", ":move '<-2<CR>gv-gv", opts)
--- keymap("x", "J", ":move '>+1<CR>gv-gv", opts)
--- keymap("x", "K", ":move '<-2<CR>gv-gv", opts)
 
 -- Terminal --
 -- Better terminal navigation
@@ -71,7 +63,7 @@ keymap("t", "<C-l>", "<C-\\><C-N><C-w>l", term_opts)
 
 -- Nvim-Tree --
 keymap("n", "<leader>e", ":NvimTreeToggle<CR>", opts)
-
+keymap("n", "<leader>ef", ":NvimTreeFindFile<CR>", opts)
 
 -- LSP --
 -- formating
@@ -116,6 +108,71 @@ if ok then
 	keymap("n", "<leader>f", fzf.builtin, { desc = "fzf buildin" })
 	keymap("n", "<leader>ff", fzf.files, { desc = "fzf files" })
 	keymap("n", "<leader>fg", fzf.live_grep_glob, { desc = "fzf live-grep-glob" })
+	keymap("n", "<leader>fo", fzf.oldfiles, { desc = "fzf oldfiles" })
 	keymap("n", "<leader>fb", fzf.buffers, { desc = "fzf buffers" })
 	keymap("n", "<leader>fh", fzf.help_tags, { desc = "fzf help" })
 end
+
+-- Github --
+function OpenGithubUrl()
+	-- Get absolute file path
+	local cur_file_path = vim.fn.expand('%:p')
+
+	-- Get git repo root
+	local git_root = vim.fn.systemlist('git rev-parse --show-toplevel')[1]
+	if not git_root or git_root == '' then
+		print("Not inside a Git repository")
+		return
+	end
+	local rel_path = cur_file_path:sub(#git_root + 2)
+
+	local origin_url = vim.fn.systemlist('git remote get-url origin')[1] or ''
+	local user_repo = origin_url:match("github%.com/(.+)")
+	if not user_repo then
+		vim.notify("Unable to determine GitHub repository from remote origin", vim.log.levels.ERROR)
+		return
+	end
+
+	-- Get the default branch from local refs
+	local head_ref = vim.fn.systemlist('git symbolic-ref refs/remotes/origin/HEAD')[1]
+	local default_branch = head_ref and head_ref:match("refs/remotes/origin/(.+)") or 'master'
+
+	local start_line = vim.fn.line('v')
+	local end_line = vim.fn.line('.')
+	if start_line > end_line then
+		start_line, end_line = end_line, start_line
+	end
+	local linenum_str = string.format('#L%d-L%d', start_line, end_line)
+
+	-- Final URL
+	local url = string.format('%s/blob/%s/%s%s', 'https://github.com/' .. user_repo, default_branch, rel_path,
+		linenum_str)
+	-- Open URL
+	vim.fn.system('open "' .. url .. '"')
+end
+
+function OpenCommitFromBlame()
+	local line_number = vim.fn.line('.')
+	local file_path = vim.fn.expand('%:p')
+
+	local blame_output = vim.fn.system('git blame -L ' .. line_number .. ',' .. line_number .. ' ' .. file_path)
+	local commit_hash = string.match(blame_output, '^[^%s]+')
+
+	if not commit_hash or commit_hash == '' then
+		vim.notify("Could not determine commit hash from git blame", vim.log.levels.ERROR)
+		return
+	end
+
+	local origin_url = vim.fn.systemlist('git remote get-url origin')[1] or ''
+	local user_repo = origin_url:match("github%.com/(.+)")
+	if not user_repo then
+		vim.notify("Unable to determine GitHub repository from remote origin", vim.log.levels.ERROR)
+		return
+	end
+
+	local url = 'https://github.com/' .. user_repo .. '/commit/' .. commit_hash
+	vim.fn.system('open "' .. url .. '"')
+end
+
+keymap('n', '<leader>b', ':lua OpenGithubUrl()<CR>', opts)
+keymap('n', '<leader>c', ':lua OpenCommitFromBlame()<CR>', opts)
