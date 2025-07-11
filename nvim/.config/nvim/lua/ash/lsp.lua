@@ -24,9 +24,9 @@ local lsp_defaults = {
 }
 
 lspconfig.util.default_config = vim.tbl_deep_extend(
-  'force',
-  lspconfig.util.default_config,
-  lsp_defaults
+	'force',
+	lspconfig.util.default_config,
+	lsp_defaults
 )
 
 -- rust-analyzer

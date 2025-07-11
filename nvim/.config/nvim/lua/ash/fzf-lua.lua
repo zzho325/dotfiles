@@ -17,4 +17,12 @@ require("fzf-lua").setup({
 		-- keep pointer (the bar) bold/bright
 		["pointer"] = { "fg", "Conditional" },
 	},
+	files = {
+		git_icons = true,
+		formatter = "path.filename_first",
+	},
+	grep = {
+		git_icons = true,
+		formatter = "path.filename_first",
+	}
 })
