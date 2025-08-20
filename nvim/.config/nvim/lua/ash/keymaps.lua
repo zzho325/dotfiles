@@ -54,6 +54,17 @@ keymap("v", "p", '"_dP', opts)
 keymap("x", "<A-j>", ":move '>+1<CR>gv-gv", opts)
 keymap("x", "<A-k>", ":move '<-2<CR>gv-gv", opts)
 
+-- Clipboard --
+-- Yank to system clipboard
+keymap("n", "<leader>y", '"+y', opts)
+keymap("v", "<leader>y", '"+y', opts)
+
+-- Paste from system clipboard
+keymap("n", "<leader>p", '"+p', opts)
+keymap("n", "<leader>P", '"+P', opts)
+keymap("v", "<leader>p", '"+p', opts)
+keymap("v", "<leader>P", '"+P', opts)
+
 -- Terminal --
 -- Better terminal navigation
 keymap("t", "<C-h>", "<C-\\><C-N><C-w>h", term_opts)
@@ -67,7 +78,7 @@ keymap("n", "<leader>ef", ":NvimTreeFindFile<CR>", opts)
 
 -- LSP --
 -- formating
-keymap('n', '<leader>p', function() vim.lsp.buf.format({ async = true }) end, opts)
+keymap('n', '<leader>fm', function() vim.lsp.buf.format({ async = true }) end, opts)
 -- code action for auto-import
 keymap('n', '<leader>.', vim.lsp.buf.code_action, opts)
 -- open diagnostics float
