@@ -10,3 +10,12 @@
         editor = nvim
 [stash]
         showIncludeUntracked = true
+
+[alias]
+  webdiff = "!f() { \
+    if git diff --quiet \"$@\"; then echo 'No changes.'; exit 0; fi; \
+    tmp=\"${TMPDIR:-/tmp}/git-diff-$(date +%s).html\"; \
+    runner='npx --yes'; command -v pnpm >/dev/null && runner='pnpm dlx'; \
+    git diff \"$@\" | $runner diff2html-cli -i stdin -s side -F \"$tmp\" && \
+    ( command -v xdg-open >/dev/null && xdg-open \"$tmp\" ) || open \"$tmp\"; \
+  }; f"

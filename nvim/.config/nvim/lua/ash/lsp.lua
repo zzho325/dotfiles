@@ -63,11 +63,20 @@ lspconfig.ts_ls.setup({
 lspconfig.eslint.setup({
 	filetypes = { "javascript", "javascriptreact", "typescript", "typescriptreact" },
 	settings = {
-		eslint = { workingDirectory = { mode = "auto" }, format = { enable = true } },
+		eslint = { workingDirectory = { mode = "auto" }, format = { enable = false } },
 	},
 	root_dir = require("lspconfig.util").root_pattern(
 		".eslintrc.js", ".eslintrc.json", ".eslintignore", "package.json", ".git"
 	),
+})
+
+vim.api.nvim_create_autocmd("FileType", {
+	pattern = { "javascript", "typescript", "javascriptreact", "typescriptreact" },
+	callback = function()
+		vim.bo.shiftwidth = 2
+		vim.bo.tabstop    = 2
+		vim.bo.expandtab  = true
+	end,
 })
 
 -- lua

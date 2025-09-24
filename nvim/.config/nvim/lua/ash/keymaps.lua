@@ -77,6 +77,7 @@ keymap("n", "<leader>e", ":NvimTreeToggle<CR>", opts)
 keymap("n", "<leader>ef", ":NvimTreeFindFile<CR>", opts)
 
 -- LSP --
+keymap('n', 'gi', vim.lsp.buf.implementation, { desc = 'go-to-implementation' })
 -- formating
 keymap('n', '<leader>fm', function() vim.lsp.buf.format({ async = true }) end, opts)
 -- code action for auto-import

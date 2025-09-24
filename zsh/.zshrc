@@ -72,3 +72,8 @@ if [ -f '/Users/ashley.zhou/google-cloud-sdk/path.zsh.inc' ]; then . '/Users/ash
 if [ -f '/Users/ashley.zhou/google-cloud-sdk/completion.zsh.inc' ]; then . '/Users/ashley.zhou/google-cloud-sdk/completion.zsh.inc'; fi
 export PATH="$HOME/google-cloud-sdk/bin:$PATH"
 # <<< Google Cloud >>>
+#
+#
+#
+# <<< OPEN_CODE >>>
+export NODE_TLS_REJECT_UNAUTHORIZED=0
