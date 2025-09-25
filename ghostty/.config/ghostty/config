@@ -1,4 +1,4 @@
-theme = dark:rose-pine,light:rose-pine-dawn
+theme = dark:Rose Pine,light:Rose Pine Dawn
 macos-titlebar-style = transparent
 macos-titlebar-proxy-icon = hidden
 font-family = "Iosevka Term"
