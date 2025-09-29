@@ -1,5 +1,6 @@
 theme = dark:Rose Pine,light:Rose Pine Dawn
-macos-titlebar-style = transparent
+# macos-titlebar-style = transparent
+macos-titlebar-style = hidden
 macos-titlebar-proxy-icon = hidden
 font-family = "Iosevka Term"
 background-opacity = 0.95
