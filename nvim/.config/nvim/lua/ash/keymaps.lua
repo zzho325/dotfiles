@@ -139,7 +139,9 @@ function OpenGithubUrl()
 	local rel_path = cur_file_path:sub(#git_root + 2)
 
 	local origin_url = vim.fn.systemlist('git remote get-url origin')[1] or ''
-	local user_repo = origin_url:match("github%.com/(.+)")
+	local user_repo =
+		origin_url:match("github%.com[:/](.+)%.git") or
+		origin_url:match("github%.com[:/](.+)")
 	if not user_repo then
 		vim.notify("Unable to determine GitHub repository from remote origin", vim.log.levels.ERROR)
 		return
@@ -176,7 +178,9 @@ function OpenCommitFromBlame()
 	end
 
 	local origin_url = vim.fn.systemlist('git remote get-url origin')[1] or ''
-	local user_repo = origin_url:match("github%.com/(.+)")
+	local user_repo =
+		origin_url:match("github%.com[:/](.+)%.git") or
+		origin_url:match("github%.com[:/](.+)")
 	if not user_repo then
 		vim.notify("Unable to determine GitHub repository from remote origin", vim.log.levels.ERROR)
 		return

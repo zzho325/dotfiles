@@ -77,3 +77,8 @@ export PATH="$HOME/google-cloud-sdk/bin:$PATH"
 #
 # <<< OPEN_CODE >>>
 export NODE_TLS_REJECT_UNAUTHORIZED=0
+
+# local
+if [[ -r "$HOME/.zsh_local" ]]; then
+  source "$HOME/.zsh_local"
+fi
