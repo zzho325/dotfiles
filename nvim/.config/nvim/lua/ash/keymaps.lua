@@ -78,6 +78,7 @@ keymap("n", "<leader>ef", ":NvimTreeFindFile<CR>", opts)
 
 -- LSP --
 keymap('n', 'gi', vim.lsp.buf.implementation, { desc = 'go-to-implementation' })
+keymap("i", "<C-h>", vim.lsp.buf.signature_help)
 -- formating
 keymap('n', '<leader>fm', function() vim.lsp.buf.format({ async = true }) end, opts)
 -- code action for auto-import
@@ -139,7 +140,9 @@ function OpenGithubUrl()
 	local rel_path = cur_file_path:sub(#git_root + 2)
 
 	local origin_url = vim.fn.systemlist('git remote get-url origin')[1] or ''
-	local user_repo = origin_url:match("github%.com/(.+)")
+	local user_repo =
+		origin_url:match("github%.com[:/](.+)%.git") or
+		origin_url:match("github%.com[:/](.+)")
 	if not user_repo then
 		vim.notify("Unable to determine GitHub repository from remote origin", vim.log.levels.ERROR)
 		return
@@ -176,7 +179,9 @@ function OpenCommitFromBlame()
 	end
 
 	local origin_url = vim.fn.systemlist('git remote get-url origin')[1] or ''
-	local user_repo = origin_url:match("github%.com/(.+)")
+	local user_repo =
+		origin_url:match("github%.com[:/](.+)%.git") or
+		origin_url:match("github%.com[:/](.+)")
 	if not user_repo then
 		vim.notify("Unable to determine GitHub repository from remote origin", vim.log.levels.ERROR)
 		return

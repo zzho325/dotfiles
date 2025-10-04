@@ -3,10 +3,10 @@ require "ash.options"
 require "ash.keymaps"
 require "ash.plugins"
 require "ash.cmp"
-require "ash.lsp"
 require "ash.auto-dark-mode"
 require "ash.nvim-tree"
 require "ash.fzf-lua"
+require("ash.lsp").setup()
 
 -- project level override
 local proj_cfg = vim.fn.getcwd() .. "/.nvim.lua"
