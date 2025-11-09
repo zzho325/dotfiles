@@ -58,6 +58,10 @@ keymap("x", "<A-k>", ":move '<-2<CR>gv-gv", opts)
 -- Yank to system clipboard
 keymap("n", "<leader>y", '"+y', opts)
 keymap("v", "<leader>y", '"+y', opts)
+keymap( 'v', '<Leader>cp',
+  [[:<C-u>let @+ = expand('%:.') . '(' . line("'<") . '-' . line("'>") . ')' <CR>:echo "Path with lines copied!"<CR>]],
+  opts
+)
 
 -- Paste from system clipboard
 keymap("n", "<leader>p", '"+p', opts)
