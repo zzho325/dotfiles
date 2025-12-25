@@ -124,7 +124,7 @@ if ok then
 	keymap("n", "gr", fzf.lsp_references, { desc = "fzf find-refs" })
 	keymap("n", "<leader>f", fzf.builtin, { desc = "fzf buildin" })
 	keymap("n", "<leader>ff", fzf.files, { desc = "fzf files" })
-	keymap("n", "<leader>fg", fzf.live_grep_glob, { desc = "fzf live-grep-glob" })
+	keymap("n", "<leader>fg", fzf.live_grep, { desc = "fzf live-grep-glob" })
 	keymap("n", "<leader>fo", fzf.oldfiles, { desc = "fzf oldfiles" })
 	keymap("n", "<leader>fb", fzf.buffers, { desc = "fzf buffers" })
 	keymap("n", "<leader>fh", fzf.help_tags, { desc = "fzf help" })
