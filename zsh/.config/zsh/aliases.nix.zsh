@@ -16,3 +16,4 @@ alias wget='wget --hsts-file="$XDG_CACHE_HOME/wget-hsts" --show-progress'
 alias lg='lazygit'
 alias tmux-copy="wl-copy"
 alias nv='cd $HOME/.config/nvim && nvim'
+alias ck='~/cookie/target/debug/cookie'
