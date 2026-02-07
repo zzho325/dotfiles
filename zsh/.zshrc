@@ -52,31 +52,8 @@ autoload edit-command-line
 zle -N edit-command-line
 bindkey "^X^E" edit-command-line
 
-# >>> conda initialize >>>
-__conda_setup="$('/Users/ashley.zhou/miniconda3/bin/conda' 'shell.zsh' 'hook' 2> /dev/null)"
-if [ $? -eq 0 ]; then
-    eval "$__conda_setup"
-else
-    if [ -f "/Users/ashley.zhou/miniconda3/etc/profile.d/conda.sh" ]; then
-        . "/Users/ashley.zhou/miniconda3/etc/profile.d/conda.sh"
-    else
-        export PATH="/Users/ashley.zhou/miniconda3/bin:$PATH"
-    fi
-fi
-unset __conda_setup
-# <<< conda initialize <<<
-
-# >>> Google Cloud >>>
-if [ -f '/Users/ashley.zhou/google-cloud-sdk/path.zsh.inc' ]; then . '/Users/ashley.zhou/google-cloud-sdk/path.zsh.inc'; fi
-
-if [ -f '/Users/ashley.zhou/google-cloud-sdk/completion.zsh.inc' ]; then . '/Users/ashley.zhou/google-cloud-sdk/completion.zsh.inc'; fi
-export PATH="$HOME/google-cloud-sdk/bin:$PATH"
-# <<< Google Cloud >>>
-#
-#
-#
-# <<< OPEN_CODE >>>
-export NODE_TLS_REJECT_UNAUTHORIZED=0
+# wt
+if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)"; fi
 
 # local
 if [[ -r "$HOME/.zsh_local" ]]; then

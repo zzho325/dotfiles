@@ -34,7 +34,7 @@ echo "→ Removing legacy files…"
 # Stow application configs
 if command -v stow >/dev/null; then
   cd "$HOME/dotfiles"
-  stow --adopt --no-folding zsh nvim git starship ghostty zellij --target="$HOME"
+  stow --adopt --no-folding zsh nvim git starship ghostty zellij tmux worktrunk --target="$HOME"
   echo "✔ Stowed all dotfiles into $HOME"
 else
   echo "⚠ stow not installed; skipping config stow"
