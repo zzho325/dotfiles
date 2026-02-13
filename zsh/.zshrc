@@ -27,8 +27,9 @@ for f in $XDG_CONFIG_HOME/zsh/*.nix.zsh; do
   source $f
 done
 
-# set to beam cursor
-print -n "\e[6 q"
+# set to beam cursor before each prompt
+precmd_set_beam_cursor() { print -n "\e[6 q" }
+precmd_functions+=(precmd_set_beam_cursor)
 
 bindkey -e
 
@@ -59,3 +60,4 @@ if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)
 if [[ -r "$HOME/.zsh_local" ]]; then
   source "$HOME/.zsh_local"
 fi
+export PATH="$HOME/bin:$PATH"
