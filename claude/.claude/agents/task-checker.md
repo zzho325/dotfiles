@@ -51,7 +51,9 @@ Analyze:
 
 ### 3. Send unresolved feedback to the worker
 
-If you find unresolved review comments that the worker hasn't addressed yet, send them directly to the worker's tmux session:
+First check `tmux list-clients -t <session>`. If a client is attached, the user is in the session — **do not send keys**. Just include the feedback in your status report.
+
+If no client is attached and you find unresolved review comments, send them to the worker:
 
 ```bash
 tmux send-keys -t "<session>" -l "There are unresolved PR review comments you need to address:
@@ -70,11 +72,12 @@ tmux send-keys -t "<session>" Enter
 
 Your output should be a concise report with:
 
+- **User attached**: whether a client is attached (user is actively working with this worker)
 - **Worker activity**: what the worker is currently doing (from tmux pane)
 - **PR state**: open/closed/merged, CI status, mergeability (if PR exists)
 - **Review status**: unresolved comments, whether fixes address feedback (if PR exists)
 - **Action taken**: whether you sent review feedback to the worker
-- **Recommended action**: what the orchestrator should do next (e.g. "worker is active, no action needed", "worker appears stuck, may need restart", "sent review feedback to worker, waiting for fixes")
+- **Recommended action**: what the orchestrator should record (e.g. "worker is active, no action needed", "worker appears stuck — flag for user", "sent review feedback to worker, waiting for fixes")
 
 ## Rules
 
