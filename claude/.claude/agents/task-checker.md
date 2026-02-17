@@ -83,5 +83,7 @@ Your output should be a concise report with:
 
 - **Never modify task files.** Never spawn workers. Task files are the orchestrator's domain.
 - **Do send review feedback** directly to workers via tmux when there are unresolved comments.
+- **Never send Enter, approve prompts, or "unstick" a worker.** If the worker is stuck, report it — don't interact with its session beyond relaying review feedback.
+- **Never instruct a worker to commit, push, or create a PR.**
 - **Be concise.** The orchestrator reads many of these reports — keep them short and actionable.
 - **Be specific.** Quote relevant lines from review comments. Don't paraphrase — the worker needs exact feedback to act on.
