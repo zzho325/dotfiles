@@ -1,0 +1,31 @@
+model = "gpt-5.3-codex"
+model_reasoning_effort = "high"
+approval_policy = "untrusted"
+sandbox_mode = "read-only"
+profile = "edit-control"
+
+[projects."/Users/ashleyzhou"]
+trust_level = "trusted"
+
+[notice.model_migrations]
+"gpt-5.2-codex" = "gpt-5.3-codex"
+
+[features]
+child_agents_md = true
+request_rule = true
+
+[[skills.config]]
+path = "/Users/ashleyzhou/.claude/skills/find-skills"
+enabled = true
+
+[[skills.config]]
+path = "/Users/ashleyzhou/.claude/skills/playwriter"
+enabled = true
+
+[profiles.edit-control]
+approval_policy = "untrusted"
+sandbox_mode = "read-only"
+
+[profiles.auto]
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"

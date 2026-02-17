@@ -1,0 +1,55 @@
+# Codex execution policy rules.
+# Goal: keep read-only inspection smooth while requiring prompts for risky actions.
+
+# Common read-only commands: allow without prompt.
+prefix_rule(
+  pattern = [["ls", "pwd", "which", "command", "env", "date", "whoami", "id"]],
+  decision = "allow",
+)
+
+prefix_rule(
+  pattern = [["cat", "head", "tail", "less", "wc", "sort", "uniq", "cut", "tr"]],
+  decision = "allow",
+)
+
+prefix_rule(
+  pattern = [["grep", "rg", "find", "tree", "basename", "dirname", "realpath", "readlink"]],
+  decision = "allow",
+)
+
+prefix_rule(
+  pattern = ["git", ["status", "diff", "show", "log", "branch", "rev-parse", "grep"]],
+  decision = "allow",
+)
+
+# Project build/test commands are usually safe and useful.
+prefix_rule(
+  pattern = [["make", "go", "pnpm", "nix"]],
+  decision = "allow",
+)
+
+# Write/mutate operations: always prompt.
+prefix_rule(
+  pattern = ["git", ["add", "commit", "push", "pull", "merge", "rebase", "reset", "checkout"]],
+  decision = "prompt",
+)
+
+prefix_rule(
+  pattern = [["rm", "mv", "cp", "chmod", "chown", "sed", "tee"]],
+  decision = "prompt",
+)
+
+# Hard blocks for especially risky force operations.
+prefix_rule(
+  pattern = ["git", "push", ["-f", "--force", "--force-with-lease", "--force-if-includes"]],
+  decision = "forbidden",
+)
+
+prefix_rule(
+  pattern = ["rm", ["-rf", "-fr"], "/"],
+  decision = "forbidden",
+)
+prefix_rule(pattern=["awk", "length($0)>100{print NR\":\"length($0)}", "backend/tools/code_sandbox_tool_test.go"], decision="allow")
+prefix_rule(pattern=["nix", "develop", "--command", "go", "test", "./backend/tools", "-run", "TestCodeSandboxTool_Execute_(MissingCommand|EmptyCommand|GetFileUrl_MissingFilename|GetFileUrl_FileNotFound|InvalidAction)$"], decision="allow")
+prefix_rule(pattern=["git", "for-each-ref", "--format=%(refname:short)", "refs/remotes"], decision="allow")
+prefix_rule(pattern=["awk", "length($0)>100{print FNR\":\"length($0)\":\"$0}", "Makefile", "backend/tools/code_sandbox_tool.go", "backend/tools/code_sandbox_tool_test.go", "web/tests/fetch-recent-gmail.spec.ts", ".agents/skills/local-dev/SKILL.md"], decision="allow")
