@@ -6,6 +6,7 @@ require "ash.cmp"
 require "ash.auto-dark-mode"
 require "ash.nvim-tree"
 require "ash.fzf-lua"
+require "ash.gitsigns"
 require("ash.lsp").setup()
 
 -- project level override

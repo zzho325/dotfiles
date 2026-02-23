@@ -48,6 +48,8 @@ return packer.startup(function(use)
 	use "tpope/vim-rhubarb"   -- Github
 	use 'nvim-tree/nvim-tree.lua'
 	use 'ibhagwan/fzf-lua'
+	use 'lewis6991/gitsigns.nvim'
+	use 'sindrets/diffview.nvim'
 
 	-- UI
 	use({ "ellisonleao/gruvbox.nvim" })
