@@ -58,10 +58,17 @@
       "Bash(staticcheck:*)",
       "Bash(deadcode:*)",
       "Bash(ENV=test go test:*)",
+      "Bash(INTEGRATION=1 go test:*)",
+      "Bash(go get:*)",
       "Bash(make:*)",
       "Bash(docker:*)",
       "Bash(docker compose:*)",
       "Bash(cargo build:*)",
+      "Bash(bash:*)",
+      "Bash(sops:*)",
+      "Bash(brew list:*)",
+      "Bash(terraform plan:*)",
+      "Bash(gh repo view:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(git diff:*)",
@@ -103,12 +110,18 @@
       "Bash(columnctl * --help:*)",
       "Bash(columnctl tailscale status)",
       "Bash(kubectl config get-contexts:*)",
+      "Bash(kubectl config current-context:*)",
+      "Bash(kubectl describe:*)",
+      "Bash(kubectl logs:*)",
+      "Bash(kubectl get:*)",
       "Bash(aws s3 ls:*)",
       "Skill(linear-cli)",
       "mcp__linear-server__get_issue",
       "mcp__claude_ai_Linear__*",
       "mcp__claude_ai_Slack__slack_search_public_and_private",
       "mcp__claude_ai_Slack__slack_search_public",
+      "mcp__claude_ai_Slack__slack_search_channels",
+      "mcp__claude_ai_Slack__slack_search_users",
       "mcp__claude_ai_Slack__slack_read_thread",
       "mcp__claude_ai_Slack__slack_read_channel",
       "mcp__claude_ai_Slack__slack_send_message_draft",
@@ -117,7 +130,10 @@
       "WebFetch(domain:column-na.slack.com)",
       "WebFetch(domain:app.frbservices.org)",
       "WebFetch(domain:myndex.ai)",
-      "WebSearch"
+      "WebSearch",
+      "Read",
+      "Glob",
+      "Grep"
     ],
     "deny": [
       "Bash(gh pr comment:*)",
@@ -134,8 +150,11 @@
       "mcp__claude_ai_Slack__slack_schedule_message"
     ]
   },
+  "model": "opus",
   "enabledPlugins": {
-    "gopls-lsp@claude-plugins-official": true
+    "gopls-lsp@claude-plugins-official": true,
+    "column-db@column-ai-marketplace": true
   },
+  "fastMode": true,
   "skipDangerousModePermissionPrompt": true
 }

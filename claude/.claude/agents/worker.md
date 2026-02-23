@@ -27,7 +27,7 @@ wt switch --create <feature-name> -y -C $ORCH_REPO
 cd $ORCH_REPO/<feature-name>
 ```
 
-If implementing against a ticket, also create a ticket branch inside the worktree: `git checkout -b ashley/ENG-<number>`
+If implementing against a ticket, also create a ticket branch inside the worktree: `git checkout -b ashley/ENG-<number>-<short-description>`
 
 Always keep main up to date and rebase before starting:
 ```bash
