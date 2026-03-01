@@ -17,3 +17,4 @@ alias lg='lazygit'
 alias tmux-copy="wl-copy"
 alias nv='cd $HOME/.config/nvim && nvim'
 alias ck='~/cookie/target/debug/cookie'
+alias treev='eza --tree --header --git --ignore-glob .DS_Store --icons --all'

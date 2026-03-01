@@ -14,6 +14,7 @@ brew "zellij"
 brew "rust"
 brew "lazygit"
 brew "ripgrep"
+brew "eza"
 brew "worktrunk"
 
 #GUI apps
