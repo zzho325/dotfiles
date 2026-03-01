@@ -133,7 +133,19 @@
       "WebSearch",
       "Read",
       "Glob",
-      "Grep"
+      "Grep",
+      "Bash(python3 */.claude/skills/linear-cli/scripts/linear_cli.py:*)",
+      "Bash(python3 .claude/commands/deploy-column-prod/scripts/monitor_workflows.py:*)",
+      "Bash(columnctl agent session --help:*)",
+      "Bash(columnctl agent --help:*)",
+      "Bash(python3.11 -m pip:*)",
+      "Bash(columnctl agent start:*)",
+      "Bash(columnctl agent attach:*)",
+      "Bash(columnctl agent list:*)",
+      "Bash(claude plugins:*)",
+      "Bash(CLAUDECODE= claude plugins:*)",
+      "Bash(columnctl db:*)",
+      "Skill(design:design)"
     ],
     "deny": [
       "Bash(gh pr comment:*)",
@@ -148,13 +160,18 @@
       "Read(/Users/*/.aws/config)",
       "mcp__claude_ai_Slack__slack_send_message",
       "mcp__claude_ai_Slack__slack_schedule_message"
-    ]
+    ],
+    "defaultMode": "default"
   },
   "model": "opus",
   "enabledPlugins": {
     "gopls-lsp@claude-plugins-official": true,
-    "column-db@column-ai-marketplace": true
+    "column-db@local-desktop-app-uploads": true
   },
-  "fastMode": true,
-  "skipDangerousModePermissionPrompt": true
+  "promptSuggestionEnabled": false,
+  "skipDangerousModePermissionPrompt": true,
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/statusline-command.sh"
+  }
 }
