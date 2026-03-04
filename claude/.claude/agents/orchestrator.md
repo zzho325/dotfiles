@@ -56,8 +56,10 @@ git -C $ORCH_REPO/main pull --ff-only
 ```
 
 ```bash
-tmux new-session -d -s "task-<short-name>" -c "$ORCH_REPO/main"
-tmux send-keys -t "task-<short-name>" "claude --model opus --agent worker \"$(cat ~/tasks/<filename>.md)\"" Enter
+tmux new-session -d -s "task-<short-name>" -c "$ORCH_REPO/main" && \
+  tmux send-keys -t "task-<short-name>" "claude --model opus" Enter && \
+  sleep 8 && \
+  tmux send-keys -t "task-<short-name>" "/orch:worker ~/tasks/<filename>.md" Enter
 ```
 
 After spinning up, add `session: task-<short-name>` on its own line near the top of the task file (below the user's text, above `## Summary`).

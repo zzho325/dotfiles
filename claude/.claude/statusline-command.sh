@@ -18,13 +18,20 @@ cost_log="$HOME/.claude/session-cost-log.json"
 if [ -n "$sid" ] && [ -n "$cost" ]; then
     prev_file="/tmp/claude-cost-prev-${sid}"
 
-    # On first tick (or after resume), seed prev with current cost
+    # On first tick, seed prev with current cost
     if [ ! -f "$prev_file" ]; then
         echo "$cost" > "$prev_file"
     fi
     prev_cost=$(cat "$prev_file")
-    delta=$(awk "BEGIN{print $cost - $prev_cost}")
-    echo "$cost" > "$prev_file"
+
+    # If cost dropped for any reason, reset baseline without applying a negative delta
+    if awk "BEGIN{exit !($cost < $prev_cost)}"; then
+        echo "$cost" > "$prev_file"
+        delta="0"
+    else
+        delta=$(awk "BEGIN{print $cost - $prev_cost}")
+        echo "$cost" > "$prev_file"
+    fi
 
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     [ ! -s "$cost_log" ] && echo '{}' > "$cost_log"

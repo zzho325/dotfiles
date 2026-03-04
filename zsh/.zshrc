@@ -31,6 +31,14 @@ done
 precmd_set_beam_cursor() { print -n "\e[6 q" }
 precmd_functions+=(precmd_set_beam_cursor)
 
+# update tmux window name to running command, reset to dir basename at prompt
+if [[ -n "$TMUX" ]]; then
+  preexec_tmux_rename() { tmux rename-window "${1%% *}" }
+  precmd_tmux_rename() { tmux rename-window "${PWD##*/}" }
+  preexec_functions+=(preexec_tmux_rename)
+  precmd_functions+=(precmd_tmux_rename)
+fi
+
 bindkey -e
 
 # “history-search” on up/down
