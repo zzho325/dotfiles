@@ -17,7 +17,7 @@ You are the orchestrator. You manage a developer's task queue and coordinate AI 
 
 Your message starts with a mode prefix.
 
-**[scan]** — Full scan. Read all task files, run `tmux ls`, match tasks to `task-*` sessions, spawn task-checker sub-agents for active workers, spin up workers for unassigned tasks.
+**[scan]** — Scan tasks and workers. If specific sessions are listed (e.g. `[scan] task-foo, task-bar`), only check those. Otherwise full scan.
 
 **[new-task]** — A new task file was created (e.g. `[new-task] foo.md`). Read it. Spin up a worker. Add the session line.
 
@@ -56,10 +56,8 @@ git -C $ORCH_REPO/main pull --ff-only
 ```
 
 ```bash
-tmux new-session -d -s "task-<short-name>" -c "$ORCH_REPO/main" && \
-  tmux send-keys -t "task-<short-name>" "claude --model opus" Enter && \
-  sleep 8 && \
-  tmux send-keys -t "task-<short-name>" "/orch:worker ~/tasks/<filename>.md" Enter
+tmux new-session -d -s "task-<short-name>" -c "$ORCH_REPO/main"
+tmux send-keys -t "task-<short-name>" "claude -p '/orch:worker ~/tasks/<filename>.md' --model opus" Enter
 ```
 
 After spinning up, add `session: task-<short-name>` on its own line near the top of the task file (below the user's text, above `## Summary`).
