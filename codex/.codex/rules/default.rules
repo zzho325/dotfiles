@@ -1,55 +1,22 @@
-# Codex execution policy rules.
-# Goal: keep read-only inspection smooth while requiring prompts for risky actions.
-
-# Common read-only commands: allow without prompt.
-prefix_rule(
-  pattern = [["ls", "pwd", "which", "command", "env", "date", "whoami", "id"]],
-  decision = "allow",
-)
-
-prefix_rule(
-  pattern = [["cat", "head", "tail", "less", "wc", "sort", "uniq", "cut", "tr"]],
-  decision = "allow",
-)
-
-prefix_rule(
-  pattern = [["grep", "rg", "find", "tree", "basename", "dirname", "realpath", "readlink"]],
-  decision = "allow",
-)
-
-prefix_rule(
-  pattern = ["git", ["status", "diff", "show", "log", "branch", "rev-parse", "grep"]],
-  decision = "allow",
-)
-
-# Project build/test commands are usually safe and useful.
-prefix_rule(
-  pattern = [["make", "go", "pnpm", "nix"]],
-  decision = "allow",
-)
-
-# Write/mutate operations: always prompt.
-prefix_rule(
-  pattern = ["git", ["add", "commit", "push", "pull", "merge", "rebase", "reset", "checkout"]],
-  decision = "prompt",
-)
-
-prefix_rule(
-  pattern = [["rm", "mv", "cp", "chmod", "chown", "sed", "tee"]],
-  decision = "prompt",
-)
-
-# Hard blocks for especially risky force operations.
-prefix_rule(
-  pattern = ["git", "push", ["-f", "--force", "--force-with-lease", "--force-if-includes"]],
-  decision = "forbidden",
-)
-
-prefix_rule(
-  pattern = ["rm", ["-rf", "-fr"], "/"],
-  decision = "forbidden",
-)
-prefix_rule(pattern=["awk", "length($0)>100{print NR\":\"length($0)}", "backend/tools/code_sandbox_tool_test.go"], decision="allow")
-prefix_rule(pattern=["nix", "develop", "--command", "go", "test", "./backend/tools", "-run", "TestCodeSandboxTool_Execute_(MissingCommand|EmptyCommand|GetFileUrl_MissingFilename|GetFileUrl_FileNotFound|InvalidAction)$"], decision="allow")
-prefix_rule(pattern=["git", "for-each-ref", "--format=%(refname:short)", "refs/remotes"], decision="allow")
-prefix_rule(pattern=["awk", "length($0)>100{print FNR\":\"length($0)\":\"$0}", "Makefile", "backend/tools/code_sandbox_tool.go", "backend/tools/code_sandbox_tool_test.go", "web/tests/fetch-recent-gmail.spec.ts", ".agents/skills/local-dev/SKILL.md"], decision="allow")
+prefix_rule(pattern=["go", "test"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test go test ./app/internalapi/service/dbquery ./pkg/auth/internalauth"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test go test ./app/internalapi/service/accounts -run TestBulkUpdatePositivePay -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test go test ./app/internalapi/service/accounts -run TestUpdatePlatformAccountNumbers -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test go test ./pkg/accounts -run TestUpdateAccountNumber -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test go test ./pkg/accounts -run TestUpdateAccountNumbersForPlatformTxn -count=1"], decision="allow")
+prefix_rule(pattern=["python3", "/Users/azhou@column.com/column/lms-best-egg/.agents/skills/linear-cli/scripts/linear_cli.py", "issue", "create", "--help"], decision="allow")
+prefix_rule(pattern=["python3", "/Users/azhou@column.com/column/lms-best-egg/.agents/skills/linear-cli/scripts/linear_cli.py", "issue", "create"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./app/internalapi/service/accounts -run TestUpdateAccountNumber -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./app/internalapi/service/accounts -run TestUpdatePlatformNonReserveAccountNumbers -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./app/internalapi/service/accounts -run TestUpdatePlatformAccountNumbersPositivePay -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./pkg/accounts -run TestUpdateAccountNumbersForPlatformTxn -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./app/internalapi/service/accounts ./pkg/accounts -count=1"], decision="allow")
+prefix_rule(pattern=["python3", "/Users/azhou@column.com/column/eng-24580-biz-day-roll/.agents/skills/linear-cli/scripts/linear_cli.py", "issue", "get"], decision="allow")
+prefix_rule(pattern=["bash", ".agents/skills/query-database/scripts/query.sh", "SELECT JSON_LENGTH(history) AS snapshot_count, COUNT(*) AS config_count FROM interest_configs WHERE removed_at IS NULL GROUP BY JSON_LENGTH(history) ORDER BY snapshot_count"], decision="allow")
+prefix_rule(pattern=["bash", ".agents/skills/query-database/scripts/query.sh", "SELECT COUNT(*) AS total_configs, AVG(JSON_LENGTH(history)) AS avg_snapshots, MIN(JSON_LENGTH(history)) AS min_snapshots, MAX(JSON_LENGTH(history)) AS max_snapshots FROM interest_configs WHERE removed_at IS NULL"], decision="allow")
+prefix_rule(pattern=["bash", ".agents/skills/query-database/scripts/query.sh", "WITH ordered AS (SELECT JSON_LENGTH(history) AS snapshot_count FROM interest_configs WHERE removed_at IS NULL ORDER BY snapshot_count), numbered AS (SELECT snapshot_count, ROW_NUMBER() OVER (ORDER BY snapshot_count) AS rn, COUNT(*) OVER () AS n FROM ordered) SELECT MIN(CASE WHEN rn >= FLOOR((n + 1) / 2) THEN snapshot_count END) AS p50_snapshot_count, MIN(CASE WHEN rn >= CEIL(n * 0.90) THEN snapshot_count END) AS p90_snapshot_count, MIN(CASE WHEN rn >= CEIL(n * 0.95) THEN snapshot_count END) AS p95_snapshot_count FROM numbered"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./app/internalapi/service/interests -run 'TestForfeit(Column|Both)InterestGin_ManualPayout' -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./pkg/accounts/interests -run TestNoPayoutIfOtherPayoutUnderReview -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./pkg/accounts/interests -run '^TestNoPayoutIfOtherPayoutUnderReview$' -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./pkg/interests -run 'Test(UpdatePayoutStatus_ManualPayoutSkipsInterestLedger|GetMonthlyPayoutsByProductsAndAccruedDate_ExcludesManual)$' -count=1"], decision="allow")
+prefix_rule(pattern=["/bin/zsh", "-lc", "curl -s -H \"Authorization: Bearer ${SLACK_BOT_TOKEN}\" \"https://slack.com/api/conversations.replies?channel=C0291K04RGD&ts=1771280480.905549\" | jq '{ok, error, messages: [.messages[]? | {ts, user, text}]}'"], decision="allow")

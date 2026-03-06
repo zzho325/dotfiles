@@ -14,6 +14,7 @@ alias v='nvim'
 alias vi='nvim'
 alias vim='nvim'
 alias nv='cd $HOME/.config/nvim && nvim'
+alias vg='rg --line-number --no-heading . | fzf --delimiter=: --preview "bat --color=always --highlight-line {2} {1}" | awk -F: '\''{print "+"$2, $1}'\'' | xargs nvim'
 
 # tools
 alias tmux='tmux -2 -f "$XDG_CONFIG_HOME"/tmux/tmux.conf'

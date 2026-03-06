@@ -7,9 +7,6 @@ export DOTFILES_LOCATION="$HOME/dotfiles"
 
 export LESSHISTFILE="-"
 
-export FZF_COMPLETION_TRIGGER="**"
-export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border'
-
 eval "$(direnv hook zsh)"
 
 export PATH="$HOME/go/bin:$PATH"
@@ -22,22 +19,14 @@ setopt hist_ignore_all_dups   # don’t record duplicates
 
 eval "$(starship init zsh)"
 
-# load nix Zsh snippets
-for f in $XDG_CONFIG_HOME/zsh/*.nix.zsh; do
+# load zsh config snippets
+for f in $XDG_CONFIG_HOME/zsh/*.zsh; do
   source $f
 done
 
 # set to beam cursor before each prompt
 precmd_set_beam_cursor() { print -n "\e[6 q" }
 precmd_functions+=(precmd_set_beam_cursor)
-
-# update tmux window name to running command, reset to dir basename at prompt
-if [[ -n "$TMUX" ]]; then
-  preexec_tmux_rename() { tmux rename-window "${1%% *}" }
-  precmd_tmux_rename() { tmux rename-window "${PWD##*/}" }
-  preexec_functions+=(preexec_tmux_rename)
-  precmd_functions+=(precmd_tmux_rename)
-fi
 
 bindkey -e
 

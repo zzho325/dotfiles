@@ -36,5 +36,11 @@ vim.opt.guifont = "monospace:h17"               -- the font used in graphical ne
 vim.opt.colorcolumn = "100"                     -- show a vertical guide line at column 100
 vim.opt.shortmess:append "c"
 
+vim.opt.autoread = true
+vim.api.nvim_create_autocmd(
+  { "FocusGained", "BufEnter", "CursorHold" },
+  { command = "silent! checktime" }
+)
+
 vim.cmd "set whichwrap+=<,>,[,],h,l"
 vim.cmd [[set iskeyword+=-]]
