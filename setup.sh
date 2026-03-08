@@ -34,11 +34,27 @@ echo "→ Removing legacy files…"
 # Stow application configs
 if command -v stow >/dev/null; then
   cd "$HOME/dotfiles"
-  stow --adopt --no-folding zsh nvim git starship ghostty zellij tmux worktrunk claude --target="$HOME"
+  stow --adopt --no-folding zsh nvim git starship ghostty zellij tmux worktrunk claude agents codex --target="$HOME"
   echo "✔ Stowed all dotfiles into $HOME"
 else
   echo "⚠ stow not installed; skipping config stow"
 fi
+
+# Link claude and codex agents/skills to shared agent package
+echo "→ Linking agents/skills…"
+ln -sfn "$HOME/.agents/agents" "$HOME/.claude/agents"
+ln -sfn "$HOME/.agents/skills" "$HOME/.claude/skills"
+ln -sfn "$HOME/.agents/design" "$HOME/.claude/design"
+ln -sfn "$HOME/.agents/agents" "$HOME/.codex/agents"
+
+# Merge local-only skills into the shared skills dir
+if [ -d "$HOME/.agents/skills_local" ]; then
+  for skill in "$HOME/.agents/skills_local"/*/; do
+    name=$(basename "$skill")
+    ln -sfn "$skill" "$HOME/.agents/skills/$name"
+  done
+fi
+echo "✔ Agents/skills linked"
 
 echo "✔ Bootstrap complete!"
 

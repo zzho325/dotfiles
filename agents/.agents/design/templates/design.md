@@ -104,5 +104,4 @@ For each new API response type, document the explicit field list after cross-ref
 - [What could go wrong] — [mitigation]
 
 ---
-*Last updated: [date] after design*
-*Claude session: [session-id]*
+*Last updated: [date]*

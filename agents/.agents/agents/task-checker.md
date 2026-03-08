@@ -60,7 +60,7 @@ tmux send-keys -t "<session>" -l "There are unresolved PR review comments you ne
 
 <comment 1: file, line, reviewer, what they asked>
 <comment 2: ...>"
-tmux send-keys -t "<session>" Enter
+tmux send-keys -t "<session>" C-m
 ```
 
 **Only send if**:
