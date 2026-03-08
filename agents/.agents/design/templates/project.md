@@ -63,5 +63,4 @@
 - [ ] [Another open question]
 
 ---
-*Last updated: [date] after brainstorming*
-*Claude session: [session-id]*
+*Last updated: [date]*

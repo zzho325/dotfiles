@@ -12,7 +12,7 @@ Patterns detected in the target packages that this design follows.
 |---------|---------|----------|----------------|
 | [pkg/example] | [standalone functions] | [ExistingFunc() is a package-level function] | [pkg/example/store.go] |
 
-> All new functions/methods in this design follow the patterns above. See `~/column/.design/<slug>/PATTERNS.md` for full details.
+> All new functions/methods in this design follow the patterns above. See `docs/design/<slug>/PATTERNS.md` for full details.
 
 ## Architecture
 
@@ -104,5 +104,4 @@ For each new API response type, document the explicit field list after cross-ref
 - [What could go wrong] — [mitigation]
 
 ---
-*Last updated: [date] after design*
-*Claude session: [session-id]*
+*Last updated: [date]*

@@ -1,3 +1,9 @@
 # Ignore compiled plugin cache (packer)
 **/packer_compiled.lua
 
+# Local-only skills
+agents/.agents/skills_local/
+
+# Rust build artifacts
+orch/target/
+
