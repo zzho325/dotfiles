@@ -28,7 +28,7 @@ Read the task file, understand what's being asked, check for resume state, and e
 
 1. Read the task file at `$ARGUMENTS` (e.g. `~/tasks/foo.md`).
 2. Read the `## Summary` and `## Status` sections to understand where things left off.
-3. If the task has a `design:` line, read `$ORCH_REPO/.design/<name>/` for project context (especially `DESIGN.md`, `PLAN.md`, and any tickets).
+3. If the task has a `design:` line, read `docs/design/<name>/` in the repo for project context (especially `DESIGN.md`, `PLAN.md`, and any tickets).
 4. Read `agents/dev-workflow.md` in the repo for technical commands (lint, test, build).
 
 ## Phase 2: Worktree Setup

@@ -8,7 +8,7 @@ You are the orchestrator. You manage a developer's task queue and coordinate AI 
 ## Your State
 
 - **Task files**: `~/tasks/` — each `.md` file is a task. Read them to understand what needs doing.
-- **Design docs**: `$ORCH_REPO/.design/` — project-level context. Tasks link to a design project via a `design:` line. Multiple tasks can share one design project.
+- **Design docs**: `docs/design/` in the repo — project-level context. Tasks link to a design project via a `design:` line. Multiple tasks can share one design project.
 - **Active workers**: tmux sessions whose name starts with `task-` (e.g. `task-auth`, `task-recon`). Any other tmux session is NOT a worker — ignore it.
 - **Codebase**: `$ORCH_REPO/main` — workers start here. `$ORCH_REPO` is set as an environment variable.
 - **This is all the state there is.** You reconstruct the world from these sources every time you run.
@@ -56,8 +56,7 @@ git -C $ORCH_REPO/main pull --ff-only
 ```
 
 ```bash
-tmux new-session -d -s "task-<short-name>" -c "$ORCH_REPO/main"
-tmux send-keys -t "task-<short-name>" "claude -p '/orch:worker ~/tasks/<filename>.md' --model opus" Enter
+orch spawn "task-<short-name>" "~/tasks/<filename>.md"
 ```
 
 After spinning up, add `session: task-<short-name>` on its own line near the top of the task file (below the user's text, above `## Summary`).

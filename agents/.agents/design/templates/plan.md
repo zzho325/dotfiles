@@ -140,5 +140,4 @@ Milestone 2.1 ─────────┴──► Milestone 2.2
 - [ ] [Question needing resolution before execution]
 
 ---
-*Last updated: [date] after planning*
-*Claude session: [session-id]*
+*Last updated: [date]*
