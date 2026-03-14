@@ -283,7 +283,7 @@ fn cmd_spawn(session: &str, task_file: &str) {
 
     let repo = repo_dir();
     let work_dir = format!("{repo}/main");
-    let cmd = format!("codex '$orch:worker {task_file}'");
+    let cmd = format!("claude '/orch:worker {task_file}'");
 
     if !tmux(&["new-session", "-d", "-s", session, "-c", &work_dir]) {
         eprintln!("[spawn] failed to create tmux session '{session}'");

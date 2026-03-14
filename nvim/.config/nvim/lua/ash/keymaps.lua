@@ -132,6 +132,8 @@ if ok then
 	keymap("n", "<leader>fo", fzf.oldfiles, { desc = "fzf oldfiles" })
 	keymap("n", "<leader>fb", fzf.buffers, { desc = "fzf buffers" })
 	keymap("n", "<leader>fh", fzf.help_tags, { desc = "fzf help" })
+	keymap("n", "<leader>gs", fzf.git_status, { desc = "fzf git status" })
+	keymap("n", "<leader>gc", fzf.git_stash, { desc = "fzf git stash" })
 end
 
 -- Github --
