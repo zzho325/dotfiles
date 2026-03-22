@@ -39,6 +39,9 @@ enum Cmd {
         session: String,
         /// Path to the task file (e.g. ~/tasks/tm.md)
         task_file: String,
+        /// Working directory (defaults to $ORCH_REPO/main)
+        #[arg(long, short = 'C')]
+        dir: Option<String>,
     },
     /// Send a message to the orchestrator
     #[command(name = "-")]
@@ -275,14 +278,15 @@ fn cmd_jump(name: &str) {
     let _ = Command::new("tmux").args([action, "-t", &session]).status();
 }
 
-fn cmd_spawn(session: &str, task_file: &str) {
+fn cmd_spawn(session: &str, task_file: &str, dir: Option<&str>) {
     if has_tmux_session(session) {
         eprintln!("[spawn] session '{session}' already exists");
         return;
     }
 
-    let repo = repo_dir();
-    let work_dir = format!("{repo}/main");
+    let work_dir = dir
+        .map(String::from)
+        .unwrap_or_else(|| format!("{}/main", repo_dir()));
     let cmd = format!("claude '/orch:worker {task_file}'");
 
     if !tmux(&["new-session", "-d", "-s", session, "-c", &work_dir]) {
@@ -387,8 +391,8 @@ fn main() {
     match cli.command {
         Some(Cmd::Status) | None => cmd_status(),
         Some(Cmd::Jump { name }) => cmd_jump(&name),
-        Some(Cmd::Spawn { session, task_file }) => {
-            cmd_spawn(&session, &task_file)
+        Some(Cmd::Spawn { session, task_file, dir }) => {
+            cmd_spawn(&session, &task_file, dir.as_deref())
         }
         Some(Cmd::Daemon) => cmd_daemon(),
         Some(Cmd::Scan) => {

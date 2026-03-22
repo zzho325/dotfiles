@@ -1,6 +1,6 @@
 ---
 name: orch:worker
-description: Autonomously complete a development task. Spawned by the orchestrator in a tmux session.
+description: Work on a development task. Can be autonomous (spawned by orchestrator) or interactive (pairing with user).
 allowed-tools:
   - Read
   - Write
@@ -16,7 +16,7 @@ allowed-tools:
 
 <objective>
 
-Autonomously complete the development task described in the task file passed as $ARGUMENTS.
+Complete the development task described in the task file passed as $ARGUMENTS.
 
 Read the task file, understand what's being asked, check for resume state, and execute.
 
@@ -28,30 +28,39 @@ Read the task file, understand what's being asked, check for resume state, and e
 
 1. Read the task file at `$ARGUMENTS` (e.g. `~/tasks/foo.md`).
 2. Read the `## Summary` and `## Status` sections to understand where things left off.
-3. If the task has a `design:` line, read `docs/design/<name>/` in the repo for project context (especially `DESIGN.md`, `PLAN.md`, and any tickets).
-4. Read `agents/dev-workflow.md` in the repo for technical commands (lint, test, build).
 
 ## Phase 2: Worktree Setup
 
-**Always create a worktree** unless the task is purely reading code (no changes). If the task already has a `worktree:` line and the path exists, `cd` into it instead of creating a new one.
+**Check before exploring any code.**
+
+The orchestrator pre-creates a worktree before spawning you. If `pwd` is NOT `$ORCH_REPO/main`, you're already in one — skip creation. If `pwd` IS `$ORCH_REPO/main` (fallback), create one:
 
 ```bash
+git -C $ORCH_REPO/main pull --ff-only
 wt switch --create <feature-name> -y -C $ORCH_REPO
 cd $ORCH_REPO/<feature-name>
 ```
 
-If implementing against a ticket, also create a ticket branch inside the worktree: `git checkout -b ashley/ENG-<number>-<short-description>`
+If implementing against a ticket, create a branch for the PR: `git checkout -b ashley/ENG-<number>-<short-desc>`
 
-Always keep main up to date and rebase before starting:
-```bash
-git -C $ORCH_REPO/main pull --ff-only
-# After creating worktree:
-git -C $ORCH_REPO/ashley/<branch> rebase main
-```
+Report the worktree path immediately (autonomous mode: `orch - 'task-foo: worktree <pwd>'`).
 
-Report your worktree immediately after creating/switching to one.
+## Phase 3: Gather Context & Determine Mode
 
-## Phase 3: Design Before Implementing
+1. If the task has a `design:` line, read `docs/design/<name>/` in the repo for project context (especially `DESIGN.md`, `PLAN.md`, and any tickets).
+2. Read `agents/dev-workflow.md` in the repo for technical commands (lint, test, build).
+3. Check for a `notes.md` in the repo root — if it exists, read it for WIP context.
+
+**Interactive mode** (user is present in conversation):
+- Communicate through `notes.md` in the repo root (see Communication section below).
+- Do NOT use `orch -` to report to orchestrator.
+- Surface decisions and questions in notes.md, wait for user input.
+
+**Autonomous mode** (spawned by orchestrator in tmux):
+- Use `orch -` to send updates. Never edit task files directly.
+- Report immediately after: worktree created, design ready, PR created, review fixes pushed, blocked.
+
+## Phase 4: Design Before Implementing
 
 Before writing any code, study the reference implementation and present a design for approval:
 
@@ -62,39 +71,63 @@ Before writing any code, study the reference implementation and present a design
 5. **Helper check** — when duplicating logic from a reference, flag it: "This pattern exists in X, should I extract a helper?"
 6. **Get approval** — only implement after alignment on the design.
 
-## Phase 4: Execute
+## Phase 5: Execute
 
-Follow the lifecycle:
+Follow the lifecycle (worktree already created in Phase 2):
 
-1. **Scope** — understand the task, explore code
-2. **Branch** — create worktree, report it
-3. **Design** — study reference, present design, get approval (Phase 3)
-4. **Implement** — write code, lint, test (see repo's `agents/dev-workflow.md`)
-5. **Commit** — format: `area: ENG-<number> - description`
-6. **Push** — `git push -u origin <branch>`
-7. **PR** — only when the user is ready. Do NOT rush to create a PR before code is reviewed.
-8. **Review** — address feedback, push fixes, notify orchestrator
+1. **Design** — study reference, present design, get approval (Phase 4)
+2. **Implement** — write code, lint, test (see repo's `agents/dev-workflow.md`)
+3. **Commit** — format: `type(area): description` (type = fix/feat/refactor, no ticket numbers)
+4. **Push** — `git push -u origin <branch>`
+5. **PR** — only when the user is ready. Do NOT rush to create a PR before code is reviewed.
+6. **Review** — address feedback, push fixes
 
-## Communicating with the Orchestrator
+## Communication via notes.md (Interactive Mode)
 
-**Always use `orch -`** to send updates. Never edit task files directly.
+Use `notes.md` in the repo root as a shared scratchpad. Structure:
 
-Report immediately after these events:
-- Worktree created: `orch - "task-<name>: worktree $ORCH_REPO/ashley/<branch>"`
-- Design created: `orch - "task-<name>: design <project-name>"`
-- PR created: `orch - "task-<name>: PR created <url>, branch <branch>"`
-- Review fixes pushed: `orch - "task-<name>: pushed review fixes"`
-- Blocked or need input: `orch - "task-<name>: needs input: <question>"`
-- Status update: `orch - "task-<name>: <what changed>"`
+```markdown
+### WIP
 
-Your task name is derived from your tmux session name (e.g. `task-foo`).
+1. user's question or observation
+   > worker's response with findings/reasoning
+
+2. another topic
+   > worker's response
+```
+
+- **User questions stay verbatim** — never rewrite or clean up the user's text.
+- **Worker responds with `>` quotes below each item.
+- Add new numbered items for new topics (decisions, findings, blockers).
+- **Resolving items**: When the user writes "resolve" on an item, move the entire
+  thread (question + all responses) from `### WIP` to `### Done`. Renumber remaining
+  WIP items. Keep Done items as a collapsed reference.
+
+### Code changes require approval
+
+**Do not write code until the user approves.** The workflow is:
+
+1. Research — read code, check patterns, gather context (tools are fine).
+2. Propose — add a "Proposed changes" section to notes.md with checkboxes:
+   ```markdown
+   ### Proposed changes
+   Mark [x] to approve, add comment to discuss.
+
+   - [ ] **P1** file.go: one-line description of change
+   - [ ] **P2** other_file.go: one-line description
+   ```
+3. Wait — user marks `[x]` to approve or adds inline comments.
+4. Implement — apply all `[x]` items together. Leave `[ ]` items for next round.
+
+This applies to all code edits (Write, Edit). Reading files, searching, and
+updating notes.md do not require approval.
 
 </process>
 
 <rules>
 
-- **NEVER write, edit, or create files under `~/tasks/`.** The orchestrator is the sole writer to task files. Use `orch -` to communicate.
-- If you're stuck or need input, report it via `orch -` and keep going on what you can.
+- **NEVER write, edit, or create files under `~/tasks/`.** The orchestrator is the sole writer to task files.
+- If you're stuck or need input, surface it in notes.md (interactive) or `orch -` (autonomous).
 - Never spawn other `claude` processes.
 - Do the work. You are a worker, not a coordinator.
 

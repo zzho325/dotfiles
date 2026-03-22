@@ -18,9 +18,15 @@ trust_level = "trusted"
 [projects."/Users/azhou@column.com/dotfiles"]
 trust_level = "trusted"
 
+[projects."/Users/azhou@column.com/website"]
+trust_level = "trusted"
+
+[projects."/Users/azhou@column.com/codex"]
+trust_level = "trusted"
+
 [tui]
 status_line = ["model-with-reasoning", "context-remaining", "current-dir", "git-branch"]
-theme = "gruvbox-dark"
+theme = "nord"
 
 [features]
 multi_agent = true
@@ -28,6 +34,9 @@ voice_transcription = true
 
 [mcp_servers.linear-server]
 url = "https://mcp.linear.app/mcp"
+
+[mcp_servers.notion]
+url = "https://mcp.notion.com/mcp"
 
 [profiles.safe]
 approval_policy = "untrusted"

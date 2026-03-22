@@ -40,13 +40,13 @@ else
   echo "⚠ stow not installed; skipping config stow"
 fi
 
-# Replace stow symlinks in skills/ with copies (codex needs real files)
-echo "→ Copying skills…"
+# Replace stow symlinks in skills/ with hardlinks (codex needs real files)
+echo "→ Hardlinking skills…"
 for f in "$HOME/.agents/skills"/*/SKILL.md; do
   [ -L "$f" ] || continue
   src=$(readlink -f "$f")
   rm "$f"
-  cp "$src" "$f"
+  ln "$src" "$f"
 done
 
 # Link claude and codex agents/skills to shared agent package
