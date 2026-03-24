@@ -1,5 +1,4 @@
 {
-  "awsAuthRefresh": "aws sso login --sso-session column",
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
@@ -65,9 +64,7 @@
       "Bash(docker compose:*)",
       "Bash(cargo build:*)",
       "Bash(bash:*)",
-      "Bash(sops:*)",
       "Bash(brew list:*)",
-      "Bash(terraform plan:*)",
       "Bash(gh repo view:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
@@ -100,78 +97,51 @@
       "Bash(lazygit:*)",
       "Bash(orch:*)",
       "Bash(tmux capture-pane:*)",
-      "Bash(linear issue view:*)",
-      "Bash(columnctl db console:*)",
-      "Bash(columnctl db schema:*)",
-      "Bash(columnctl db:* -e dev:*)",
-      "Bash(columnctl db:* -e staging:*)",
-      "Bash(columnctl releases:*)",
-      "Bash(columnctl --help:*)",
-      "Bash(columnctl * --help:*)",
-      "Bash(columnctl tailscale status)",
-      "Bash(kubectl config get-contexts:*)",
-      "Bash(kubectl config current-context:*)",
-      "Bash(kubectl describe:*)",
-      "Bash(kubectl logs:*)",
-      "Bash(kubectl get:*)",
-      "Bash(aws s3 ls:*)",
-      "Skill(linear-cli)",
-      "mcp__linear-server__get_issue",
-      "mcp__claude_ai_Linear__*",
-      "mcp__claude_ai_Slack__slack_search_public_and_private",
-      "mcp__claude_ai_Slack__slack_search_public",
-      "mcp__claude_ai_Slack__slack_search_channels",
-      "mcp__claude_ai_Slack__slack_search_users",
-      "mcp__claude_ai_Slack__slack_read_thread",
-      "mcp__claude_ai_Slack__slack_read_channel",
-      "mcp__claude_ai_Slack__slack_send_message_draft",
+      "Bash(claude plugins:*)",
+      "Bash(CLAUDECODE= claude plugins:*)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:linear.app)",
-      "WebFetch(domain:column-na.slack.com)",
-      "WebFetch(domain:app.frbservices.org)",
       "WebFetch(domain:myndex.ai)",
       "WebSearch",
       "Read",
       "Glob",
       "Grep",
-      "Bash(python3 */.claude/skills/linear-cli/scripts/linear_cli.py:*)",
-      "Bash(python3 .claude/commands/deploy-column-prod/scripts/monitor_workflows.py:*)",
-      "Bash(columnctl agent session --help:*)",
-      "Bash(columnctl agent --help:*)",
-      "Bash(python3.11 -m pip:*)",
-      "Bash(columnctl agent start:*)",
-      "Bash(columnctl agent attach:*)",
-      "Bash(columnctl agent list:*)",
-      "Bash(claude plugins:*)",
-      "Bash(CLAUDECODE= claude plugins:*)",
-      "Bash(columnctl db:*)",
       "Skill(design:design)"
     ],
     "deny": [
       "Bash(gh pr comment:*)",
       "Bash(gh pr review:*)",
-      "Bash(gh pr merge:*)",
-      "Bash(terraform apply:*)",
-      "Bash(aws sts get-caller-identity:*)",
-      "Bash(aws configure list:*)",
-      "Bash(cat ~/.aws/credentials:*)",
-      "Bash(cat ~/.aws/config:*)",
-      "Read(/Users/*/.aws/credentials)",
-      "Read(/Users/*/.aws/config)",
-      "mcp__claude_ai_Slack__slack_send_message",
-      "mcp__claude_ai_Slack__slack_schedule_message"
+      "Bash(gh pr merge:*)"
     ],
-    "defaultMode": "default"
+    "defaultMode": "bypassPermissions"
   },
-  "model": "opus",
+  "model": "opus[1m]",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/azhou@column.com/.claude/hooks/rtk-rewrite.sh"
+          },
+          {
+            "type": "command",
+            "command": "/Users/azhou@column.com/.claude/hooks/skip-rtk-lint.sh"
+          }
+        ]
+      }
+    ]
+  },
   "statusLine": {
     "type": "command",
     "command": "bash ~/.claude/statusline-command.sh"
   },
   "enabledPlugins": {
     "gopls-lsp@claude-plugins-official": true,
-    "column-db@local-desktop-app-uploads": true
+    "frontend-design@claude-plugins-official": true
   },
+  "effortLevel": "high",
   "promptSuggestionEnabled": false,
-  "skipDangerousModePermissionPrompt": true
+  "skipDangerousModePermissionPrompt": true,
+  "voiceEnabled": true
 }

@@ -6,7 +6,6 @@ input=$(cat)
 cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // ""')
 model=$(echo "$input" | jq -r '.model.display_name // ""')
 used=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
-session=$(echo "$input" | jq -r '.session_name // empty')
 cost=$(echo "$input" | jq -r '.cost.total_cost_usd // empty')
 sid=$(echo "$input" | jq -r '.session_id // empty')
 
@@ -70,14 +69,6 @@ reset="\033[0m"
 # Build top line parts
 parts="${bold_green}${short_cwd}${reset}"
 
-if [ -n "$git_branch" ]; then
-    parts="${parts}  ${cyan}${git_branch}${reset}"
-fi
-
-if [ -n "$model" ]; then
-    parts="${parts}  ${magenta}${model}${reset}"
-fi
-
 if [ -n "$used" ]; then
     used_int=$(printf "%.0f" "$used")
     parts="${parts}  ${yellow}ctx:${used_int}%${reset}"
@@ -89,10 +80,6 @@ if [ -n "$sid" ] && [ -s "$cost_log" ]; then
         cost_fmt=$(printf "%.2f" "$sc")
         parts="${parts}  ${yellow}\$${cost_fmt}${reset}"
     fi
-fi
-
-if [ -n "$session" ]; then
-    parts="${parts}  ${cyan}[${session}]${reset}"
 fi
 
 printf "%b\n" "$parts"

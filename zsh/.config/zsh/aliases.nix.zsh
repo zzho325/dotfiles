@@ -7,6 +7,19 @@ alias ll='ls -alh --color'
 alias py='python3'
 alias sq='sqlite3'
 alias lg='lazygit'
+
+jj-init() {
+  local gitdir=$(git rev-parse --git-dir 2>/dev/null)
+  if [[ -z "$gitdir" ]]; then
+    echo "Not in a git repo"
+    return 1
+  fi
+  if [[ -d .jj ]]; then
+    echo "jj already initialized"
+    return 0
+  fi
+  jj git init --git-repo="$gitdir"
+}
 alias treev='eza --tree --header --git --ignore-glob .DS_Store --icons --all'
 
 # editors
@@ -45,18 +58,33 @@ pr() {
 }
 
 rebase-main() {
-  git fetch origin main
-  git branch -f main origin/main
-  if [[ -n "$1" ]]; then
-    git rebase --autostash --onto origin/main HEAD~"$1"
-  else
-    local n
-    n=$(git rev-list --count --right-only --cherry-pick origin/main...HEAD)
-    if [[ "$n" -eq 0 ]]; then
-      echo "No unique commits to rebase"
+  if [[ -d .jj ]]; then
+    jj git fetch
+    jj git export
+    git branch -f main origin/main 2>/dev/null
+    local root
+    root=$(jj log -r 'roots(::@ & ~::main)' --no-graph -T 'change_id.shortest()' --limit 1)
+    if [[ -z "$root" ]]; then
+      echo "No commits to rebase"
       return 0
     fi
-    echo "Rebasing $n commit(s) onto origin/main"
-    git rebase --autostash --onto origin/main HEAD~"$n"
+    echo "Rebasing stack from $root onto main"
+    jj rebase -s "$root" -d main
+  else
+    git fetch origin main
+    git branch -f main origin/main
+    if [[ -n "$1" ]]; then
+      git rebase --autostash --onto origin/main HEAD~"$1"
+    else
+      local n
+      n=$(git rev-list --count --right-only --cherry-pick origin/main...HEAD)
+      if [[ "$n" -eq 0 ]]; then
+        echo "No unique commits to rebase"
+        return 0
+      fi
+      echo "Rebasing $n commit(s) onto origin/main"
+      git rebase --autostash --onto origin/main HEAD~"$n"
+    fi
   fi
 }
+

@@ -1,0 +1,49 @@
+#!/bin/bash
+# orderlint-diff: run orderlint and filter to only violations in files changed since a baseline.
+# Usage: orderlint-diff <baseline-rev> [orderlint-args...] [packages...]
+#
+# Examples:
+#   orderlint-diff origin/main ./pkg/transfers/...
+#   orderlint-diff HEAD~3 ./...
+set -euo pipefail
+
+baseline="${1:?Usage: orderlint-diff <baseline-rev> [orderlint-args...] [packages...]}"
+shift
+
+ORDERLINT="${ORDERLINT:-$(dirname "$0")/orderlint}"
+if [ ! -x "$ORDERLINT" ]; then
+	ORDERLINT="go run $(dirname "$0")/main.go"
+fi
+
+# Get the set of Go files changed since baseline.
+changed_files=$(git diff --name-only "$baseline" -- '*.go' | sort -u)
+if [ -z "$changed_files" ]; then
+	echo "No Go files changed since $baseline"
+	exit 0
+fi
+
+# Run orderlint, capture output (diagnostics go to stderr for singlechecker).
+output=$($ORDERLINT "$@" 2>&1) || true
+
+if [ -z "$output" ]; then
+	exit 0
+fi
+
+# Filter: keep only diagnostics whose file path matches a changed file.
+# Diagnostic format: /absolute/path/to/file.go:line:col: message
+exit_code=0
+repo_root=$(git rev-parse --show-toplevel)
+
+while IFS= read -r line; do
+	# Extract file path from diagnostic (everything before first ':').
+	diag_file="${line%%:*}"
+	# Make relative to repo root for comparison.
+	rel_file="${diag_file#"$repo_root/"}"
+
+	if echo "$changed_files" | grep -qxF "$rel_file"; then
+		echo "$line"
+		exit_code=1
+	fi
+done <<< "$output"
+
+exit $exit_code
