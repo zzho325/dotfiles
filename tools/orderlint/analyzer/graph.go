@@ -16,6 +16,12 @@ var (
 	printedFiles = map[string]bool{}
 )
 
+// child pairs a callee with the line where it's called from its parent.
+type child struct {
+	fi       *funcInfo
+	callLine int
+}
+
 // printCallTree prints an ASCII call tree for a single file's functions.
 func printCallTree(
 	fset *token.FileSet,
@@ -38,20 +44,15 @@ func printCallTree(
 	printedFiles[fileName] = true
 	printedMu.Unlock()
 
-	// Build adjacency list: caller → callees (deduplicated, ordered by callee line).
-	adj := map[*funcInfo][]*funcInfo{}
-	seen := map[[2]*funcInfo]bool{}
+	// Build adjacency list: caller → callees, ordered by call-site line.
+	// Not deduplicated — repeat calls show as ↩ in the tree.
+	adj := map[*funcInfo][]child{}
 	for _, e := range edges {
-		key := [2]*funcInfo{e.caller, e.callee}
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		adj[e.caller] = append(adj[e.caller], e.callee)
+		adj[e.caller] = append(adj[e.caller], child{fi: e.callee, callLine: e.callLine})
 	}
 	for _, children := range adj {
 		sort.Slice(children, func(i, j int) bool {
-			return children[i].line < children[j].line
+			return children[i].callLine < children[j].callLine
 		})
 	}
 
@@ -91,7 +92,7 @@ func printNode(
 	prefix string,
 	isLast bool,
 	isRoot bool,
-	adj map[*funcInfo][]*funcInfo,
+	adj map[*funcInfo][]child,
 	violations map[*funcInfo]*funcInfo,
 	visited map[*funcInfo]bool,
 ) {
@@ -130,9 +131,9 @@ func printNode(
 		childPrefix = prefix + "  │   "
 	}
 
-	for i, child := range children {
+	for i, c := range children {
 		last := i == len(children)-1
-		printNode(buf, child, childPrefix, last, false, adj, violations, visited)
+		printNode(buf, c.fi, childPrefix, last, false, adj, violations, visited)
 	}
 }
 
@@ -156,6 +157,77 @@ func buildViolationMap(
 	for callee, caller := range earliestCaller {
 		if callee.line < caller.line {
 			violations[callee] = caller
+		}
+	}
+	return violations
+}
+
+// siblingViolation records a callee that is defined out of order
+// relative to a sibling callee from the same caller.
+type siblingViolation struct {
+	callee      *funcInfo // the out-of-order callee
+	calleeCall  int       // call-site line of callee in caller
+	sibling     *funcInfo // the sibling it should appear after
+	siblingCall int       // call-site line of sibling in caller
+	caller      *funcInfo // their shared caller
+}
+
+// buildSiblingViolations checks that callees of the same caller are defined
+// in the same order they are called. If caller C calls A at line 10 then B
+// at line 20, A's definition should appear before B's definition.
+func buildSiblingViolations(
+	edges []edge,
+	inCycle map[*funcInfo]bool,
+) []siblingViolation {
+	// Group edges by caller, keeping only the first call-site per callee.
+	type callSite struct {
+		callee   *funcInfo
+		callLine int
+	}
+	callerCallees := map[*funcInfo][]callSite{}
+	seen := map[[2]*funcInfo]bool{}
+	for _, e := range edges {
+		if inCycle[e.caller] && inCycle[e.callee] {
+			continue
+		}
+		key := [2]*funcInfo{e.caller, e.callee}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		callerCallees[e.caller] = append(
+			callerCallees[e.caller],
+			callSite{callee: e.callee, callLine: e.callLine},
+		)
+	}
+
+	// For each caller, sort callees by call-site line (call order).
+	// Then check: if A is called before B, A should be defined before B.
+	var violations []siblingViolation
+	for caller, sites := range callerCallees {
+		sort.Slice(sites, func(i, j int) bool {
+			return sites[i].callLine < sites[j].callLine
+		})
+		// For each callee, check against its immediate predecessor in
+		// call order. Only report once per callee (not against every sibling).
+		reported := map[*funcInfo]bool{}
+		for i := 1; i < len(sites); i++ {
+			prev := sites[i-1] // called earlier
+			cur := sites[i]    // called later
+			if prev.callee == cur.callee || reported[prev.callee] {
+				continue
+			}
+			// prev is called before cur, so prev should be defined before cur.
+			if prev.callee.line > cur.callee.line {
+				reported[prev.callee] = true
+				violations = append(violations, siblingViolation{
+					callee:      prev.callee,
+					calleeCall:  prev.callLine,
+					sibling:     cur.callee,
+					siblingCall: cur.callLine,
+					caller:      caller,
+				})
+			}
 		}
 	}
 	return violations

@@ -37,9 +37,11 @@ type funcInfo struct {
 }
 
 // edge represents a caller→callee relationship within a file.
+// callLine is the source line of the call site within the caller's body.
 type edge struct {
-	caller *funcInfo
-	callee *funcInfo
+	caller   *funcInfo
+	callee   *funcInfo
+	callLine int // line number of the call expression in the caller
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -118,6 +120,26 @@ func analyzeFile(
 		})
 	}
 
+	// Report sibling ordering violations.
+	// Only report if the callee isn't already flagged by caller-before-callee check.
+	siblingViolations := buildSiblingViolations(edges, inCycle)
+	for _, sv := range siblingViolations {
+		if _, alreadyFlagged := violations[sv.callee]; alreadyFlagged {
+			continue
+		}
+		pass.Report(analysis.Diagnostic{
+			Pos: sv.callee.pos,
+			Message: fmt.Sprintf(
+				"%s (line %d) should appear before %s (line %d) — %s calls %s (line %d) before %s (line %d)",
+				sv.callee.name, fset.Position(sv.callee.pos).Line,
+				sv.sibling.name, fset.Position(sv.sibling.pos).Line,
+				sv.caller.name,
+				sv.callee.name, sv.calleeCall,
+				sv.sibling.name, sv.siblingCall,
+			),
+		})
+	}
+
 	// Test file: check that helpers appear after test functions.
 	if isTest {
 		checkTestHelperOrdering(pass, funcs)
@@ -148,7 +170,12 @@ func buildCallGraph(
 			}
 			callee := resolveCallee(pass, call, fileObjs, objToFunc)
 			if callee != nil && callee != caller {
-				edges = append(edges, edge{caller: caller, callee: callee})
+				callLine := pass.Fset.Position(call.Pos()).Line
+				edges = append(edges, edge{
+					caller:   caller,
+					callee:   callee,
+					callLine: callLine,
+				})
 			}
 			return true
 		})

@@ -99,9 +99,12 @@ Use `notes.md` in the repo root as a shared scratchpad. Structure:
 - **User questions stay verbatim** — never rewrite or clean up the user's text.
 - **Worker responds with `>` quotes below each item.
 - Add new numbered items for new topics (decisions, findings, blockers).
-- **Resolving items**: When the user writes "resolve" on an item, move the entire
-  thread (question + all responses) from `### WIP` to `### Done`. Renumber remaining
-  WIP items. Keep Done items as a collapsed reference.
+- **Auto-resolve**: After responding to a thread AND applying any changes,
+  move it to Done immediately. Only keep items in WIP that are waiting on
+  user input (unanswered questions, unreviewed proposals).
+- **Explicit resolve**: When the user writes "resolve" on an item, move it
+  to Done even if you haven't acted on it (user is dismissing it).
+- Done items go in `### Done` as collapsed `<details>` references.
 
 ### Code changes require approval
 
@@ -121,6 +124,11 @@ Use `notes.md` in the repo root as a shared scratchpad. Structure:
 
 This applies to all code edits (Write, Edit). Reading files, searching, and
 updating notes.md do not require approval.
+
+**Approval means the user stamps/marks items `[x]`.** If the user asks a question
+about a proposed change (e.g. "should we also check X?"), that is NOT approval to
+implement — respond in notes.md and wait for the stamp. Only implement when items
+are explicitly marked `[x]`.
 
 </process>
 

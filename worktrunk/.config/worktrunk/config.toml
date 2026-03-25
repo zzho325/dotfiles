@@ -1,4 +1,5 @@
 worktree-path = "{{ repo_path }}/{{ branch | sanitize }}"
 
 [post-create]
-jj = 'jj git init --git-repo="$(git rev-parse --git-dir)"'
+design = 'ln -sfn {{ repo_path }}/{{ default_branch }}/docs/design {{ worktree_path }}/docs/design'
+jj = '[ -d .jj ] || jj git init --git-repo={{ repo_path }}'
