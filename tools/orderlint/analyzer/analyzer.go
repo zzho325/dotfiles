@@ -41,7 +41,8 @@ type funcInfo struct {
 type edge struct {
 	caller   *funcInfo
 	callee   *funcInfo
-	callLine int // line number of the call expression in the caller
+	callLine int  // line number of the call expression in the caller
+	nested   bool // true if this call is inside another call's argument list
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -163,7 +164,9 @@ func buildCallGraph(
 		if caller.decl.Body == nil {
 			continue
 		}
-		ast.Inspect(caller.decl.Body, func(n ast.Node) bool {
+		callDepth := 0
+		var walk func(ast.Node) bool
+		walk = func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -175,10 +178,18 @@ func buildCallGraph(
 					caller:   caller,
 					callee:   callee,
 					callLine: callLine,
+					nested:   callDepth > 0,
 				})
 			}
-			return true
-		})
+			// Walk arguments at incremented depth.
+			callDepth++
+			for _, arg := range call.Args {
+				ast.Inspect(arg, walk)
+			}
+			callDepth--
+			return false // already walked children
+		}
+		ast.Inspect(caller.decl.Body, walk)
 	}
 	return edges
 }
@@ -353,6 +364,11 @@ func isTestFunc(name string) bool {
 	return strings.HasPrefix(name, "Test") ||
 		strings.HasPrefix(name, "Benchmark") ||
 		strings.HasPrefix(name, "Example")
+}
+
+// isMethod returns true if the function declaration has a receiver (struct method).
+func isMethod(fi *funcInfo) bool {
+	return fi.decl.Recv != nil && len(fi.decl.Recv.List) > 0
 }
 
 // isUnexported returns true if the function name starts with a lowercase letter.

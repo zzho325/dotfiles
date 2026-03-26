@@ -190,6 +190,11 @@ func buildSiblingViolations(
 		if inCycle[e.caller] && inCycle[e.callee] {
 			continue
 		}
+		// Skip nested calls — e.g. makeBatch(t, testBatchHeader()) where
+		// testBatchHeader is an argument, not an independent sibling call.
+		if e.nested {
+			continue
+		}
 		key := [2]*funcInfo{e.caller, e.callee}
 		if seen[key] {
 			continue
@@ -217,7 +222,11 @@ func buildSiblingViolations(
 			if prev.callee == cur.callee || reported[prev.callee] {
 				continue
 			}
-			// prev is called before cur, so prev should be defined before cur.
+			// Skip when siblings cross the method/function boundary —
+			// methods and standalone functions belong to different ordering tiers.
+			if isMethod(prev.callee) != isMethod(cur.callee) {
+				continue
+			}
 			if prev.callee.line > cur.callee.line {
 				reported[prev.callee] = true
 				violations = append(violations, siblingViolation{
