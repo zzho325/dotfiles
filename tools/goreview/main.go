@@ -23,6 +23,7 @@ import (
 func main() {
 	base := flag.String("diff", "", "base ref for diff (e.g., origin/main)")
 	depth := flag.Int("depth", 0, "max call depth from roots (0 = unlimited)")
+	changesOnly := flag.Bool("changes-only", false, "only show subtrees with new/modified functions (requires --diff)")
 	flag.Parse()
 
 	patterns := flag.Args()
@@ -46,7 +47,7 @@ func main() {
 		}
 	}
 
-	render(os.Stdout, g, di, *depth)
+	render(os.Stdout, g, di, *depth, *changesOnly)
 }
 
 // diffInfo tracks which files/lines are new or modified relative to a base ref.
@@ -58,6 +59,7 @@ type diffInfo struct {
 
 type lineRange struct {
 	start, end int
+	pureAdd    bool // old-side count is 0 — entire hunk is new code
 }
 
 type diffStatus int
@@ -90,12 +92,37 @@ func (d *diffInfo) classify(fn *funcNode) diffStatus {
 	if d.newFiles[rel] {
 		return added
 	}
+	// Check if the function is fully covered by pure-addition hunks.
+	// If so, it's a new function in a modified file.
+	overlaps := false
+	coveredLines := 0
+	allPureAdd := true
+	fnLen := fn.endLine - fn.line + 1
 	for _, h := range d.hunks[rel] {
 		if fn.line <= h.end && fn.endLine >= h.start {
-			return modified
+			overlaps = true
+			if !h.pureAdd {
+				allPureAdd = false
+			}
+			// Count how many of the function's lines this hunk covers.
+			lo := h.start
+			if fn.line > lo {
+				lo = fn.line
+			}
+			hi := h.end
+			if fn.endLine < hi {
+				hi = fn.endLine
+			}
+			coveredLines += hi - lo + 1
 		}
 	}
-	return unchanged
+	if !overlaps {
+		return unchanged
+	}
+	if allPureAdd && coveredLines >= fnLen {
+		return added
+	}
+	return modified
 }
 
 func getDiff(base string) (*diffInfo, error) {
@@ -142,6 +169,20 @@ func getDiff(base string) (*diffInfo, error) {
 // parseHunk extracts the new-side line range from a unified diff hunk header.
 // Format: @@ -old[,count] +new[,count] @@
 func parseHunk(line string) lineRange {
+	// Parse old side to detect pure additions (old count = 0).
+	minus := strings.Index(line, "-")
+	oldCount := 1
+	if minus >= 0 {
+		oldRest := line[minus+1:]
+		if sp := strings.IndexByte(oldRest, ' '); sp >= 0 {
+			oldRest = oldRest[:sp]
+		}
+		oldParts := strings.SplitN(oldRest, ",", 2)
+		if len(oldParts) > 1 {
+			oldCount, _ = strconv.Atoi(oldParts[1])
+		}
+	}
+
 	plus := strings.Index(line, "+")
 	if plus < 0 {
 		return lineRange{}
@@ -162,5 +203,9 @@ func parseHunk(line string) lineRange {
 	if count == 0 {
 		return lineRange{} // pure deletion
 	}
-	return lineRange{start: start, end: start + count - 1}
+	return lineRange{
+		start:   start,
+		end:     start + count - 1,
+		pureAdd: oldCount == 0,
+	}
 }

@@ -7,7 +7,29 @@ import (
 	"strings"
 )
 
-func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int) {
+// subtreeHasChanges returns true if fn or any of its transitive callees are new/modified.
+func subtreeHasChanges(
+	fn *funcNode,
+	adj map[*funcNode][]callChild,
+	di *diffInfo,
+	seen map[*funcNode]bool,
+) bool {
+	if seen[fn] {
+		return false
+	}
+	seen[fn] = true
+	if di.classify(fn) != unchanged {
+		return true
+	}
+	for _, c := range adj[fn] {
+		if subtreeHasChanges(c.fn, adj, di, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int, changesOnly bool) {
 	// Header with stats.
 	fmt.Fprintf(w, "%s", g.pkgPath)
 	if di != nil {
@@ -74,7 +96,11 @@ func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int) {
 	visited := map[*funcNode]bool{}
 
 	// Standalone exported functions.
+	changesCheckSeen := map[*funcNode]bool{}
 	for _, fn := range standalone {
+		if changesOnly && di != nil && !subtreeHasChanges(fn, g.adj, di, changesCheckSeen) {
+			continue
+		}
 		printFuncNode(w, fn, "  ", true, true, "", g.adj, di, visited, 0, maxDepth)
 	}
 	if len(standalone) > 0 && len(typeRoots) > 0 {
@@ -85,6 +111,18 @@ func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int) {
 	typeNames := sortedKeys(typeRoots)
 	for ti, tname := range typeNames {
 		roots := typeRoots[tname]
+		if changesOnly && di != nil {
+			var filtered []*funcNode
+			for _, fn := range roots {
+				if subtreeHasChanges(fn, g.adj, di, changesCheckSeen) {
+					filtered = append(filtered, fn)
+				}
+			}
+			if len(filtered) == 0 {
+				continue
+			}
+			roots = filtered
+		}
 		sort.Slice(roots, func(i, j int) bool {
 			return roots[i].line < roots[j].line
 		})

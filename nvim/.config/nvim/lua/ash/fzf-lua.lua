@@ -1,4 +1,5 @@
 require("fzf-lua").setup({
+	formatter = "path.filename_first",
 	fzf_opts = {
 		["--ansi"]     = "",
 		["--multi"]    = "",
@@ -19,10 +20,8 @@ require("fzf-lua").setup({
 	},
 	files = {
 		git_icons = true,
-		formatter = "path.filename_first",
 	},
 	grep = {
 		git_icons = true,
-		formatter = "path.filename_first",
-	}
+	},
 })

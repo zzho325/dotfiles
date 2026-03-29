@@ -35,7 +35,17 @@ func main() {
 
 	switch args[0] {
 	case "wip":
-		cmdWip(path)
+		if len(args) > 1 {
+			wipArgs := args[1:]
+			readStdin := wipArgs[len(wipArgs)-1] == "-"
+			if readStdin {
+				wipArgs = wipArgs[:len(wipArgs)-1]
+			}
+			cmdWipAdd(path, strings.Join(wipArgs, " "), readStdin)
+		} else {
+			cmdWip(path)
+		}
+
 	case "resolve":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: notes resolve <N|all>")
@@ -46,15 +56,26 @@ func main() {
 		cmdDone(path)
 	case "propose":
 		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: notes propose \"title\" [- < body]")
+			fmt.Fprintln(os.Stderr, "usage: notes propose \"title\" [-b \"body\" | -]")
 			os.Exit(1)
 		}
 		propArgs := args[1:]
-		readStdin := len(propArgs) > 0 && propArgs[len(propArgs)-1] == "-"
-		if readStdin {
+		var body string
+		var readStdin bool
+		// Check for -b "body" flag
+		for i := 0; i < len(propArgs)-1; i++ {
+			if propArgs[i] == "-b" {
+				body = propArgs[i+1]
+				propArgs = append(propArgs[:i], propArgs[i+2:]...)
+				break
+			}
+		}
+		// Check for trailing "-" (stdin)
+		if len(propArgs) > 0 && propArgs[len(propArgs)-1] == "-" {
+			readStdin = true
 			propArgs = propArgs[:len(propArgs)-1]
 		}
-		cmdPropose(path, strings.Join(propArgs, " "), readStdin)
+		cmdPropose(path, strings.Join(propArgs, " "), body, readStdin)
 	case "proposals":
 		cmdProposals(path)
 	case "stamp":
@@ -65,6 +86,12 @@ func main() {
 		cmdStamp(path, args[1])
 	case "approved":
 		cmdApproved(path)
+	case "delete":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: notes delete <N>")
+			os.Exit(1)
+		}
+		cmdDelete(path, args[1])
 	case "applied":
 		cmdApplied(path)
 	default:
@@ -78,14 +105,16 @@ func printUsage() {
 
 threads:
   wip              list WIP threads
+  wip "title" [-]  add WIP thread (pipe body via stdin)
   resolve <N>      move WIP thread N to Done
   resolve all      move all WIP threads to Done
   done             list Done thread summaries
 
 proposals:
-  propose "desc"   add proposal (pipe body via stdin)
+  propose "desc" [-b "body"]  add proposal (body via -b or stdin -)
   proposals        list all proposals
   stamp <N>        mark proposal N as approved [x]
+  delete <N>       delete proposal N
   approved         list only approved [x] proposals
   applied          move approved [x] proposals to Done`)
 }
@@ -418,6 +447,16 @@ func (p *parsedFile) writeBack(path string) error {
 
 // ── Helpers ──
 
+func (p *parsedFile) nextThreadNum() int {
+	max := 0
+	for _, t := range p.threads {
+		if t.num > max {
+			max = t.num
+		}
+	}
+	return max + 1
+}
+
 func (p *parsedFile) nextPropNum() int {
 	max := 0
 	for _, chunk := range p.propChunks {
@@ -487,6 +526,43 @@ func cmdWip(path string) {
 			fmt.Println()
 		}
 	}
+}
+
+func cmdWipAdd(path string, title string, readStdin bool) {
+	p, err := parseFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	n := p.nextThreadNum()
+	threadLines := []string{fmt.Sprintf("%d. %s", n, title)}
+
+	if readStdin {
+		threadLines = append(threadLines, "")
+		scanner := bufio.NewScanner(os.Stdin)
+		// Increase buffer for large bodies (1MB).
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				threadLines = append(threadLines, "")
+			} else {
+				threadLines = append(threadLines, "   "+line)
+			}
+		}
+	}
+
+	p.threads = append(p.threads, thread{
+		num:   n,
+		lines: threadLines,
+	})
+
+	if err := p.writeBack(path); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("added: %d. %s\n", n, title)
 }
 
 func cmdResolve(path string, arg string) {
@@ -559,7 +635,7 @@ func cmdDone(path string) {
 	}
 }
 
-func cmdPropose(path string, desc string, readStdin bool) {
+func cmdPropose(path string, desc string, body string, readStdin bool) {
 	p, err := parseFile(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -574,11 +650,28 @@ func cmdPropose(path string, desc string, readStdin bool) {
 	titleLine := fmt.Sprintf("- [ ] **P%d** %s", n, desc)
 	propLines := []string{titleLine}
 
-	// Read body from stdin if "-" flag was passed
+	// Body from -b argument
+	if body != "" {
+		for _, line := range strings.Split(body, "\n") {
+			if line == "" {
+				propLines = append(propLines, "")
+			} else {
+				propLines = append(propLines, "  "+line)
+			}
+		}
+	}
+
+	// Body from stdin
 	if readStdin {
 		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
-			propLines = append(propLines, "  "+scanner.Text())
+			line := scanner.Text()
+			if line == "" {
+				propLines = append(propLines, "")
+			} else {
+				propLines = append(propLines, "  "+line)
+			}
 		}
 	}
 
@@ -647,6 +740,44 @@ func cmdStamp(path string, arg string) {
 		os.Exit(1)
 	}
 	fmt.Printf("stamped: P%d\n", n)
+}
+
+func cmdDelete(path string, arg string) {
+	p, err := parseFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	n, err := strconv.Atoi(arg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid proposal number: %s\n", arg)
+		os.Exit(1)
+	}
+
+	found := false
+	var remaining []propChunk
+	var desc string
+	for _, chunk := range p.propChunks {
+		if chunk.proposal != nil && chunk.proposal.num == n {
+			found = true
+			desc = chunk.proposal.description()
+			continue
+		}
+		remaining = append(remaining, chunk)
+	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "proposal P%d not found\n", n)
+		os.Exit(1)
+	}
+
+	p.propChunks = remaining
+
+	if err := p.writeBack(path); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("deleted: P%d %s\n", n, desc)
 }
 
 func cmdApproved(path string) {

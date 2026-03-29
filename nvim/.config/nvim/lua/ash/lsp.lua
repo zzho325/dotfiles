@@ -47,104 +47,113 @@ function M.setup()
 	-- ensure these servers are installed via mason
 	mason.setup()
 	mason_lspconfig.setup({
-		ensure_installed = { "rust_analyzer", "gopls", "tsserver", "eslint", "lua_ls" },
-		automatic_installation = false, -- we will handle setup via handlers
-	})
+		ensure_installed = { "rust_analyzer", "gopls", "ts_ls", "eslint", "lua_ls" },
+		automatic_installation = false,
+		handlers = {
+			-- default handler
+			function(server_name)
+				lspconfig[server_name].setup({
+					on_attach = on_attach,
+					capabilities = capabilities,
+				})
+			end,
 
-	-- default handler: attach basic on_attach & capabilities
-	mason_lspconfig.setup_handlers({
-		-- default handler
-		function(server_name)
-			lspconfig[server_name].setup({
-				on_attach = on_attach,
-				capabilities = capabilities,
-			})
-		end,
-
-		-- rust_analyzer
-		["rust_analyzer"] = function()
-			lspconfig.rust_analyzer.setup({
-				on_attach = on_attach,
-				capabilities = capabilities,
-				cmd = { "rust-analyzer" },
-				filetypes = { "rust" },
-				root_dir = util.root_pattern("Cargo.toml", ".git"),
-				settings = {
-					["rust-analyzer"] = {
-						cargo = { allFeatures = true },
-						checkOnSave = { command = "clippy" },
-					},
-				},
-			})
-		end,
-
-		-- gopls
-		["gopls"] = function()
-			lspconfig.gopls.setup({
-				on_attach = on_attach,
-				capabilities = capabilities,
-				cmd = { "gopls" },
-				filetypes = { "go", "gomod", "gowork", "gotmpl" },
-				root_dir = util.root_pattern("go.work", "go.mod", ".git"),
-				settings = {
-					gopls = {
-						gofumpt = true,
-						usePlaceholders = true,
-						staticcheck = true,
-					},
-				},
-			})
-		end,
-
-		-- tsserver
-		["tsserver"] = function()
-			lspconfig.tsserver.setup({
-				on_attach = on_attach,
-				capabilities = capabilities,
-				cmd = { "typescript-language-server", "--stdio" },
-				filetypes = { "javascript", "javascriptreact", "typescript", "typescriptreact" },
-				root_dir = util.root_pattern("package.json", "tsconfig.json", ".git"),
-			})
-		end,
-
-		-- eslint
-		["eslint"] = function()
-			lspconfig.eslint.setup({
-				on_attach = on_attach,
-				capabilities = capabilities,
-				cmd = { "vscode-eslint-language-server", "--stdio" },
-				filetypes = { "javascript", "javascriptreact", "typescript", "typescriptreact" },
-				root_dir = util.root_pattern(".eslintrc.js", ".eslintrc.json", "package.json", ".git"),
-				settings = {
-					eslint = {
-						workingDirectory = { mode = "auto" },
-						format = { enable = false },
-					},
-				},
-			})
-		end,
-
-		-- lua_ls
-		["lua_ls"] = function()
-			lspconfig.lua_ls.setup({
-				on_attach = on_attach,
-				capabilities = capabilities,
-				cmd = { "lua-language-server" },
-				filetypes = { "lua" },
-				root_dir = util.root_pattern(".git", ".config", "lua"),
-				settings = {
-					Lua = {
-						format = { enable = true },
-						diagnostics = {
-							enable = true,
-							globals = { "vim" },
+			-- rust_analyzer
+			["rust_analyzer"] = function()
+				lspconfig.rust_analyzer.setup({
+					on_attach = on_attach,
+					capabilities = capabilities,
+					cmd = { "rust-analyzer" },
+					filetypes = { "rust" },
+					root_dir = util.root_pattern("Cargo.toml", ".git"),
+					settings = {
+						["rust-analyzer"] = {
+							cargo = { allFeatures = true },
+							checkOnSave = { command = "clippy" },
 						},
-						workspace = { checkThirdParty = false },
-						telemetry = { enable = false },
 					},
-				},
-			})
-		end,
+				})
+			end,
+
+			-- gopls
+			["gopls"] = function()
+				lspconfig.gopls.setup({
+					on_attach = on_attach,
+					capabilities = capabilities,
+					cmd = { "gopls" },
+					filetypes = { "go", "gomod", "gowork", "gotmpl" },
+					root_dir = util.root_pattern("go.work", "go.mod", ".git"),
+					settings = {
+						gopls = {
+							gofumpt = true,
+							usePlaceholders = true,
+							staticcheck = true,
+						},
+					},
+				})
+			end,
+
+			-- ts_ls
+			["ts_ls"] = function()
+				lspconfig.ts_ls.setup({
+					on_attach = on_attach,
+					capabilities = capabilities,
+					cmd = { "typescript-language-server", "--stdio" },
+					filetypes = {
+						"javascript", "javascriptreact",
+						"typescript", "typescriptreact",
+					},
+					root_dir = util.root_pattern(
+						"package.json", "tsconfig.json", ".git"
+					),
+				})
+			end,
+
+			-- eslint
+			["eslint"] = function()
+				lspconfig.eslint.setup({
+					on_attach = on_attach,
+					capabilities = capabilities,
+					cmd = { "vscode-eslint-language-server", "--stdio" },
+					filetypes = {
+						"javascript", "javascriptreact",
+						"typescript", "typescriptreact",
+					},
+					root_dir = util.root_pattern(
+						".eslintrc.js", ".eslintrc.json",
+						"package.json", ".git"
+					),
+					settings = {
+						eslint = {
+							workingDirectory = { mode = "auto" },
+							format = { enable = false },
+						},
+					},
+				})
+			end,
+
+			-- lua_ls
+			["lua_ls"] = function()
+				lspconfig.lua_ls.setup({
+					on_attach = on_attach,
+					capabilities = capabilities,
+					cmd = { "lua-language-server" },
+					filetypes = { "lua" },
+					root_dir = util.root_pattern(".git", ".config", "lua"),
+					settings = {
+						Lua = {
+							format = { enable = true },
+							diagnostics = {
+								enable = true,
+								globals = { "vim" },
+							},
+							workspace = { checkThirdParty = false },
+							telemetry = { enable = false },
+						},
+					},
+				})
+			end,
+		},
 	})
 
 	-- FileType-specific options (preserve your tab/shiftwidth rules)

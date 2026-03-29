@@ -53,7 +53,7 @@ Before spinning up any workers, pull main and create a worktree:
 
 ```bash
 git -C $ORCH_REPO/main pull --ff-only
-wt switch --create task-<short-name> -y --no-cd --no-verify -C $ORCH_REPO/main
+wt switch --create task-<short-name> -y --no-cd -C $ORCH_REPO/main
 orch spawn "task-<short-name>" "~/tasks/<filename>.md" -C $ORCH_REPO/task-<short-name>
 ```
 

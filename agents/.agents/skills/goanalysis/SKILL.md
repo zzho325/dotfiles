@@ -17,6 +17,8 @@ Run Go static analysis tools: **orderlint** checks function ordering, **goreview
 - `/goanalysis lint graph ./pkg/some/package/...` — orderlint ASCII call tree
 - `/goanalysis review ./pkg/some/package/...` — goreview call graph
 - `/goanalysis review --diff origin/main ./pkg/some/package/...` — goreview with diff markers
+- `/goanalysis review --diff origin/main --changes-only ./pkg/some/package/...` — only changed subtrees
+- `/goanalysis summarize ./pkg/some/package/...` — goreview + human-readable summary for PR comments
 
 A package path is always required.
 
@@ -97,6 +99,14 @@ goreview --diff origin/main ./pkg/some/package/...
 
 Adds markers: `+` = new function, `~` = modified, ` ` = unchanged context.
 
+### Changes only (for PR review)
+
+```bash
+goreview --diff origin/main --changes-only ./pkg/some/package/...
+```
+
+Filters to only subtrees containing new/modified functions. Use this for PRs in large packages where unchanged code would bury the changes.
+
 ### Depth limiting
 
 ```bash
@@ -113,6 +123,17 @@ Limits call tree to N levels deep — useful for large packages.
 - `↩` = already shown earlier (cycle or shared callee)
 - Signatures show param names and short type names (`*rsa.PrivateKey` not `*crypto/rsa.PrivateKey`)
 
+## Summarize mode
+
+When the user runs `/goanalysis summarize <packages>`, generate a human-readable PR review comment:
+
+1. Run `goreview --diff origin/main --changes-only <packages>` for each package
+2. Interpret the call graph output and write a summary with:
+   - **Call graph**: the raw tree output in a code block, one section per package
+   - **What changed**: 2-3 sentences describing the new/modified functions and their purpose
+   - **Design notes**: architectural observations — layer separation, validation boundaries, key patterns (idempotency, error wrapping, etc.)
+3. Keep it concise — a reviewer should be able to understand the PR's shape in 30 seconds
+
 ## Tools
 
 | Command | What it does |
@@ -122,6 +143,7 @@ Limits call tree to N levels deep — useful for large packages.
 | `orderlint-diff <rev> ./pkg/...` | Lint only files changed since `<rev>` |
 | `goreview ./pkg/...` | Diff-annotated call graph (cross-file, per package) |
 | `goreview --diff <rev> ./pkg/...` | Call graph with new/modified markers |
+| `goreview --diff <rev> --changes-only ./pkg/...` | Only subtrees with changes |
 | `goreview --depth N ./pkg/...` | Depth-limited call graph |
 
 Source: `~/dotfiles/tools/orderlint/`, `~/dotfiles/tools/goreview/`
