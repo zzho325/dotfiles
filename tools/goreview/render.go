@@ -29,7 +29,7 @@ func subtreeHasChanges(
 	return false
 }
 
-func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int, changesOnly bool) {
+func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int, changesOnly bool, short bool) {
 	// Header with stats.
 	fmt.Fprintf(w, "%s", g.pkgPath)
 	if di != nil {
@@ -101,7 +101,7 @@ func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int, changesOnly b
 		if changesOnly && di != nil && !subtreeHasChanges(fn, g.adj, di, changesCheckSeen) {
 			continue
 		}
-		printFuncNode(w, fn, "  ", true, true, "", g.adj, di, visited, 0, maxDepth)
+		printFuncNode(w, fn, "  ", true, true, "", g.adj, di, visited, 0, maxDepth, short)
 	}
 	if len(standalone) > 0 && len(typeRoots) > 0 {
 		fmt.Fprintln(w)
@@ -129,7 +129,7 @@ func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int, changesOnly b
 		fmt.Fprintf(w, "  %s\n", tname)
 		for i, fn := range roots {
 			isLast := i == len(roots)-1
-			printFuncNode(w, fn, "  ", isLast, false, tname, g.adj, di, visited, 0, maxDepth)
+			printFuncNode(w, fn, "  ", isLast, false, tname, g.adj, di, visited, 0, maxDepth, short)
 		}
 		if ti < len(typeNames)-1 {
 			fmt.Fprintln(w)
@@ -149,6 +149,7 @@ func printFuncNode(
 	di *diffInfo,
 	visited map[*funcNode]bool,
 	depth, maxDepth int,
+	short bool,
 ) {
 	var marker string
 	if di != nil {
@@ -180,9 +181,9 @@ func printFuncNode(
 	}
 	visited[fn] = true
 
-	label := name + fn.sig
-	if !fn.exported {
-		label += "  [unexported]"
+	label := name
+	if !short {
+		label += fn.sig
 	}
 	fmt.Fprintf(w, "%s%s%s%s\n", marker, prefix, connector, label)
 
@@ -207,7 +208,7 @@ func printFuncNode(
 
 	for i, c := range children {
 		last := i == len(children)-1
-		printFuncNode(w, c.fn, childPrefix, last, false, groupRecv, adj, di, visited, depth+1, maxDepth)
+		printFuncNode(w, c.fn, childPrefix, last, false, groupRecv, adj, di, visited, depth+1, maxDepth, short)
 	}
 }
 

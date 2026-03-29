@@ -24,6 +24,7 @@ func main() {
 	base := flag.String("diff", "", "base ref for diff (e.g., origin/main)")
 	depth := flag.Int("depth", 0, "max call depth from roots (0 = unlimited)")
 	changesOnly := flag.Bool("changes-only", false, "only show subtrees with new/modified functions (requires --diff)")
+	short := flag.Bool("short", false, "omit function signatures, show names only")
 	flag.Parse()
 
 	patterns := flag.Args()
@@ -47,7 +48,7 @@ func main() {
 		}
 	}
 
-	render(os.Stdout, g, di, *depth, *changesOnly)
+	render(os.Stdout, g, di, *depth, *changesOnly, *short)
 }
 
 // diffInfo tracks which files/lines are new or modified relative to a base ref.

@@ -134,6 +134,46 @@ if ok then
 	keymap("n", "<leader>fh", fzf.help_tags, { desc = "fzf help" })
 	keymap("n", "<leader>gs", fzf.git_status, { desc = "fzf git status" })
 	keymap("n", "<leader>gc", fzf.git_stash, { desc = "fzf git stash" })
+	keymap("n", "<leader>jb", function()
+		fzf.fzf_exec(
+			"jj log -r '::@ ~ ::main' --no-graph"
+				.. " -T 'if(local_bookmarks, local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\")'",
+			{
+				prompt = "jj bookmark> ",
+				preview = "jj diff -r {} --git --color=always",
+				fzf_opts = { ["--preview-window"] = "right,70%" },
+				actions = {
+					["default"] = function(selected)
+						vim.cmd("DiffviewOpen " .. selected[1] .. "^!")
+					end,
+					["ctrl-v"] = function(selected)
+						vim.cmd("DiffviewOpen main.." .. selected[1])
+					end,
+				},
+			}
+		)
+	end, { desc = "jj bookmark diffview" })
+	keymap("n", "<leader>jr", function()
+		fzf.fzf_exec(
+			"jj log -r '::@ ~ ::main' --no-graph"
+				.. " -T 'if(local_bookmarks, local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\")'",
+			{
+				prompt = "jj review> ",
+				preview = "git diff --name-only main...{} 2>/dev/null"
+					.. " | grep '\\.go$'"
+					.. " | xargs -I@ dirname @"
+					.. " | sort -u"
+					.. " | sed 's|^|./|; s|$|/...|'"
+					.. " | xargs goreview --diff main --changes-only --depth 4 --short 2>&1",
+				fzf_opts = { ["--preview-window"] = "right,70%" },
+				actions = {
+					["default"] = function(selected)
+						vim.cmd("DiffviewOpen " .. selected[1] .. "^!")
+					end,
+				},
+			}
+		)
+	end, { desc = "jj bookmark goreview" })
 end
 
 -- Github --
