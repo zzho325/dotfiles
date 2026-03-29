@@ -7,6 +7,7 @@ alias ll='ls -alh --color'
 alias py='python3'
 alias sq='sqlite3'
 alias lg='lazygit'
+alias jjs='jj log -r "::@ ~ ::main" --no-graph'
 
 jj-init() {
   local gitdir=$(git rev-parse --git-dir 2>/dev/null)
