@@ -212,11 +212,10 @@ func analyzeFile(
 		pass.Report(analysis.Diagnostic{
 			Pos: cgv.fn.pos,
 			Message: fmt.Sprintf(
-				"%s (line %d) should appear after %s (line %d) — %s's caller %s (line %d) appears before %s's caller %s (line %d)",
+				"%s (line %d) should appear after %s (line %d) — %s is reached before %s in the call tree",
 				cgv.fn.name, fset.Position(cgv.fn.pos).Line,
 				cgv.other.name, fset.Position(cgv.other.pos).Line,
-				cgv.other.name, cgv.otherCaller.name, fset.Position(cgv.otherCaller.pos).Line,
-				cgv.fn.name, cgv.fnCaller.name, fset.Position(cgv.fnCaller.pos).Line,
+				cgv.other.name, cgv.fn.name,
 			),
 		})
 	}

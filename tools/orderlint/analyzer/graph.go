@@ -336,89 +336,105 @@ func buildCallerGroupViolations(
 		}
 	}
 
-	// Compute call depth for each function via BFS from entry points.
-	// Entry points (not called by anything) are depth 0.
+	// Build adjacency list with children sorted by call-site line (DFS order).
+	type callChild struct {
+		fn       *funcInfo
+		callLine int
+	}
+	adj := map[*funcInfo][]callChild{}
 	called := map[*funcInfo]bool{}
-	adj := map[*funcInfo][]*funcInfo{}
 	for _, e := range edges {
 		if inCycle[e.caller] && inCycle[e.callee] {
 			continue
 		}
 		called[e.callee] = true
-		adj[e.caller] = append(adj[e.caller], e.callee)
+		adj[e.caller] = append(adj[e.caller], callChild{e.callee, e.callLine})
 	}
-	depth := map[*funcInfo]int{}
-	var queue []*funcInfo
+	for _, children := range adj {
+		sort.Slice(children, func(i, j int) bool {
+			return children[i].callLine < children[j].callLine
+		})
+	}
+
+	// Find entry points (not called by anything), sorted by line.
+	var roots []*funcInfo
+	seen := map[*funcInfo]bool{}
+	for fn := range adj {
+		if !called[fn] && !seen[fn] {
+			roots = append(roots, fn)
+			seen[fn] = true
+		}
+	}
 	for fn := range primaryCaller {
-		if !called[fn] {
-			depth[fn] = 0
-			queue = append(queue, fn)
+		if !called[fn] && !seen[fn] {
+			roots = append(roots, fn)
+			seen[fn] = true
 		}
 	}
-	// Include entry points that are callers but not callees.
-	for caller := range adj {
-		if !called[caller] {
-			if _, ok := depth[caller]; !ok {
-				depth[caller] = 0
-				queue = append(queue, caller)
-			}
+	sort.Slice(roots, func(i, j int) bool {
+		return roots[i].line < roots[j].line
+	})
+
+	// Compute DFS pre-order position for each function.
+	dfsPos := map[*funcInfo]int{}
+	pos := 0
+	var dfs func(*funcInfo)
+	dfs = func(fn *funcInfo) {
+		if _, ok := dfsPos[fn]; ok {
+			return
+		}
+		dfsPos[fn] = pos
+		pos++
+		for _, c := range adj[fn] {
+			dfs(c.fn)
 		}
 	}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		for _, child := range adj[cur] {
-			if _, ok := depth[child]; !ok {
-				depth[child] = depth[cur] + 1
-				queue = append(queue, child)
-			}
-		}
+	for _, root := range roots {
+		dfs(root)
 	}
 
 	// Collect single-caller callees sorted by definition line.
-	type calleePair struct {
-		fn     *funcInfo
-		caller *funcInfo
-	}
-	var callees []calleePair
-	for callee, caller := range primaryCaller {
-		callees = append(callees, calleePair{callee, caller})
+	var callees []*funcInfo
+	for callee := range primaryCaller {
+		callees = append(callees, callee)
 	}
 	sort.Slice(callees, func(i, j int) bool {
-		return callees[i].fn.line < callees[j].fn.line
+		return callees[i].line < callees[j].line
 	})
 
-	// For each pair with different primary callers at the same depth,
-	// check if their callers are in the wrong order.
+	// For each pair of single-caller callees with different callers,
+	// check if their file order matches DFS pre-order.
 	var violations []callerGroupViolation
 	for i := 0; i < len(callees); i++ {
 		for j := i + 1; j < len(callees); j++ {
 			x := callees[i] // appears first in file
 			y := callees[j] // appears second in file
-			if x.caller == y.caller {
+			if primaryCaller[x] == primaryCaller[y] {
 				continue // same caller — handled by sibling check
 			}
-			if depth[x.fn] != depth[y.fn] {
-				continue // different depths — not comparable
-			}
-			if isMethod(x.fn) != isMethod(y.fn) {
+			if isMethod(x) != isMethod(y) {
 				continue
 			}
 			// Skip if already flagged by caller-before-callee check.
-			if _, ok := existingViolations[x.fn]; ok {
+			if _, ok := existingViolations[x]; ok {
 				continue
 			}
-			if _, ok := existingViolations[y.fn]; ok {
+			if _, ok := existingViolations[y]; ok {
 				continue
 			}
-			// x appears before y in file. If x's caller appears AFTER
-			// y's caller, then x should move after y.
-			if x.caller.line > y.caller.line {
+			// x appears before y in file. If DFS visits y before x,
+			// then x is in the wrong position.
+			xPos, xOk := dfsPos[x]
+			yPos, yOk := dfsPos[y]
+			if !xOk || !yOk {
+				continue
+			}
+			if xPos > yPos {
 				violations = append(violations, callerGroupViolation{
-					fn:          x.fn,
-					fnCaller:    x.caller,
-					other:       y.fn,
-					otherCaller: y.caller,
+					fn:          x,
+					fnCaller:    primaryCaller[x],
+					other:       y,
+					otherCaller: primaryCaller[y],
 				})
 				break // only report first violation per function
 			}

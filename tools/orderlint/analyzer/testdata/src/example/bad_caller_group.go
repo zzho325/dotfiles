@@ -10,7 +10,7 @@ func SecondEntry() {
 	secondHelper()
 }
 
-func secondHelper() {} // want `secondHelper .* should appear after firstHelper .* firstHelper's caller FirstEntry .* appears before secondHelper's caller SecondEntry`
+func secondHelper() {} // want `secondHelper .* should appear after firstHelper .* firstHelper is reached before secondHelper in the call tree`
 
 
 func firstHelper() {}
