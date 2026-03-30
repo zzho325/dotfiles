@@ -184,14 +184,30 @@ func buildSiblingViolations(
 		callee   *funcInfo
 		callLine int
 	}
+
+	// allCallerCallees includes nested calls — used to detect
+	// contradictory orderings across callers even when one caller's
+	// call is nested (e.g. insertRecords(t, createBatch(t))).
+	allCallerCallees := map[*funcInfo][]callSite{}
+	allSeen := map[[2]*funcInfo]bool{}
+
+	// callerCallees excludes nested calls — used for violation reporting
+	// (nested calls aren't independent sequential siblings).
 	callerCallees := map[*funcInfo][]callSite{}
 	seen := map[[2]*funcInfo]bool{}
+
 	for _, e := range edges {
 		if inCycle[e.caller] && inCycle[e.callee] {
 			continue
 		}
-		// Skip nested calls — e.g. makeBatch(t, testBatchHeader()) where
-		// testBatchHeader is an argument, not an independent sibling call.
+		akey := [2]*funcInfo{e.caller, e.callee}
+		if !allSeen[akey] {
+			allSeen[akey] = true
+			allCallerCallees[e.caller] = append(
+				allCallerCallees[e.caller],
+				callSite{callee: e.callee, callLine: e.callLine},
+			)
+		}
 		if e.nested {
 			continue
 		}
@@ -206,13 +222,43 @@ func buildSiblingViolations(
 		)
 	}
 
-	// For each caller, sort callees by call-site line (call order).
-	// Then check: if A is called before B, A should be defined before B.
-	var violations []siblingViolation
-	for caller, sites := range callerCallees {
+	// Sort both maps by call-site line.
+	for _, sites := range allCallerCallees {
 		sort.Slice(sites, func(i, j int) bool {
 			return sites[i].callLine < sites[j].callLine
 		})
+	}
+	for _, sites := range callerCallees {
+		sort.Slice(sites, func(i, j int) bool {
+			return sites[i].callLine < sites[j].callLine
+		})
+	}
+
+	// Collect implied orderings and first-call-site per callee from
+	// ALL edges (including nested). A nested call like createBatch
+	// inside insertRecords(t, createBatch(t)) still establishes that
+	// createBatch appears before later siblings in the same caller.
+	type funcPair struct{ first, second *funcInfo }
+	impliedOrder := map[funcPair]bool{}
+	firstCallLine := map[*funcInfo]int{}
+	for _, sites := range allCallerCallees {
+		for i := 0; i < len(sites); i++ {
+			if prev, ok := firstCallLine[sites[i].callee]; !ok || sites[i].callLine < prev {
+				firstCallLine[sites[i].callee] = sites[i].callLine
+			}
+			for j := i + 1; j < len(sites); j++ {
+				a, b := sites[i].callee, sites[j].callee
+				if a == b || isMethod(a) != isMethod(b) {
+					continue
+				}
+				impliedOrder[funcPair{a, b}] = true
+			}
+		}
+	}
+
+	// Check: if A is called before B (same caller), A should be defined before B.
+	var violations []siblingViolation
+	for caller, sites := range callerCallees {
 		// For each callee, check against its immediate predecessor in
 		// call order. Only report once per callee (not against every sibling).
 		reported := map[*funcInfo]bool{}
@@ -227,6 +273,14 @@ func buildSiblingViolations(
 			if isMethod(prev.callee) != isMethod(cur.callee) {
 				continue
 			}
+			// When another caller imposes the opposite ordering, the
+			// constraints conflict. The callee called earliest across
+			// the file wins — skip if this caller's ordering disagrees
+			// with the first-call-site ordering.
+			if impliedOrder[funcPair{cur.callee, prev.callee}] &&
+				firstCallLine[cur.callee] <= firstCallLine[prev.callee] {
+				continue
+			}
 			if prev.callee.line > cur.callee.line {
 				reported[prev.callee] = true
 				violations = append(violations, siblingViolation{
@@ -236,6 +290,137 @@ func buildSiblingViolations(
 					siblingCall: cur.callLine,
 					caller:      caller,
 				})
+			}
+		}
+	}
+	return violations
+}
+
+// callerGroupViolation records a function that is defined out of order
+// relative to another function whose primary caller appears earlier.
+type callerGroupViolation struct {
+	fn          *funcInfo // the out-of-order function
+	fnCaller    *funcInfo // its primary caller
+	other       *funcInfo // the function it should appear after
+	otherCaller *funcInfo // the other's primary caller
+}
+
+// buildCallerGroupViolations checks that callees of different callers are
+// ordered consistently with their callers. If FirstEntry (line 10) calls
+// helperA, and SecondEntry (line 20) calls helperB, then helperA should
+// appear before helperB.
+func buildCallerGroupViolations(
+	edges []edge,
+	inCycle map[*funcInfo]bool,
+	existingViolations map[*funcInfo]*funcInfo,
+) []callerGroupViolation {
+	// Find the sole caller for each callee. If a function is called by
+	// multiple different callers, its group ordering is ambiguous — skip it.
+	callerCount := map[*funcInfo]map[*funcInfo]bool{}
+	for _, e := range edges {
+		if inCycle[e.caller] && inCycle[e.callee] {
+			continue
+		}
+		if callerCount[e.callee] == nil {
+			callerCount[e.callee] = map[*funcInfo]bool{}
+		}
+		callerCount[e.callee][e.caller] = true
+	}
+	primaryCaller := map[*funcInfo]*funcInfo{}
+	for callee, callers := range callerCount {
+		if len(callers) != 1 {
+			continue // shared helper — ambiguous ordering
+		}
+		for caller := range callers {
+			primaryCaller[callee] = caller
+		}
+	}
+
+	// Compute call depth for each function via BFS from entry points.
+	// Entry points (not called by anything) are depth 0.
+	called := map[*funcInfo]bool{}
+	adj := map[*funcInfo][]*funcInfo{}
+	for _, e := range edges {
+		if inCycle[e.caller] && inCycle[e.callee] {
+			continue
+		}
+		called[e.callee] = true
+		adj[e.caller] = append(adj[e.caller], e.callee)
+	}
+	depth := map[*funcInfo]int{}
+	var queue []*funcInfo
+	for fn := range primaryCaller {
+		if !called[fn] {
+			depth[fn] = 0
+			queue = append(queue, fn)
+		}
+	}
+	// Include entry points that are callers but not callees.
+	for caller := range adj {
+		if !called[caller] {
+			if _, ok := depth[caller]; !ok {
+				depth[caller] = 0
+				queue = append(queue, caller)
+			}
+		}
+	}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, child := range adj[cur] {
+			if _, ok := depth[child]; !ok {
+				depth[child] = depth[cur] + 1
+				queue = append(queue, child)
+			}
+		}
+	}
+
+	// Collect single-caller callees sorted by definition line.
+	type calleePair struct {
+		fn     *funcInfo
+		caller *funcInfo
+	}
+	var callees []calleePair
+	for callee, caller := range primaryCaller {
+		callees = append(callees, calleePair{callee, caller})
+	}
+	sort.Slice(callees, func(i, j int) bool {
+		return callees[i].fn.line < callees[j].fn.line
+	})
+
+	// For each pair with different primary callers at the same depth,
+	// check if their callers are in the wrong order.
+	var violations []callerGroupViolation
+	for i := 0; i < len(callees); i++ {
+		for j := i + 1; j < len(callees); j++ {
+			x := callees[i] // appears first in file
+			y := callees[j] // appears second in file
+			if x.caller == y.caller {
+				continue // same caller — handled by sibling check
+			}
+			if depth[x.fn] != depth[y.fn] {
+				continue // different depths — not comparable
+			}
+			if isMethod(x.fn) != isMethod(y.fn) {
+				continue
+			}
+			// Skip if already flagged by caller-before-callee check.
+			if _, ok := existingViolations[x.fn]; ok {
+				continue
+			}
+			if _, ok := existingViolations[y.fn]; ok {
+				continue
+			}
+			// x appears before y in file. If x's caller appears AFTER
+			// y's caller, then x should move after y.
+			if x.caller.line > y.caller.line {
+				violations = append(violations, callerGroupViolation{
+					fn:          x.fn,
+					fnCaller:    x.caller,
+					other:       y.fn,
+					otherCaller: y.caller,
+				})
+				break // only report first violation per function
 			}
 		}
 	}

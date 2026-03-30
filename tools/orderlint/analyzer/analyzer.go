@@ -5,13 +5,18 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 )
 
 var graphFlag bool
+var baselineFlag string
 
 var Analyzer = &analysis.Analyzer{
 	Name:     "orderlint",
@@ -25,6 +30,52 @@ func init() {
 		&graphFlag, "graph", false,
 		"print ASCII call tree per file instead of diagnostics",
 	)
+	Analyzer.Flags.StringVar(
+		&baselineFlag, "baseline", "",
+		"path to baseline file of accepted violations (file:Func per line)",
+	)
+}
+
+var (
+	baselineOnce sync.Once
+	baselineSet  map[string]bool
+)
+
+func repoRoot() string {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func loadBaseline() {
+	baselineSet = map[string]bool{}
+	path := baselineFlag
+	if path == "" {
+		if root := repoRoot(); root != "" {
+			path = filepath.Join(root, ".orderlintbaseline")
+		} else {
+			path = ".orderlintbaseline"
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		baselineSet[line] = true
+	}
+}
+
+// isBaselined returns true if the function is listed in the baseline file.
+func isBaselined(fileName, funcName string) bool {
+	baselineOnce.Do(loadBaseline)
+	return baselineSet[filepath.Base(fileName)+":"+funcName]
 }
 
 // funcInfo tracks a function declaration's identity and position.
@@ -110,6 +161,9 @@ func analyzeFile(
 
 	// Report ordering violations.
 	for callee, caller := range violations {
+		if isBaselined(fileName, callee.name) {
+			continue
+		}
 		pass.Report(analysis.Diagnostic{
 			Pos: callee.pos,
 			Message: fmt.Sprintf(
@@ -128,6 +182,9 @@ func analyzeFile(
 		if _, alreadyFlagged := violations[sv.callee]; alreadyFlagged {
 			continue
 		}
+		if isBaselined(fileName, sv.callee.name) {
+			continue
+		}
 		pass.Report(analysis.Diagnostic{
 			Pos: sv.callee.pos,
 			Message: fmt.Sprintf(
@@ -137,6 +194,29 @@ func analyzeFile(
 				sv.caller.name,
 				sv.callee.name, sv.calleeCall,
 				sv.sibling.name, sv.siblingCall,
+			),
+		})
+	}
+
+	// Report caller-group ordering violations (non-test files only).
+	// If A's caller appears before B's caller, A should appear before B.
+	// Skipped for test files where helpers are commonly shared across tests.
+	callerGroupViolations := buildCallerGroupViolations(edges, inCycle, violations)
+	for _, cgv := range callerGroupViolations {
+		if _, alreadyFlagged := violations[cgv.fn]; alreadyFlagged {
+			continue
+		}
+		if isBaselined(fileName, cgv.fn.name) {
+			continue
+		}
+		pass.Report(analysis.Diagnostic{
+			Pos: cgv.fn.pos,
+			Message: fmt.Sprintf(
+				"%s (line %d) should appear after %s (line %d) — %s's caller %s (line %d) appears before %s's caller %s (line %d)",
+				cgv.fn.name, fset.Position(cgv.fn.pos).Line,
+				cgv.other.name, fset.Position(cgv.other.pos).Line,
+				cgv.other.name, cgv.otherCaller.name, fset.Position(cgv.otherCaller.pos).Line,
+				cgv.fn.name, cgv.fnCaller.name, fset.Position(cgv.fnCaller.pos).Line,
 			),
 		})
 	}
@@ -315,8 +395,10 @@ func checkTestHelperOrdering(pass *analysis.Pass, funcs []*funcInfo) {
 	if lastTestLine == 0 {
 		return
 	}
+	fileName := fset.Position(funcs[0].pos).Filename
 	for _, fi := range funcs {
-		if !isTestFunc(fi.name) && isUnexported(fi.name) && fi.line < lastTestLine {
+		if !isTestFunc(fi.name) && isUnexported(fi.name) && fi.line < lastTestLine &&
+			!isBaselined(fileName, fi.name) {
 			pass.Report(analysis.Diagnostic{
 				Pos: fi.pos,
 				Message: fmt.Sprintf(
