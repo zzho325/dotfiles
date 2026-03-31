@@ -15,8 +15,14 @@ if [ ! -x "$ORDERLINT" ]; then
 	ORDERLINT="go run $(dirname "$0")/main.go"
 fi
 
-# Get the set of Go files changed since baseline.
-changed_files=$(git diff --name-only "$baseline" -- '*.go' | sort -u)
+# Get the set of Go files changed since baseline (jj or git).
+if jj workspace root &>/dev/null; then
+	changed_files=$(jj diff --summary --from "$baseline" | awk '{print $NF}' | grep '\.go$' | sort -u)
+	repo_root=$(jj workspace root)
+else
+	changed_files=$(git diff --name-only "$baseline" -- '*.go' | sort -u)
+	repo_root=$(git rev-parse --show-toplevel)
+fi
 if [ -z "$changed_files" ]; then
 	echo "No Go files changed since $baseline"
 	exit 0
@@ -32,7 +38,6 @@ fi
 # Filter: keep only diagnostics whose file path matches a changed file.
 # Diagnostic format: /absolute/path/to/file.go:line:col: message
 exit_code=0
-repo_root=$(git rev-parse --show-toplevel)
 
 while IFS= read -r line; do
 	# Extract file path from diagnostic (everything before first ':').

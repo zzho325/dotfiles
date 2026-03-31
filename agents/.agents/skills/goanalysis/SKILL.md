@@ -146,6 +146,12 @@ When the user runs `/goanalysis summarize <packages>`, generate a human-readable
 | `goreview --diff <rev> --changes-only ./pkg/...` | Only subtrees with changes |
 | `goreview --depth N ./pkg/...` | Depth-limited call graph |
 
+Both `--diff <rev>` and `orderlint-diff <rev>` accept git refs or jj bookmarks — jj is auto-detected.
+
+### Orderlint baseline
+
+`orderlint` auto-reads `.orderlintbaseline` at the git/jj repo root. Each line is `filename:FuncName` to suppress known-accepted violations (e.g., CRUD ordering). Supports `#` comments. Override path with `-baseline=<path>`.
+
 Source: `~/dotfiles/tools/orderlint/`, `~/dotfiles/tools/goreview/`
 Binaries: `~/bin/orderlint`, `~/bin/goreview`
 

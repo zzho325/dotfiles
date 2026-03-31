@@ -46,6 +46,18 @@ func main() {
 			cmdWip(path)
 		}
 
+	case "reply":
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: notes reply <N> \"text\" [-]")
+			os.Exit(1)
+		}
+		replyArgs := args[2:]
+		readStdin := replyArgs[len(replyArgs)-1] == "-"
+		if readStdin {
+			replyArgs = replyArgs[:len(replyArgs)-1]
+		}
+		cmdReply(path, args[1], strings.Join(replyArgs, " "), readStdin)
+
 	case "resolve":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: notes resolve <N|all>")
@@ -78,6 +90,27 @@ func main() {
 		cmdPropose(path, strings.Join(propArgs, " "), body, readStdin)
 	case "proposals":
 		cmdProposals(path)
+	case "update":
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: notes update <N> \"desc\" [-b \"body\" | -]")
+			os.Exit(1)
+		}
+		updateArgs := args[2:]
+		var updateBody string
+		var updateStdin bool
+		for i := 0; i < len(updateArgs)-1; i++ {
+			if updateArgs[i] == "-b" {
+				updateBody = updateArgs[i+1]
+				updateArgs = append(updateArgs[:i], updateArgs[i+2:]...)
+				break
+			}
+		}
+		if len(updateArgs) > 0 && updateArgs[len(updateArgs)-1] == "-" {
+			updateStdin = true
+			updateArgs = updateArgs[:len(updateArgs)-1]
+		}
+		cmdUpdate(path, args[1], strings.Join(updateArgs, " "), updateBody, updateStdin)
+
 	case "stamp":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: notes stamp <N>")
@@ -104,19 +137,21 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, `usage: notes [-f <file>] <command>
 
 threads:
-  wip              list WIP threads
-  wip "title" [-]  add WIP thread (pipe body via stdin)
-  resolve <N>      move WIP thread N to Done
-  resolve all      move all WIP threads to Done
-  done             list Done thread summaries
+  wip                    list WIP threads
+  wip "title" [-]        add WIP thread (pipe body via stdin)
+  reply <N> "text" [-]   append to WIP thread N
+  resolve <N>            move WIP thread N to Done
+  resolve all            move all WIP threads to Done
+  done                   list Done thread summaries
 
 proposals:
-  propose "desc" [-b "body"]  add proposal (body via -b or stdin -)
-  proposals        list all proposals
-  stamp <N>        mark proposal N as approved [x]
-  delete <N>       delete proposal N
-  approved         list only approved [x] proposals
-  applied          move approved [x] proposals to Done`)
+  propose "desc" [-b "body" | -]   add proposal
+  update <N> "desc" [-b "body" | -]  update proposal N
+  proposals              list all proposals
+  stamp <N>              mark proposal N as approved [x]
+  delete <N>             delete proposal N
+  approved               list only approved [x] proposals
+  applied                move approved [x] proposals to Done`)
 }
 
 func findNotesFile(custom string) string {
@@ -298,9 +333,11 @@ func parseWipSection(p *parsedFile, section string) {
 		for end > s.start && strings.TrimSpace(lines[end-1]) == "" {
 			end--
 		}
+		threadLines := make([]string, end-s.start)
+		copy(threadLines, lines[s.start:end])
 		p.threads = append(p.threads, thread{
 			num:   s.num,
-			lines: lines[s.start:end],
+			lines: threadLines,
 		})
 	}
 
@@ -565,6 +602,58 @@ func cmdWipAdd(path string, title string, readStdin bool) {
 	fmt.Printf("added: %d. %s\n", n, title)
 }
 
+func cmdReply(path string, arg string, text string, readStdin bool) {
+	p, err := parseFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	n, err := strconv.Atoi(arg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid thread number: %s\n", arg)
+		os.Exit(1)
+	}
+
+	idx := -1
+	for i, t := range p.threads {
+		if t.num == n {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		fmt.Fprintf(os.Stderr, "WIP thread %d not found\n", n)
+		os.Exit(1)
+	}
+
+	t := &p.threads[idx]
+	t.lines = append(t.lines, "")
+
+	if text != "" {
+		t.lines = append(t.lines, "   "+text)
+	}
+
+	if readStdin {
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				t.lines = append(t.lines, "")
+			} else {
+				t.lines = append(t.lines, "   "+line)
+			}
+		}
+	}
+
+	if err := p.writeBack(path); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("replied to: %d. %s\n", n, t.firstLine())
+}
+
 func cmdResolve(path string, arg string) {
 	p, err := parseFile(path)
 	if err != nil {
@@ -687,6 +776,76 @@ func cmdPropose(path string, desc string, body string, readStdin bool) {
 		os.Exit(1)
 	}
 	fmt.Printf("proposed: P%d %s\n", n, desc)
+}
+
+func cmdUpdate(path string, arg string, desc string, body string, readStdin bool) {
+	p, err := parseFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	n, err := strconv.Atoi(arg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid proposal number: %s\n", arg)
+		os.Exit(1)
+	}
+
+	found := false
+	for i := range p.propChunks {
+		pr := p.propChunks[i].proposal
+		if pr == nil || pr.num != n {
+			continue
+		}
+		found = true
+
+		checkbox := " "
+		if pr.stamped {
+			checkbox = "x"
+		}
+		titleLine := fmt.Sprintf("- [%s] **P%d** %s", checkbox, n, desc)
+
+		hasNewBody := body != "" || readStdin
+		if hasNewBody {
+			propLines := []string{titleLine}
+			if body != "" {
+				for _, line := range strings.Split(body, "\n") {
+					if line == "" {
+						propLines = append(propLines, "")
+					} else {
+						propLines = append(propLines, "  "+line)
+					}
+				}
+			}
+			if readStdin {
+				scanner := bufio.NewScanner(os.Stdin)
+				scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+				for scanner.Scan() {
+					line := scanner.Text()
+					if line == "" {
+						propLines = append(propLines, "")
+					} else {
+						propLines = append(propLines, "  "+line)
+					}
+				}
+			}
+			pr.lines = propLines
+		} else {
+			pr.lines[0] = titleLine
+		}
+		break
+	}
+
+	if !found {
+		fmt.Fprintf(os.Stderr, "proposal P%d not found\n", n)
+		os.Exit(1)
+	}
+
+	if err := p.writeBack(path); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("updated: P%d %s\n", n, desc)
 }
 
 func cmdProposals(path string) {

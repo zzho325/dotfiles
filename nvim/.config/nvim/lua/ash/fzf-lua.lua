@@ -24,4 +24,10 @@ require("fzf-lua").setup({
 	grep = {
 		git_icons = true,
 	},
+	buffers = {
+		formatter = "path.filename_first",
+	},
+	oldfiles = {
+		formatter = "path.filename_first",
+	},
 })

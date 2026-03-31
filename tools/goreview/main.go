@@ -127,9 +127,18 @@ func (d *diffInfo) classify(fn *funcNode) diffStatus {
 }
 
 func getDiff(base string) (*diffInfo, error) {
-	rootBytes, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		return nil, fmt.Errorf("git rev-parse: %w", err)
+	// Detect jj vs git.
+	useJJ := false
+	rootBytes, err := exec.Command("jj", "workspace", "root").Output()
+	if err == nil {
+		useJJ = true
+	} else {
+		rootBytes, err = exec.Command(
+			"git", "rev-parse", "--show-toplevel",
+		).Output()
+		if err != nil {
+			return nil, fmt.Errorf("git rev-parse: %w", err)
+		}
 	}
 
 	di := &diffInfo{
@@ -139,19 +148,43 @@ func getDiff(base string) (*diffInfo, error) {
 	}
 
 	// Classify files as added vs modified.
-	out, err := exec.Command("git", "diff", "--name-status", base, "--", "*.go").Output()
+	var out []byte
+	if useJJ {
+		out, err = exec.Command(
+			"jj", "diff", "--summary", "--from", base,
+		).Output()
+	} else {
+		out, err = exec.Command(
+			"git", "diff", "--name-status", base, "--", "*.go",
+		).Output()
+	}
 	if err != nil {
-		return nil, fmt.Errorf("git diff --name-status: %w", err)
+		return nil, fmt.Errorf("diff --name-status: %w", err)
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		parts := strings.Fields(line)
-		if len(parts) >= 2 && parts[0] == "A" {
-			di.newFiles[parts[len(parts)-1]] = true
+		if len(parts) < 2 {
+			continue
+		}
+		file := parts[len(parts)-1]
+		if !strings.HasSuffix(file, ".go") {
+			continue
+		}
+		if parts[0] == "A" {
+			di.newFiles[file] = true
 		}
 	}
 
 	// Get changed line ranges for modified (non-new) files.
-	out, _ = exec.Command("git", "diff", "--unified=0", base, "--", "*.go").Output()
+	if useJJ {
+		out, _ = exec.Command(
+			"jj", "diff", "--git", "--from", base,
+		).Output()
+	} else {
+		out, _ = exec.Command(
+			"git", "diff", "--unified=0", base, "--", "*.go",
+		).Output()
+	}
 	var curFile string
 	for _, line := range strings.Split(string(out), "\n") {
 		switch {

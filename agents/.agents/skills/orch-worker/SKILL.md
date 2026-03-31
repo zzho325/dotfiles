@@ -138,11 +138,15 @@ Use `notes.md` in the repo root as a shared scratchpad. Structure:
   notes wip                # list WIP threads
   notes wip "title"        # add WIP thread (title only)
   notes wip "title" -      # add WIP thread (pipe body via stdin)
+  notes reply <N> "text"   # append to WIP thread N
+  notes reply <N> "text" - # append text + stdin to thread N
   notes resolve <N>        # move thread N to Done
   notes resolve all        # resolve all WIP threads
   notes done               # list Done summaries
   notes propose "desc"              # add proposal (title only)
   notes propose "desc" -b "body"   # add proposal with body
+  notes update <N> "desc"          # update proposal N description
+  notes update <N> "desc" -b "body"  # update desc + replace body
   notes proposals          # list proposals with [x]/[ ] status
   notes stamp <N>          # mark proposal N as approved [x]
   notes delete <N>         # delete proposal N

@@ -9,6 +9,12 @@ alias sq='sqlite3'
 alias lg='lazygit'
 alias jjs='jj log -r "::@ ~ ::main" --no-graph'
 
+jj() {
+  command jj "$@"; local rc=$?
+  [[ $rc -eq 0 && -d .jj ]] && command jj git export 2>/dev/null
+  return $rc
+}
+
 jj-init() {
   local gitdir=$(git rev-parse --git-dir 2>/dev/null)
   if [[ -z "$gitdir" ]]; then

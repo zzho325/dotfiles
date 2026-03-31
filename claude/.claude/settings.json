@@ -107,11 +107,7 @@
       "Grep",
       "Skill(design:design)"
     ],
-    "deny": [
-      "Bash(gh pr comment:*)",
-      "Bash(gh pr review:*)",
-      "Bash(gh pr merge:*)"
-    ],
+    "deny": [],
     "defaultMode": "bypassPermissions"
   },
   "model": "opus[1m]",
