@@ -31,6 +31,13 @@ echo "→ Removing legacy files…"
 [ -f ~/.viminfo ] && rm ~/.viminfo
 [ -f ~/.DS_Store ] && rm ~/.DS_Store
 
+# Install fonts
+echo "→ Installing fonts…"
+find "$HOME/dotfiles/fonts" -type f \
+  \( -iname '*.otf' -o -iname '*.ttf' -o -iname '*.ttc' -o -iname '*.otc' \) \
+  -exec cp -f {} "$HOME/Library/Fonts"/ \;
+echo "✔ Fonts installed"
+
 # Stow application configs
 if command -v stow >/dev/null; then
   cd "$HOME/dotfiles"

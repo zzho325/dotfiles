@@ -375,8 +375,11 @@ func buildCallerGroupViolations(
 		return roots[i].line < roots[j].line
 	})
 
-	// Compute DFS pre-order position for each function.
+	// Compute DFS pre-order position and exit time for each function.
+	// Entry/exit times allow O(1) ancestry checks: A is an ancestor of B
+	// iff dfsEntry[A] < dfsEntry[B] && dfsExit[A] > dfsExit[B].
 	dfsPos := map[*funcInfo]int{}
+	dfsExit := map[*funcInfo]int{}
 	pos := 0
 	var dfs func(*funcInfo)
 	dfs = func(fn *funcInfo) {
@@ -388,9 +391,43 @@ func buildCallerGroupViolations(
 		for _, c := range adj[fn] {
 			dfs(c.fn)
 		}
+		dfsExit[fn] = pos
+		pos++
 	}
 	for _, root := range roots {
 		dfs(root)
+	}
+
+	isAncestor := func(a, b *funcInfo) bool {
+		ae, aok := dfsPos[a]
+		be, bok := dfsPos[b]
+		if !aok || !bok {
+			return false
+		}
+		return ae < be && dfsExit[a] > dfsExit[b]
+	}
+
+	// Compute depth for each callee by walking up the primaryCaller chain.
+	// Only compare callees at the same depth — comparing across depths
+	// creates false positives (e.g. a handler's deep helper vs a sibling
+	// handler's direct helper in service files).
+	depth := map[*funcInfo]int{}
+	var computeDepth func(*funcInfo) int
+	computeDepth = func(fn *funcInfo) int {
+		if d, ok := depth[fn]; ok {
+			return d
+		}
+		caller, hasCaller := primaryCaller[fn]
+		if !hasCaller {
+			depth[fn] = 0
+			return 0
+		}
+		d := computeDepth(caller) + 1
+		depth[fn] = d
+		return d
+	}
+	for callee := range primaryCaller {
+		computeDepth(callee)
 	}
 
 	// Collect single-caller callees sorted by definition line.
@@ -402,8 +439,8 @@ func buildCallerGroupViolations(
 		return callees[i].line < callees[j].line
 	})
 
-	// For each pair of single-caller callees with different callers,
-	// check if their file order matches DFS pre-order.
+	// For each pair of single-caller callees with different callers
+	// at the same depth, check if their file order matches DFS pre-order.
 	var violations []callerGroupViolation
 	for i := 0; i < len(callees); i++ {
 		for j := i + 1; j < len(callees); j++ {
@@ -413,6 +450,17 @@ func buildCallerGroupViolations(
 				continue // same caller — handled by sibling check
 			}
 			if isMethod(x) != isMethod(y) {
+				continue
+			}
+			// Only compare callees at the same depth.
+			if depth[x] != depth[y] {
+				continue
+			}
+			// Skip when one caller is an ancestor of the other —
+			// they're at different depths and comparing their
+			// callees' order is not meaningful.
+			cx, cy := primaryCaller[x], primaryCaller[y]
+			if isAncestor(cx, cy) || isAncestor(cy, cx) {
 				continue
 			}
 			// Skip if already flagged by caller-before-callee check.

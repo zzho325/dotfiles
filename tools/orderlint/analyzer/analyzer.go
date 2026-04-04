@@ -201,23 +201,25 @@ func analyzeFile(
 	// Report caller-group ordering violations (non-test files only).
 	// If A's caller appears before B's caller, A should appear before B.
 	// Skipped for test files where helpers are commonly shared across tests.
-	callerGroupViolations := buildCallerGroupViolations(edges, inCycle, violations)
-	for _, cgv := range callerGroupViolations {
-		if _, alreadyFlagged := violations[cgv.fn]; alreadyFlagged {
-			continue
+	if !isTest {
+		callerGroupViolations := buildCallerGroupViolations(edges, inCycle, violations)
+		for _, cgv := range callerGroupViolations {
+			if _, alreadyFlagged := violations[cgv.fn]; alreadyFlagged {
+				continue
+			}
+			if isBaselined(fileName, cgv.fn.name) {
+				continue
+			}
+			pass.Report(analysis.Diagnostic{
+				Pos: cgv.fn.pos,
+				Message: fmt.Sprintf(
+					"%s (line %d) should appear after %s (line %d) — %s is reached before %s in the call tree",
+					cgv.fn.name, fset.Position(cgv.fn.pos).Line,
+					cgv.other.name, fset.Position(cgv.other.pos).Line,
+					cgv.other.name, cgv.fn.name,
+				),
+			})
 		}
-		if isBaselined(fileName, cgv.fn.name) {
-			continue
-		}
-		pass.Report(analysis.Diagnostic{
-			Pos: cgv.fn.pos,
-			Message: fmt.Sprintf(
-				"%s (line %d) should appear after %s (line %d) — %s is reached before %s in the call tree",
-				cgv.fn.name, fset.Position(cgv.fn.pos).Line,
-				cgv.other.name, fset.Position(cgv.other.pos).Line,
-				cgv.other.name, cgv.fn.name,
-			),
-		})
 	}
 
 	// Test file: check that helpers appear after test functions.

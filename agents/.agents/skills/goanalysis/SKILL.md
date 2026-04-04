@@ -18,7 +18,8 @@ Run Go static analysis tools: **orderlint** checks function ordering, **goreview
 - `/goanalysis review ./pkg/some/package/...` — goreview call graph
 - `/goanalysis review --diff origin/main ./pkg/some/package/...` — goreview with diff markers
 - `/goanalysis review --diff origin/main --changes-only ./pkg/some/package/...` — only changed subtrees
-- `/goanalysis summarize ./pkg/some/package/...` — goreview + human-readable summary for PR comments
+- `/goanalysis guide` — review guide for current branch's PR (auto-detects packages)
+- `/goanalysis guide <PR number>` — review guide for a specific PR
 
 A package path is always required.
 
@@ -123,16 +124,79 @@ Limits call tree to N levels deep — useful for large packages.
 - `↩` = already shown earlier (cycle or shared callee)
 - Signatures show param names and short type names (`*rsa.PrivateKey` not `*crypto/rsa.PrivateKey`)
 
-## Summarize mode
+## Guide mode
 
-When the user runs `/goanalysis summarize <packages>`, generate a human-readable PR review comment:
+When the user runs `/goanalysis guide` or `/goanalysis guide <PR number>`, generate a review guide
+that helps reviewers understand the PR quickly.
 
-1. Run `goreview --diff origin/main --changes-only <packages>` for each package
-2. Interpret the call graph output and write a summary with:
-   - **Call graph**: the raw tree output in a code block, one section per package
-   - **What changed**: 2-3 sentences describing the new/modified functions and their purpose
-   - **Design notes**: architectural observations — layer separation, validation boundaries, key patterns (idempotency, error wrapping, etc.)
-3. Keep it concise — a reviewer should be able to understand the PR's shape in 30 seconds
+### Step 1: Gather context
+
+If a PR number is given, use `gh pr diff <number>` and `gh pr view <number> --json files`.
+Otherwise, detect the current branch's PR via `gh pr view`, or fall back to `git diff main...HEAD`.
+
+Extract the list of changed Go packages from the changed files.
+
+### Step 2: Run tools
+
+For each changed Go package:
+```bash
+goreview --diff origin/main --changes-only ./pkg/changed/package/...
+```
+
+For the full set of changed files:
+```bash
+orderlint-diff origin/main ./pkg/changed/package/...
+```
+
+If the PR branch is not checked out locally, fetch it (`gh pr checkout <number>` or
+`git fetch origin <branch>`) before running the tools.
+
+### Step 3: Read and understand
+
+Read the changed files and surrounding code to understand:
+- What the PR does (one sentence)
+- How the pieces fit together (reading order for a reviewer)
+- Key design decisions and their rationale
+- Caller/callee relationships beyond what goreview shows
+
+### Step 4: Output the review guide
+
+Output in this exact format:
+
+```
+## Review guide
+
+**What this does:** <One sentence summary — plain, no drama.>
+
+**How to read this PR:**
+
+1. **Description** (`path/to/file.go: FunctionOrType`) — what it does, why it matters,
+   key details a reviewer should notice.
+
+2. **Description** (`another/file.go: AnotherFunction`) — same format. Order by
+   recommended reading order, not alphabetical.
+
+3. ...
+
+**Call graph:**
+<goreview output in a code block, one section per package>
+
+**Key design decisions:**
+- **Decision** — rationale. Why this approach over alternatives.
+- ...
+```
+
+### Guidelines
+
+- **"How to read"** entries should follow the data/control flow, not file order.
+  Start with the entry point, then follow the call chain.
+- Keep each entry to 1-2 sentences. Flag non-obvious things (error types,
+  short-circuit behavior, stubs for future PRs).
+- **Call graph** is the raw goreview output — don't manually redraw it.
+- **Key design decisions** should explain choices a reviewer might question
+  (why flat params vs struct, why unexported, why this error type, etc.).
+- If orderlint found violations, add an **Orderlint** section after the call graph.
+- A reviewer should understand the PR's shape in 30 seconds from this guide.
 
 ## Tools
 
