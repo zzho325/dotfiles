@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -119,8 +119,7 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
         return HashMap::new();
     };
 
-    // Get active pane commands per session to detect running processes
-    let pane_cmds = load_pane_commands();
+    let active_sessions = load_active_sessions();
 
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -129,9 +128,8 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
             let name = parts.next()?.to_string();
             let activity = parts.next()?.parse().ok()?;
             let attached = parts.next()? != "0";
-            let has_active_process = pane_cmds
-                .get(&name)
-                .is_some_and(|cmd| is_worker_process(cmd));
+            let has_active_process =
+                active_sessions.contains(&name);
             Some((
                 name.clone(),
                 TmuxSession { name, activity, attached, has_active_process },
@@ -140,41 +138,35 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
         .collect()
 }
 
-/// Get the current command running in each session's active pane.
-fn load_pane_commands() -> HashMap<String, String> {
+/// Check if any pane in each session is running a worker process.
+fn load_active_sessions() -> HashSet<String> {
     let output = Command::new("tmux")
         .args([
             "list-panes",
             "-a",
             "-F",
-            "#{session_name} #{pane_active} #{pane_current_command}",
+            "#{session_name} #{pane_current_command}",
         ])
         .stderr(Stdio::null())
         .output()
         .ok();
     let Some(output) = output.filter(|o| o.status.success()) else {
-        return HashMap::new();
+        return HashSet::new();
     };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, ' ');
-            let session = parts.next()?;
-            let active = parts.next()?;
-            let cmd = parts.next()?;
-            // Only care about the active pane
-            if active == "1" {
-                Some((session.to_string(), cmd.to_string()))
-            } else {
-                None
-            }
-        })
-        .collect()
+    let mut active = HashSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((session, cmd)) = line.split_once(' ') else {
+            continue;
+        };
+        if is_worker_process(cmd) {
+            active.insert(session.to_string());
+        }
+    }
+    active
 }
 
-/// Check if the command is a worker process (claude/node), not just a shell.
 fn is_worker_process(cmd: &str) -> bool {
-    matches!(cmd, "claude" | "node" | "codex")
+    cmd == "claude" || cmd == "node" || cmd.starts_with("codex")
 }
 
 pub fn derive_status(

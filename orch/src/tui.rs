@@ -755,16 +755,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         (_, KeyCode::Enter) => {
             match app.visible.get(app.cursor) {
                 Some(ListItem::Task(_)) => {
-                    // Toggle expand if has PRs, else jump to tmux
-                    if app.selected_task().is_some_and(|t| !t.prs.is_empty()) {
-                        app.toggle_expand();
-                        Action::Continue
-                    } else {
-                        Action::Suspend(Box::new(|a| a.jump_to_session()))
-                    }
+                    Action::Suspend(Box::new(|a| a.jump_to_session()))
                 }
                 Some(ListItem::Pr(_, _)) => {
-                    // Open PR in browser for now (diff pane later)
                     app.open_pr_browser();
                     Action::Continue
                 }

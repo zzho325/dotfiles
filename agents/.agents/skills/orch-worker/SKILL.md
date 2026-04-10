@@ -106,15 +106,15 @@ validate_test.go
     └── mixed_valid_invalid           — 2 valid + 1 invalid
 ```
 
-## Codex Review
+## Codex
 
-When the user asks for a codex review (e.g. "get codex review", "run codex",
-"check with codex"), invoke the `/codex-review` skill with the PR link:
-`/codex-review https://github.com/column/column/pull/25827`
+When the user asks to use codex (e.g. "get codex review", "ask codex",
+"check with codex"), invoke the `/codex` skill:
+- Review: `/codex https://github.com/column/column/pull/25827`
+- Question: `/codex "is this the right approach for X?"`
 
-The skill runs `codex exec review`, posts findings as a PR comment, and
-presents proposals. **Never auto-fix from codex feedback** — always discuss
-first.
+The skill runs codex, posts review findings as PR comments, and presents
+proposals. **Never auto-fix from codex feedback** — always discuss first.
 
 ## Phase 5: Execute
 
