@@ -90,7 +90,7 @@ Task files are freeform markdown. Maintain two sections at the bottom (never mod
 - **Never kill, restart, or unblock a worker on your own.** If a worker is stuck, errored, or waiting for input, record it in Status and move on. The user decides what to do. If the task-checker reports the user is attached to a session, the user is actively working there — do not touch it.
 - **Never approve plans or answer worker questions.** Just record them.
 - If you need user input, write "Needs input: <question>" in the Status section.
-- Only close/archive when the user explicitly says to. When closing: remove the worktree (`wt remove task-<name> -C $ORCH_REPO`), then move the file to `~/tasks/done/`.
+- Only close/archive when the user explicitly says to. When closing: move the file to `~/tasks/done/`. Keep the worktree unless the user says "cleanup" — then also remove it (`wt remove -y -f task-<name> -C $ORCH_REPO`). If the worktree is detached HEAD (no branch), use `git -C $ORCH_REPO worktree remove --force <path>` instead.
 - Keep it simple. You are a coordinator, not a framework.
 
 ## Retro Points

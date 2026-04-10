@@ -1,3 +1,69 @@
+//! # orch — Task orchestrator for Claude Code workers
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌──────────┐     ┌──────────────┐     ┌─────────────────┐
+//! │  orch    │     │ orch daemon  │     │ orchestrator    │
+//! │  (TUI)   │     │ (watcher)    │     │ (Claude agent)  │
+//! └──────────┘     └──────┬───────┘     └────────┬────────┘
+//!                         │                      │
+//!      reads              │ spawns               │ coordinates
+//!        │                │                      │
+//!        ▼                ▼                      ▼
+//! ┌──────────────────────────────────────────────────────┐
+//! │                    ~/tasks/                           │
+//! │  *.md          — task descriptions (human-written)   │
+//! │  .state/*.json — machine state (session, PRs, etc)   │
+//! │  .inbox/*.msg  — worker→orchestrator messages        │
+//! │  done/         — archived completed tasks            │
+//! └──────────────────────────────────────────────────────┘
+//!        ▲                ▲
+//!        │                │
+//!        │          ┌─────┴──────┐
+//!        │          │ tmux       │
+//!        │          │ task-*     │  ← worker sessions
+//!        │          │ sessions   │
+//!        │          └────────────┘
+//!        │
+//! ┌──────┴───────┐
+//! │ GitHub API   │  ← PR status, CI, reviews
+//! │ (gh CLI)     │
+//! └──────────────┘
+//! ```
+//!
+//! ## Modules
+//!
+//! - `main.rs` — CLI, daemon (file watcher + orchestrator spawner),
+//!   legacy status, tmux helpers
+//! - `state.rs` — Task/PR/tmux data types, state loading from
+//!   ~/tasks/ and tmux, status derivation (ready/working/idle)
+//! - `gh.rs` — Background GitHub PR data fetching with cache
+//! - `tui.rs` — Interactive ratatui dashboard with Rosé Pine Dawn
+//!   palette, fold/expand PRs, tmux session jumping
+//!
+//! ## Data flow
+//!
+//! - **Daemon** watches ~/tasks/ for new files and .inbox/ for
+//!   worker messages. On changes, spawns a one-shot Claude
+//!   orchestrator agent to reconcile state.
+//! - **TUI** polls tmux sessions (2s) and GitHub API (30s) to
+//!   derive live task status. Reads .state/*.json for PR mappings.
+//! - **Workers** run in tmux sessions, communicate via
+//!   `orch - "message"` which writes to .inbox/.
+//! - **Orchestrator agent** reads task files, tmux state, and
+//!   inbox messages to coordinate workers.
+//!
+//! ## Skills
+//!
+//! - `orch-worker` — development task execution skill for workers
+//! - `codex-review` — runs `codex exec review` on a PR, posts
+//!   findings as PR comment, presents proposals to user
+
+mod gh;
+mod state;
+mod tui;
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -27,7 +93,9 @@ struct Cli {
 enum Cmd {
     /// Run the background watcher daemon
     Daemon,
-    /// Show status of all tasks and workers
+    /// Interactive TUI dashboard
+    Tui,
+    /// Show status of all tasks and workers (plain text)
     Status,
     /// Attach to a task's tmux session
     Jump { name: String },
@@ -62,7 +130,8 @@ fn repo_dir() -> String {
     std::env::var("ORCH_REPO").expect("ORCH_REPO must be set")
 }
 
-// Inbox
+// Inbox — file-based message queue for worker→orchestrator communication.
+// Workers write via `orch - "message"`, daemon drains on file-watch events.
 
 fn write_inbox(msg: &str) {
     let dir = inbox_dir();
@@ -98,7 +167,8 @@ fn drain_inbox() -> Option<String> {
     (!messages.is_empty()).then(|| messages.join("\n"))
 }
 
-// Orchestrator
+// Orchestrator — spawns a one-shot Claude agent with the orchestrator
+// persona to reconcile tasks, workers, and messages.
 
 fn run_orchestrator(message: &str) {
     eprintln!("[orch] {message}");
@@ -135,7 +205,8 @@ fn run_orchestrator(message: &str) {
     }
 }
 
-// Tmux helpers
+// Tmux helpers — used by daemon for activity polling and by legacy
+// status/jump commands.
 
 fn has_tmux_session(name: &str) -> bool {
     Command::new("tmux")
@@ -152,6 +223,8 @@ fn tmux(args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Get last-activity epoch for each task-* tmux session.
+/// Used by the daemon to detect worker activity changes.
 fn session_activity() -> HashMap<String, u64> {
     let output = Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name} #{session_activity}"])
@@ -173,7 +246,7 @@ fn session_activity() -> HashMap<String, u64> {
         .collect()
 }
 
-// Task helpers
+// Task helpers — used by daemon to detect new task files.
 
 fn known_tasks(dir: &Path) -> HashSet<String> {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -186,7 +259,7 @@ fn known_tasks(dir: &Path) -> HashSet<String> {
         .collect()
 }
 
-/// Lines between `heading` and the next `## ` (or EOF), excluding blanks.
+/// Extract lines between `heading` and the next `## ` (or EOF).
 fn extract_section<'a>(content: &'a str, heading: &str) -> Vec<&'a str> {
     let mut lines = content.lines();
     if !lines.any(|l| l.trim().starts_with(heading)) {
@@ -200,6 +273,8 @@ fn extract_section<'a>(content: &'a str, heading: &str) -> Vec<&'a str> {
 
 // Commands
 
+/// Legacy plain-text status output. Used when stdout is not a TTY
+/// (piped, scripted) or via `orch status`.
 fn cmd_status() {
     let dir = tasks_dir();
     println!("## Tasks\n");
@@ -301,6 +376,9 @@ fn cmd_spawn(session: &str, task_file: &str, dir: Option<&str>) {
     eprintln!("[spawn] {session} started with {task_file}");
 }
 
+/// Background daemon: watches ~/tasks/ for new files and .inbox/ for
+/// worker messages. On changes, spawns a one-shot orchestrator agent.
+/// Also polls tmux session activity every 20 minutes.
 fn cmd_daemon() {
     unsafe { std::env::remove_var("CLAUDECODE") };
 
@@ -337,12 +415,14 @@ fn cmd_daemon() {
     loop {
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(Ok(events)) => {
+                // Check for inbox messages triggered by file events
                 let inbox_msgs = events
                     .iter()
                     .any(|e| e.path.starts_with(&inbox))
                     .then(|| drain_inbox())
                     .flatten();
 
+                // Detect new task files
                 let current = known_tasks(&dir);
                 let new_tasks: Vec<_> =
                     current.difference(&tasks).cloned().collect();
@@ -362,6 +442,8 @@ fn cmd_daemon() {
             }
             Ok(Err(e)) => eprintln!("[orch] watch error: {e:?}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Poll tmux activity — trigger scan for sessions
+                // that have new output since last check
                 let current = session_activity();
                 let changed: Vec<_> = current
                     .iter()
@@ -389,7 +471,16 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Cmd::Status) | None => cmd_status(),
+        // Default: TUI if interactive terminal, plain status otherwise
+        None => {
+            if atty::is(atty::Stream::Stdout) {
+                tui::run().expect("TUI failed");
+            } else {
+                cmd_status();
+            }
+        }
+        Some(Cmd::Tui) => tui::run().expect("TUI failed"),
+        Some(Cmd::Status) => cmd_status(),
         Some(Cmd::Jump { name }) => cmd_jump(&name),
         Some(Cmd::Spawn { session, task_file, dir }) => {
             cmd_spawn(&session, &task_file, dir.as_deref())
