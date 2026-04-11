@@ -39,22 +39,16 @@ codex exec "<prompt>" -o /tmp/codex-output.md 2>/dev/null
 cat /tmp/codex-output.md
 ```
 
-For reviews: post as PR comment via `gh pr comment`, then present
-each finding as a proposal (with proposed fix or disagreement).
-
-For questions: present the answer. If it suggests code changes,
-present as proposals — don't auto-apply.
-
-## 4. Wait
-
-Do NOT implement changes. Wait for user approval.
+Present findings as proposals (with proposed fix or disagreement).
+Do NOT post as PR comment — just present in conversation.
+Do NOT implement changes — wait for user approval.
 
 </process>
 
 <rules>
 
 - **Never auto-fix.** Present findings as proposals first.
-- **Reviews: post to PR comment** so the user sees it on GitHub.
+- **Never post to PR comments** unless the user explicitly asks.
 - **Be honest about disagreements** with codex findings.
 
 </rules>

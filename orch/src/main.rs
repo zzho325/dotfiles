@@ -61,6 +61,7 @@
 //!   findings as PR comment, presents proposals to user
 
 mod gh;
+mod runs;
 mod state;
 mod tui;
 
@@ -114,6 +115,30 @@ enum Cmd {
     /// Send a message to the orchestrator
     #[command(name = "-")]
     Msg { message: Vec<String> },
+    /// Add a PR to a task's state
+    #[command(name = "pr")]
+    Pr {
+        #[command(subcommand)]
+        action: PrAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrAction {
+    /// Add a PR number to a task
+    Add {
+        /// Task name (e.g. agentserver)
+        task: String,
+        /// PR number
+        number: u32,
+    },
+    /// Remove a PR number from a task
+    Rm {
+        /// Task name
+        task: String,
+        /// PR number
+        number: u32,
+    },
 }
 
 // Paths
@@ -173,6 +198,29 @@ fn drain_inbox() -> Option<String> {
 fn run_orchestrator(message: &str) {
     eprintln!("[orch] {message}");
 
+    // Create per-run output directory
+    let run = runs::create_run(message);
+    let (run_id, output_file) = match &run {
+        Some((id, path)) => {
+            eprintln!("[orch] run {id}");
+            (
+                id.clone(),
+                std::fs::File::create(path).ok(),
+            )
+        }
+        None => (String::new(), None),
+    };
+
+    // Redirect stdout+stderr to the output file if available,
+    // otherwise inherit
+    let (stdout_cfg, stderr_cfg) = match &output_file {
+        Some(f) => {
+            let f2 = f.try_clone().unwrap();
+            (Stdio::from(f.try_clone().unwrap()), Stdio::from(f2))
+        }
+        None => (Stdio::inherit(), Stdio::inherit()),
+    };
+
     let mut child = match Command::new("claude")
         .args([
             "--model", "opus",
@@ -183,13 +231,16 @@ fn run_orchestrator(message: &str) {
         .env("ORCH_REPO", repo_dir())
         .env_remove("CLAUDECODE")
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(stdout_cfg)
+        .stderr(stderr_cfg)
         .spawn()
     {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[orch] failed to run claude: {e}");
+            if !run_id.is_empty() {
+                runs::finish_run(&run_id, -1);
+            }
             return;
         }
     };
@@ -198,11 +249,25 @@ fn run_orchestrator(message: &str) {
         let _ = stdin.write_all(message.as_bytes());
     }
 
-    match child.wait() {
-        Ok(s) if !s.success() => eprintln!("[orch] claude exited with {s}"),
-        Err(e) => eprintln!("[orch] claude wait failed: {e}"),
-        _ => {}
+    let exit_code = match child.wait() {
+        Ok(s) => {
+            if !s.success() {
+                eprintln!("[orch] claude exited with {s}");
+            }
+            s.code().unwrap_or(-1)
+        }
+        Err(e) => {
+            eprintln!("[orch] claude wait failed: {e}");
+            -1
+        }
+    };
+
+    if !run_id.is_empty() {
+        runs::finish_run(&run_id, exit_code);
     }
+
+    // Reconcile PRs after each orchestrator run
+    state::reconcile_prs();
 }
 
 // Tmux helpers — used by daemon for activity polling and by legacy
@@ -387,6 +452,9 @@ fn cmd_daemon() {
     fs::create_dir_all(&dir).ok();
     fs::create_dir_all(&inbox).ok();
 
+    runs::prune_old_runs();
+    eprintln!("[orch] reconciling PRs...");
+    state::reconcile_prs();
     eprintln!("[orch] daemon started, watching {}", dir.display());
 
     // Fold pending inbox messages into the initial scan
@@ -494,5 +562,23 @@ fn main() {
             write_inbox(&message.join(" "));
             eprintln!("[orch] message sent");
         }
+        Some(Cmd::Pr { action }) => match action {
+            PrAction::Add { task, number } => {
+                let mut meta = state::load_task_meta(&task);
+                if !meta.prs.contains(&number) {
+                    meta.prs.push(number);
+                    state::save_task_meta(&task, &meta);
+                    eprintln!("[orch] added PR #{number} to {task}");
+                } else {
+                    eprintln!("[orch] PR #{number} already in {task}");
+                }
+            }
+            PrAction::Rm { task, number } => {
+                let mut meta = state::load_task_meta(&task);
+                meta.prs.retain(|&n| n != number);
+                state::save_task_meta(&task, &meta);
+                eprintln!("[orch] removed PR #{number} from {task}");
+            }
+        },
     }
 }

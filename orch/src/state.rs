@@ -3,7 +3,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -30,13 +29,22 @@ pub struct TaskMeta {
 #[derive(Debug, Clone)]
 pub struct TmuxSession {
     pub name: String,
-    pub activity: u64,
     pub attached: bool,
-    /// Whether claude/node is running in the active pane
+    /// Whether claude/node is running in any pane
     pub has_active_process: bool,
+    /// Hash of the claude pane's last line (for change detection)
+    pub pane_hash: u64,
 }
 
 // PR status from GitHub
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum CodexStatus {
+    #[default]
+    None,      // no codex activity
+    Commented, // codex left a review with feedback
+    ThumbsUp,  // codex reacted 👍 (no feedback needed)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct PrData {
@@ -44,7 +52,7 @@ pub struct PrData {
     pub title: String,
     pub ci_pass: Option<bool>,     // None = pending, Some(true) = pass
     pub approved: bool,
-    pub codex_reviewed: bool,
+    pub codex: CodexStatus,
 }
 
 // Derived task state
@@ -57,8 +65,6 @@ pub enum TaskStatus {
     Idle,
     Attached,
 }
-
-const IDLE_THRESHOLD_SECS: u64 = 60;
 
 // Combined task view
 
@@ -110,7 +116,7 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
         .args([
             "list-sessions",
             "-F",
-            "#{session_name} #{session_activity} #{session_attached}",
+            "#{session_name} #{session_attached}",
         ])
         .stderr(Stdio::null())
         .output()
@@ -120,19 +126,24 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
     };
 
     let active_sessions = load_active_sessions();
+    let pane_hashes = load_pane_hashes();
 
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let mut parts = line.splitn(3, ' ');
             let name = parts.next()?.to_string();
-            let activity = parts.next()?.parse().ok()?;
             let attached = parts.next()? != "0";
             let has_active_process =
                 active_sessions.contains(&name);
+            let pane_hash =
+                pane_hashes.get(&name).copied().unwrap_or(0);
             Some((
                 name.clone(),
-                TmuxSession { name, activity, attached, has_active_process },
+                TmuxSession {
+                    name, attached,
+                    has_active_process, pane_hash,
+                },
             ))
         })
         .collect()
@@ -169,9 +180,53 @@ fn is_worker_process(cmd: &str) -> bool {
     cmd == "claude" || cmd == "node" || cmd.starts_with("codex")
 }
 
+/// Hash the last few lines of each claude pane for change detection.
+fn load_pane_hashes() -> HashMap<String, u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let output = Command::new("tmux")
+        .args([
+            "list-panes", "-a", "-F",
+            "#{session_name} #{pane_current_command} #{pane_id}",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok();
+    let Some(output) = output.filter(|o| o.status.success()) else {
+        return HashMap::new();
+    };
+
+    let mut hashes = HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let (session, cmd, pane_id) = (parts[0], parts[1], parts[2]);
+        if !is_worker_process(cmd) {
+            continue;
+        }
+        // Capture last 3 lines of this pane
+        let capture = Command::new("tmux")
+            .args(["capture-pane", "-t", pane_id, "-p", "-S", "-3"])
+            .stderr(Stdio::null())
+            .output()
+            .ok();
+        if let Some(cap) = capture.filter(|o| o.status.success()) {
+            let text = String::from_utf8_lossy(&cap.stdout);
+            let mut hasher = DefaultHasher::new();
+            text.trim().hash(&mut hasher);
+            hashes.insert(session.to_string(), hasher.finish());
+        }
+    }
+    hashes
+}
+
 pub fn derive_status(
     meta: &TaskMeta,
     sessions: &HashMap<String, TmuxSession>,
+    prev_hashes: &HashMap<String, u64>,
 ) -> TaskStatus {
     let session = find_session(&meta.session, sessions);
 
@@ -183,27 +238,22 @@ pub fn derive_status(
         return TaskStatus::Attached;
     }
 
-    // Explicit input flag from orch messages
     if meta.needs_input {
         return TaskStatus::Input;
     }
 
-    // Use active process (claude/node running) as primary signal,
-    // fall back to activity timestamp
-    if session.has_active_process {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let idle_secs = now.saturating_sub(session.activity);
-        if idle_secs > IDLE_THRESHOLD_SECS {
-            TaskStatus::Ready
-        } else {
-            TaskStatus::Working
-        }
-    } else {
-        // No worker process running — session is idle
+    if !session.has_active_process {
+        return TaskStatus::Ready;
+    }
+
+    // Compare pane content hash with previous poll.
+    // If the hash changed, the worker is actively producing output.
+    let prev = prev_hashes.get(&session.name).copied().unwrap_or(0);
+    if prev != 0 && prev == session.pane_hash {
+        // Content hasn't changed since last poll → ready
         TaskStatus::Ready
+    } else {
+        TaskStatus::Working
     }
 }
 
@@ -226,6 +276,7 @@ fn find_session<'a>(
 pub fn load_tasks(
     order: &[String],
     sessions: &HashMap<String, TmuxSession>,
+    prev_hashes: &HashMap<String, u64>,
 ) -> Vec<Task> {
     let dir = tasks_dir();
     let all_names = load_task_names(&dir);
@@ -246,7 +297,7 @@ pub fn load_tasks(
         .into_iter()
         .map(|name| {
             let meta = load_task_meta(&name);
-            let status = derive_status(&meta, sessions);
+            let status = derive_status(&meta, sessions, prev_hashes);
             Task {
                 name,
                 meta,
@@ -255,6 +306,131 @@ pub fn load_tasks(
             }
         })
         .collect()
+}
+
+pub fn save_task_meta(name: &str, meta: &TaskMeta) {
+    let dir = state_dir();
+    fs::create_dir_all(&dir).ok();
+    if let Ok(json) = serde_json::to_string_pretty(meta) {
+        let path = dir.join(format!("{name}.json"));
+        let tmp = path.with_extension("tmp");
+        if fs::write(&tmp, &json).is_ok() {
+            let _ = fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Reconcile PR state: discover open PRs via jj op log and prune
+/// closed/merged ones. Called by the daemon periodically.
+pub fn reconcile_prs() {
+    let repo_dir = match std::env::var("ORCH_REPO") {
+        Ok(r) => format!("{r}/main"),
+        Err(_) => return,
+    };
+
+    // 1. Get all open PRs by me: branch → PR numbers
+    let output = Command::new("gh")
+        .args([
+            "pr", "list", "--author", "@me", "--state", "open",
+            "--json", "number,headRefName",
+        ])
+        .current_dir(&repo_dir)
+        .stderr(Stdio::null())
+        .output()
+        .ok();
+
+    let Some(output) = output.filter(|o| o.status.success()) else {
+        return;
+    };
+    let Ok(prs) =
+        serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+    else {
+        return;
+    };
+
+    let mut branch_to_prs: HashMap<String, Vec<u32>> = HashMap::new();
+    for pr in &prs {
+        let branch = pr["headRefName"].as_str().unwrap_or("");
+        let number = pr["number"].as_u64().unwrap_or(0) as u32;
+        if !branch.is_empty() && number > 0 {
+            branch_to_prs
+                .entry(branch.to_string())
+                .or_default()
+                .push(number);
+        }
+    }
+
+    // 2. For each task, check which bookmarks were pushed from its
+    //    worktree via jj op log
+    let dir = tasks_dir();
+    let home = dirs::home_dir().unwrap_or_default();
+
+    for name in load_task_names(&dir) {
+        let mut meta = load_task_meta(&name);
+        let worktree = meta
+            .worktree
+            .replace("~", &home.to_string_lossy());
+
+        if worktree.is_empty() {
+            continue;
+        }
+
+        let wt_path = Path::new(&worktree);
+        if !wt_path.join(".jj").exists() {
+            continue;
+        }
+
+        // Get bookmarks pushed from this workspace
+        let op_output = Command::new("jj")
+            .args([
+                "op", "log",
+                "--repository", &worktree,
+                "--no-graph",
+                "-T", "description ++ \"\\n\"",
+            ])
+            .stderr(Stdio::null())
+            .output()
+            .ok();
+
+        let pushed_branches: HashSet<String> = op_output
+            .filter(|o| o.status.success())
+            .map(|o| {
+                let mut branches = HashSet::new();
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    // "push bookmark X to git remote origin"
+                    if let Some(rest) = line.strip_prefix("push bookmark ") {
+                        if let Some(name) = rest.split(" to git remote").next() {
+                            branches.insert(name.trim().to_string());
+                        }
+                    }
+                    // "push bookmarks X, Y, Z to git remote origin"
+                    if let Some(rest) = line.strip_prefix("push bookmarks ") {
+                        if let Some(names) = rest.split(" to git remote").next() {
+                            for name in names.split(", ") {
+                                branches.insert(name.trim().to_string());
+                            }
+                        }
+                    }
+                }
+                branches
+            })
+            .unwrap_or_default();
+
+        // Match pushed branches against open PRs
+        let mut task_prs: Vec<u32> = Vec::new();
+        for branch in &pushed_branches {
+            if let Some(nums) = branch_to_prs.get(branch) {
+                task_prs.extend(nums);
+            }
+        }
+        task_prs.sort();
+        task_prs.dedup();
+
+        if meta.prs != task_prs {
+            meta.prs = task_prs;
+            save_task_meta(&name, &meta);
+        }
+    }
 }
 
 // Order persistence

@@ -58,6 +58,40 @@ impl PrCache {
     }
 }
 
+fn is_codex_bot(login: &str) -> bool {
+    login.contains("codex") || login.contains("chatgpt")
+}
+
+fn check_codex_thumbs(number: u32) -> Option<bool> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/issues/{number}/reactions"),
+        ])
+        .current_dir(repo_cwd())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let reactions: serde_json::Value =
+        serde_json::from_slice(&output.stdout).ok()?;
+    let arr = reactions.as_array()?;
+    let has_thumb = arr.iter().any(|r| {
+        let login = r["user"]["login"].as_str().unwrap_or("");
+        let content = r["content"].as_str().unwrap_or("");
+        is_codex_bot(login) && content == "+1"
+    });
+    Some(has_thumb)
+}
+
+fn repo_cwd() -> String {
+    std::env::var("ORCH_REPO")
+        .map(|r| format!("{r}/main"))
+        .unwrap_or_else(|_| ".".to_string())
+}
+
 fn fetch_pr(number: u32) -> Option<PrData> {
     let output = Command::new("gh")
         .args([
@@ -66,6 +100,7 @@ fn fetch_pr(number: u32) -> Option<PrData> {
             "--json",
             "number,title,statusCheckRollup,reviews,comments",
         ])
+        .current_dir(repo_cwd())
         .stderr(Stdio::null())
         .output()
         .ok()?;
@@ -84,8 +119,10 @@ fn fetch_pr(number: u32) -> Option<PrData> {
         .as_array()
         .map(|checks| {
             checks.iter().all(|c| {
-                c["conclusion"].as_str() == Some("SUCCESS")
-                    || c["state"].as_str() == Some("SUCCESS")
+                matches!(
+                    c["conclusion"].as_str(),
+                    Some("SUCCESS" | "SKIPPED" | "NEUTRAL")
+                ) || c["state"].as_str() == Some("SUCCESS")
             })
         });
 
@@ -98,21 +135,35 @@ fn fetch_pr(number: u32) -> Option<PrData> {
                 .any(|r| r["state"].as_str() == Some("APPROVED"))
         });
 
-    // Codex reviewed: check comments for codex bot
-    let codex_reviewed = json["comments"]
-        .as_array()
-        .is_some_and(|comments| {
-            comments.iter().any(|c| {
-                let author = c["author"]["login"].as_str().unwrap_or("");
-                author.contains("codex") || author.contains("openai")
-            })
-        });
+    // Codex status: check reviews for codex bot
+    let mut codex = crate::state::CodexStatus::None;
+
+    if let Some(reviews) = json["reviews"].as_array() {
+        for r in reviews {
+            let author = r["author"]["login"].as_str().unwrap_or("");
+            if !is_codex_bot(author) {
+                continue;
+            }
+            if r["state"].as_str() == Some("COMMENTED") {
+                codex = crate::state::CodexStatus::Commented;
+            }
+        }
+    }
+
+    // Check PR reactions for codex 👍 via issues API
+    if codex == crate::state::CodexStatus::None {
+        if let Some(has_thumb) = check_codex_thumbs(number) {
+            if has_thumb {
+                codex = crate::state::CodexStatus::ThumbsUp;
+            }
+        }
+    }
 
     Some(PrData {
         number,
         title,
         ci_pass,
         approved,
-        codex_reviewed,
+        codex,
     })
 }

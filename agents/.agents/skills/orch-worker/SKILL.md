@@ -68,8 +68,7 @@ Report the worktree path immediately (autonomous mode:
 
 **Autonomous mode** (spawned by orchestrator in tmux):
 - Use `orch -` to send updates. Never edit task files directly.
-- Report immediately after: worktree created, design ready, PR created, review
-  fixes pushed, blocked.
+- Report immediately after: worktree created, design ready, blocked.
 
 ## Phase 4: Design Before Implementing
 

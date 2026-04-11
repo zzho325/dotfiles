@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, stdout},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -41,13 +41,27 @@ const PINE: Color = Color::Rgb(0x28, 0x69, 0x83);     // #286983
 const FOAM: Color = Color::Rgb(0x56, 0x94, 0x9f);     // #56949f
 const IRIS: Color = Color::Rgb(0x90, 0x7a, 0xa9);     // #907aa9
 const HL_LOW: Color = Color::Rgb(0xf4, 0xed, 0xe8);   // #f4ede8
-const _HL_MED: Color = Color::Rgb(0xdf, 0xda, 0xd9); // #dfdad9
 
 /// An item in the flat navigation list.
 #[derive(Debug, Clone)]
 enum ListItem {
     Task(usize),
     Pr(usize, usize), // (task_index, pr_index)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Focus {
+    List,
+    Output,
+    MessageInput,
+}
+
+/// Output pane state
+struct OutputPane {
+    run_id: String,
+    lines: Vec<String>,
+    scroll: usize,
+    finished: bool,
 }
 
 struct App {
@@ -63,13 +77,25 @@ struct App {
     last_fast: Instant,
     last_slow: Instant,
     should_quit: bool,
+    /// Output pane (if open)
+    output: Option<OutputPane>,
+    focus: Focus,
+    /// Run IDs the user has dismissed
+    read_runs: HashSet<String>,
+    /// Last known run count (to detect new runs)
+    last_run_count: usize,
+    /// Message input buffer
+    message_input: String,
+    /// Previous pane hashes for change detection
+    prev_hashes: HashMap<String, u64>,
 }
 
 impl App {
     fn new() -> Self {
         let order = load_order();
         let sessions = load_tmux_sessions();
-        let tasks = load_tasks(&order, &sessions);
+        let prev_hashes = HashMap::new();
+        let tasks = load_tasks(&order, &sessions, &prev_hashes);
         let pr_cache = PrCache::new();
 
         let all_prs: Vec<u32> = tasks
@@ -79,6 +105,7 @@ impl App {
         pr_cache.refresh(all_prs);
 
         let visible = Self::build_visible(&tasks, &HashSet::new());
+        let last_run_count = crate::runs::list_runs(100).len();
 
         Self {
             tasks,
@@ -90,6 +117,12 @@ impl App {
             last_fast: Instant::now(),
             last_slow: Instant::now(),
             should_quit: false,
+            output: None,
+            focus: Focus::List,
+            read_runs: HashSet::new(),
+            last_run_count,
+            message_input: String::new(),
+            prev_hashes: HashMap::new(),
         }
     }
 
@@ -126,9 +159,78 @@ impl App {
         }
     }
 
+    /// Count unread runs.
+    /// Open output pane for the latest unread run.
+    fn open_run(&mut self, run: &crate::runs::RunMeta) {
+        let lines: Vec<String> = crate::runs::read_output(&run.id)
+            .lines()
+            .map(String::from)
+            .collect();
+        self.output = Some(OutputPane {
+            run_id: run.id.clone(),
+            lines,
+            scroll: 0,
+            finished: run.finished_at.is_some(),
+        });
+        self.focus = Focus::Output;
+    }
+
+    fn open_latest_run(&mut self) {
+        let runs = crate::runs::list_runs(50);
+        let run = runs
+            .iter()
+            .find(|r| !self.read_runs.contains(&r.id))
+            .or(runs.first())
+            .cloned();
+        if let Some(run) = run {
+            self.open_run(&run);
+        }
+    }
+
+    fn refresh_output(&mut self) {
+        if let Some(pane) = &mut self.output {
+            let content = crate::runs::read_output(&pane.run_id);
+            let new_lines: Vec<String> =
+                content.lines().map(String::from).collect();
+            let was_at_bottom =
+                pane.scroll + 20 >= pane.lines.len();
+            pane.lines = new_lines;
+            if was_at_bottom {
+                pane.scroll =
+                    pane.lines.len().saturating_sub(1);
+            }
+        }
+    }
+
+    fn dismiss_output(&mut self) {
+        if let Some(pane) = self.output.take() {
+            self.read_runs.insert(pane.run_id);
+        }
+        self.focus = Focus::List;
+    }
+
+    fn check_new_runs(&mut self) {
+        let runs = crate::runs::list_runs(50);
+        let current_count = runs.len();
+        if current_count > self.last_run_count
+            && self.output.is_none()
+        {
+            if let Some(newest) = runs.first().cloned() {
+                self.open_run(&newest);
+            }
+        }
+        self.last_run_count = current_count;
+    }
+
     fn refresh_fast(&mut self) {
         let sessions = load_tmux_sessions();
-        self.tasks = load_tasks(&self.order, &sessions);
+        self.tasks =
+            load_tasks(&self.order, &sessions, &self.prev_hashes);
+        // Store current hashes for next comparison
+        self.prev_hashes = sessions
+            .iter()
+            .map(|(k, v)| (k.clone(), v.pane_hash))
+            .collect();
 
         for task in &mut self.tasks {
             task.prs = task
@@ -175,36 +277,6 @@ impl App {
         if self.cursor + 1 < self.visible.len() {
             self.cursor += 1;
         }
-    }
-
-    fn toggle_expand(&mut self) {
-        let Some(item) = self.visible.get(self.cursor) else {
-            return;
-        };
-        let task_idx = match item {
-            ListItem::Task(i) => *i,
-            ListItem::Pr(i, _) => *i, // fold parent
-        };
-        if self.tasks[task_idx].prs.is_empty() {
-            return;
-        }
-        if self.expanded.contains(&task_idx) {
-            self.expanded.remove(&task_idx);
-            // Move cursor to parent task if on a PR
-            if matches!(item, ListItem::Pr(_, _)) {
-                // Find the parent in the new visible list
-                self.rebuild_visible();
-                self.cursor = self
-                    .visible
-                    .iter()
-                    .position(|v| matches!(v, ListItem::Task(i) if *i == task_idx))
-                    .unwrap_or(0);
-                return;
-            }
-        } else {
-            self.expanded.insert(task_idx);
-        }
-        self.rebuild_visible();
     }
 
     fn expand(&mut self) {
@@ -360,8 +432,14 @@ impl App {
         let Some(pr) = self.selected_pr() else {
             return;
         };
-        let _ = Command::new("gh")
-            .args(["pr", "view", "--web", &pr.number.to_string()])
+        if pr.number == 0 {
+            return;
+        }
+        let _ = Command::new("open")
+            .arg(format!(
+                "https://github.com/column/column/pull/{}",
+                pr.number,
+            ))
             .stderr(Stdio::null())
             .stdout(Stdio::null())
             .status();
@@ -389,12 +467,26 @@ fn status_color(status: TaskStatus) -> Color {
     }
 }
 
-// Fixed column positions (0-indexed within inner content area).
-// Status and dots use absolute positions so they never shift.
-const COL_STATUS_END: usize = 53;
-const COL_CI: usize = 56;
-const COL_APPROVE: usize = 60;
-const COL_CODEX: usize = 64;
+/// Compute column positions relative to terminal width.
+/// Dots are anchored from the right edge so they don't get cut off.
+struct Cols {
+    status_end: usize,
+    ci: usize,
+    approve: usize,
+    codex: usize,
+}
+
+impl Cols {
+    fn for_width(w: usize) -> Self {
+        // Dots at right edge: codex at w-4, approve at w-8, ci at w-12
+        // Status label ends just before CI column
+        let codex = w.saturating_sub(4);
+        let approve = w.saturating_sub(8);
+        let ci = w.saturating_sub(12);
+        let status_end = ci.saturating_sub(3);
+        Self { status_end, ci, approve, codex }
+    }
+}
 
 /// Build a fixed-width line as a char buffer, then convert to styled spans.
 fn fixed_line(inner_w: usize) -> Vec<char> {
@@ -424,6 +516,7 @@ fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(block, area);
 
     let w = inner.width as usize;
+    let cols = Cols::for_width(w);
     let mut lines: Vec<Line> = Vec::new();
 
     // Header: title + column headers on one line, using char buffer
@@ -440,14 +533,14 @@ fn render(frame: &mut Frame, app: &App) {
     place(&mut hdr, 0, &title);
 
     // Build header using same char buffer + span pattern as PR rows
-    if has_prs && w > COL_CODEX {
-        hdr[COL_CI] = 'c';
-        hdr[COL_APPROVE] = 'a';
-        hdr[COL_CODEX] = 'x';
+    if has_prs && w > cols.codex {
+        hdr[cols.ci] = 'c';
+        hdr[cols.approve] = 'a';
+        hdr[cols.codex] = 'x';
     }
     {
         // Split: " orch" (bold) + rest-of-title (muted) + dots area
-        let prefix: String = hdr[..COL_CI.min(w)].iter().collect();
+        let prefix: String = hdr[..cols.ci.min(w)].iter().collect();
         let mut spans = Vec::new();
 
         // Bold "orch" within the prefix
@@ -464,19 +557,19 @@ fn render(frame: &mut Frame, app: &App) {
             spans.push(Span::styled(prefix, Style::default().fg(MUTED)));
         }
 
-        if has_prs && w > COL_CODEX {
+        if has_prs && w > cols.codex {
             spans.push(Span::styled("c", Style::default().fg(MUTED)));
             let gap1: String =
-                hdr[COL_CI + 1..COL_APPROVE].iter().collect();
+                hdr[cols.ci + 1..cols.approve].iter().collect();
             spans.push(Span::raw(gap1));
             spans.push(Span::styled("a", Style::default().fg(MUTED)));
             let gap2: String =
-                hdr[COL_APPROVE + 1..COL_CODEX].iter().collect();
+                hdr[cols.approve + 1..cols.codex].iter().collect();
             spans.push(Span::raw(gap2));
             spans.push(Span::styled("x", Style::default().fg(MUTED)));
-            if COL_CODEX + 1 < w {
+            if cols.codex + 1 < w {
                 let tail: String =
-                    hdr[COL_CODEX + 1..].iter().collect();
+                    hdr[cols.codex + 1..].iter().collect();
                 spans.push(Span::raw(tail));
             }
         }
@@ -492,7 +585,7 @@ fn render(frame: &mut Frame, app: &App) {
                 let task = &app.tasks[*ti];
                 let label = status_str(task.status);
                 let label_start =
-                    (COL_STATUS_END + 1).saturating_sub(label.len());
+                    (cols.status_end + 1).saturating_sub(label.len());
 
                 let is_expanded = app.expanded.contains(ti);
                 let has_prs_for_task = !task.prs.is_empty();
@@ -519,7 +612,7 @@ fn render(frame: &mut Frame, app: &App) {
                 let name_w =
                     name_trunc.chars().count() + badge.chars().count();
                 let pad1 = label_start.saturating_sub(2 + name_w);
-                let tail_len = w.saturating_sub(COL_STATUS_END + 1);
+                let tail_len = w.saturating_sub(cols.status_end + 1);
 
                 let gutter_style = if sel {
                     Style::default().fg(IRIS)
@@ -553,10 +646,12 @@ fn render(frame: &mut Frame, app: &App) {
                 let pr = &app.tasks[*ti].prs[*pi];
                 let mut buf = fixed_line(w);
                 let gutter = if sel { "  ▸ " } else { "    " };
+                let num_str = format!("#{} ", pr.number);
+                let max_title = cols.ci.saturating_sub(5 + num_str.len());
                 let text = format!(
-                    "#{} {}",
-                    pr.number,
-                    truncate(&pr.title, 42)
+                    "{}{}",
+                    num_str,
+                    truncate(&pr.title, max_title),
                 );
                 place(&mut buf, 0, gutter);
                 place(&mut buf, 4, &text);
@@ -567,14 +662,18 @@ fn render(frame: &mut Frame, app: &App) {
                     None => '○',
                 };
                 let ap_ch = if pr.approved { '·' } else { '○' };
-                let cx_ch = if pr.codex_reviewed { '·' } else { '·' };
+                let cx_ch = match pr.codex {
+                    state::CodexStatus::ThumbsUp => '·',
+                    state::CodexStatus::Commented => '△',
+                    state::CodexStatus::None => ' ',
+                };
 
-                if w > COL_CI { buf[COL_CI] = ci_ch; }
-                if w > COL_APPROVE { buf[COL_APPROVE] = ap_ch; }
-                if w > COL_CODEX { buf[COL_CODEX] = cx_ch; }
+                if w > cols.ci { buf[cols.ci] = ci_ch; }
+                if w > cols.approve { buf[cols.approve] = ap_ch; }
+                if w > cols.codex { buf[cols.codex] = cx_ch; }
 
                 let prefix: String =
-                    buf[..COL_CI.min(w)].iter().collect();
+                    buf[..cols.ci.min(w)].iter().collect();
                 let mut spans = vec![Span::styled(
                     prefix,
                     if sel {
@@ -584,7 +683,7 @@ fn render(frame: &mut Frame, app: &App) {
                     },
                 )];
 
-                if w > COL_CI {
+                if w > cols.ci {
                     let ci_style = match pr.ci_pass {
                         Some(true) => Style::default().fg(PINE),
                         Some(false) => Style::default().fg(LOVE),
@@ -594,11 +693,11 @@ fn render(frame: &mut Frame, app: &App) {
                         ci_ch.to_string(), ci_style,
                     ));
                     let gap: String =
-                        buf[COL_CI + 1..COL_APPROVE.min(w)]
+                        buf[cols.ci + 1..cols.approve.min(w)]
                             .iter().collect();
                     spans.push(Span::raw(gap));
                 }
-                if w > COL_APPROVE {
+                if w > cols.approve {
                     let ap_style = if pr.approved {
                         Style::default().fg(PINE)
                     } else {
@@ -608,22 +707,28 @@ fn render(frame: &mut Frame, app: &App) {
                         ap_ch.to_string(), ap_style,
                     ));
                     let gap: String =
-                        buf[COL_APPROVE + 1..COL_CODEX.min(w)]
+                        buf[cols.approve + 1..cols.codex.min(w)]
                             .iter().collect();
                     spans.push(Span::raw(gap));
                 }
-                if w > COL_CODEX {
-                    let cx_style = if pr.codex_reviewed {
-                        Style::default().fg(IRIS)
-                    } else {
-                        Style::default().fg(MUTED)
+                if w > cols.codex {
+                    let cx_style = match pr.codex {
+                        state::CodexStatus::ThumbsUp => {
+                            Style::default().fg(PINE)
+                        }
+                        state::CodexStatus::Commented => {
+                            Style::default().fg(GOLD)
+                        }
+                        state::CodexStatus::None => {
+                            Style::default().fg(MUTED)
+                        }
                     };
                     spans.push(Span::styled(
                         cx_ch.to_string(), cx_style,
                     ));
-                    if COL_CODEX + 1 < w {
+                    if cols.codex + 1 < w {
                         let tail: String =
-                            buf[COL_CODEX + 1..].iter().collect();
+                            buf[cols.codex + 1..].iter().collect();
                         spans.push(Span::raw(tail));
                     }
                 }
@@ -644,8 +749,75 @@ fn render(frame: &mut Frame, app: &App) {
         ));
     }
 
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
+    // Split layout if output pane is open
+    if let Some(pane) = &app.output {
+        let chunks = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Percentage(50),
+            ratatui::layout::Constraint::Length(1), // divider
+            ratatui::layout::Constraint::Min(5),    // output
+        ])
+        .split(inner);
+
+        // Task list (top)
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, chunks[0]);
+
+        // Divider
+        let status = if pane.finished { "done" } else { "running…" };
+        let divider_text = format!(
+            "─ Output ─── {status} ───"
+        );
+        let pad = chunks[1].width as usize
+            - divider_text.len().min(chunks[1].width as usize);
+        let divider = Line::from(vec![
+            Span::styled(divider_text, Style::default().fg(MUTED)),
+            Span::styled(
+                "─".repeat(pad),
+                Style::default().fg(MUTED),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(vec![divider]), chunks[1]);
+
+        // Output content (bottom) with word wrap and scroll
+        let output_lines: Vec<Line> = pane.lines
+            .iter()
+            .map(|l| Line::styled(l.as_str(), Style::default().fg(SUBTLE)))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(output_lines)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((pane.scroll as u16, 0)),
+            chunks[2],
+        );
+    } else {
+        // No output pane — task list fills the whole area
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
+    }
+
+    // Message input line at the very bottom (inside border)
+    if app.focus == Focus::MessageInput {
+        let input_area = Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        };
+        let input_line = Line::from(vec![
+            Span::styled("msg", Style::default().fg(IRIS)),
+            Span::styled("▸ ", Style::default().fg(MUTED)),
+            Span::styled(
+                app.message_input.as_str(),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled("_", Style::default().fg(IRIS)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(vec![input_line])
+                .style(Style::default().bg(HL_LOW)),
+            input_area,
+        );
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -703,6 +875,8 @@ pub fn run() -> io::Result<()> {
 
         if app.last_fast.elapsed() >= FAST_TICK {
             app.refresh_fast();
+            app.check_new_runs();
+            app.refresh_output();
         }
         if app.last_slow.elapsed() >= SLOW_TICK {
             app.refresh_slow();
@@ -725,50 +899,151 @@ enum Action {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Action {
-    match (key.modifiers, key.code) {
-        (_, KeyCode::Char('q')) => Action::Quit,
-        (KeyModifiers::CONTROL, KeyCode::Char('c')) => Action::Quit,
-        (_, KeyCode::Char('j')) => {
-            app.move_down();
-            Action::Continue
-        }
-        (_, KeyCode::Char('k')) => {
-            app.move_up();
-            Action::Continue
-        }
-        (_, KeyCode::Char('l')) => {
-            app.expand();
-            Action::Continue
-        }
-        (_, KeyCode::Char('h')) => {
-            app.fold();
-            Action::Continue
-        }
-        (_, KeyCode::Char('J')) => {
-            app.reorder_down();
-            Action::Continue
-        }
-        (_, KeyCode::Char('K')) => {
-            app.reorder_up();
-            Action::Continue
-        }
-        (_, KeyCode::Enter) => {
-            match app.visible.get(app.cursor) {
-                Some(ListItem::Task(_)) => {
-                    Action::Suspend(Box::new(|a| a.jump_to_session()))
+    // Message input mode
+    if app.focus == Focus::MessageInput {
+        match key.code {
+            KeyCode::Enter => {
+                if !app.message_input.trim().is_empty() {
+                    crate::write_inbox(&app.message_input);
                 }
-                Some(ListItem::Pr(_, _)) => {
-                    app.open_pr_browser();
-                    Action::Continue
-                }
-                None => Action::Continue,
+                app.message_input.clear();
+                app.focus = Focus::List;
+                return Action::Continue;
             }
+            KeyCode::Esc => {
+                app.message_input.clear();
+                app.focus = Focus::List;
+                return Action::Continue;
+            }
+            KeyCode::Backspace => {
+                app.message_input.pop();
+                return Action::Continue;
+            }
+            KeyCode::Char(c) => {
+                app.message_input.push(c);
+                return Action::Continue;
+            }
+            _ => return Action::Continue,
         }
-        (_, KeyCode::Char('o')) => {
-            app.open_pr_browser();
-            Action::Continue
+    }
+
+    // Output pane focused
+    if app.focus == Focus::Output && app.output.is_some() {
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Esc) | (_, KeyCode::Char('q')) => {
+                app.dismiss_output();
+                Action::Continue
+            }
+            (_, KeyCode::Char('j')) | (_, KeyCode::Down) => {
+                if let Some(pane) = &mut app.output {
+                    if pane.scroll + 1 < pane.lines.len() {
+                        pane.scroll += 1;
+                    }
+                }
+                Action::Continue
+            }
+            (_, KeyCode::Char('k')) | (_, KeyCode::Up) => {
+                if let Some(pane) = &mut app.output {
+                    pane.scroll = pane.scroll.saturating_sub(1);
+                }
+                Action::Continue
+            }
+            (_, KeyCode::Char('G')) => {
+                if let Some(pane) = &mut app.output {
+                    pane.scroll =
+                        pane.lines.len().saturating_sub(1);
+                }
+                Action::Continue
+            }
+            (_, KeyCode::Char('g')) => {
+                if let Some(pane) = &mut app.output {
+                    pane.scroll = 0;
+                }
+                Action::Continue
+            }
+            (_, KeyCode::Tab) => {
+                app.focus = Focus::List;
+                Action::Continue
+            }
+            _ => Action::Continue,
         }
-        _ => Action::Continue,
+    } else {
+        // List focused (default)
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Char('q')) => {
+                if app.output.is_some() {
+                    app.dismiss_output();
+                    Action::Continue
+                } else {
+                    Action::Quit
+                }
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => Action::Quit,
+            (_, KeyCode::Esc) => {
+                if app.output.is_some() {
+                    app.dismiss_output();
+                }
+                Action::Continue
+            }
+            (_, KeyCode::Char('j')) => {
+                app.move_down();
+                Action::Continue
+            }
+            (_, KeyCode::Char('k')) => {
+                app.move_up();
+                Action::Continue
+            }
+            (_, KeyCode::Char('l')) => {
+                app.expand();
+                Action::Continue
+            }
+            (_, KeyCode::Char('h')) => {
+                app.fold();
+                Action::Continue
+            }
+            (_, KeyCode::Char('J')) => {
+                app.reorder_down();
+                Action::Continue
+            }
+            (_, KeyCode::Char('K')) => {
+                app.reorder_up();
+                Action::Continue
+            }
+            (_, KeyCode::Char('r')) => {
+                app.open_latest_run();
+                Action::Continue
+            }
+            (_, KeyCode::Char('m')) => {
+                app.focus = Focus::MessageInput;
+                app.message_input.clear();
+                Action::Continue
+            }
+            (_, KeyCode::Tab) => {
+                if app.output.is_some() {
+                    app.focus = Focus::Output;
+                }
+                Action::Continue
+            }
+            (_, KeyCode::Enter) => {
+                match app.visible.get(app.cursor) {
+                    Some(ListItem::Task(_)) => {
+                        Action::Suspend(Box::new(|a| {
+                            a.jump_to_session()
+                        }))
+                    }
+                    Some(ListItem::Pr(_, _)) => {
+                        app.open_pr_browser();
+                        Action::Continue
+                    }
+                    None => Action::Continue,
+                }
+            }
+            (_, KeyCode::Char('o')) => {
+                app.open_pr_browser();
+                Action::Continue
+            }
+            _ => Action::Continue,
+        }
     }
 }
 
@@ -793,14 +1068,14 @@ mod tests {
                         title: "safe migration helper".into(),
                         ci_pass: Some(true),
                         approved: true,
-                        codex_reviewed: true,
+                        codex: state::CodexStatus::Commented,
                     },
                     state::PrData {
                         number: 25812,
                         title: "add lock_wait_timeout".into(),
                         ci_pass: Some(true),
                         approved: false,
-                        codex_reviewed: true,
+                        codex: state::CodexStatus::Commented,
                     },
                 ],
             },
@@ -850,6 +1125,12 @@ mod tests {
             last_fast: Instant::now(),
             last_slow: Instant::now(),
             should_quit: false,
+            output: None,
+            focus: Focus::List,
+            read_runs: HashSet::new(),
+            last_run_count: 0,
+            message_input: String::new(),
+            prev_hashes: HashMap::new(),
         };
         let mut terminal =
             Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -911,7 +1192,7 @@ mod tests {
                     title: "feat(remoteagent): live tool progress in Slack".into(),
                     ci_pass: Some(false),
                     approved: false,
-                    codex_reviewed: true,
+                    codex: state::CodexStatus::Commented,
                 }],
             },
             Task {
@@ -1052,11 +1333,11 @@ mod tests {
             "approval: dot={ap_dot} header={ap_hdr}"
         );
 
-        // Codex: 'x' vs rightmost ·
+        // Codex: 'x' vs △ (commented status)
         let cx_hdr =
             rfind_char_col(header_line, 'x').unwrap();
         let cx_dot =
-            rfind_char_col(pr_line, '·').unwrap();
+            find_char_col(pr_line, '△').unwrap();
         assert_eq!(
             cx_dot, cx_hdr,
             "codex: dot={cx_dot} header={cx_hdr}"
@@ -1100,5 +1381,92 @@ mod tests {
             let output = render_to_string(tasks.clone(), sel, 80, 14);
             eprintln!("\n=== sel={sel} ({}) ===\n{output}", tasks[sel].name);
         }
+    }
+
+    fn render_with_output(
+        tasks: Vec<Task>,
+        output_lines: Vec<&str>,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let mut expanded = HashSet::new();
+        for (i, t) in tasks.iter().enumerate() {
+            if !t.prs.is_empty() {
+                expanded.insert(i);
+            }
+        }
+        let visible = App::build_visible(&tasks, &expanded);
+        let app = App {
+            tasks,
+            order: Vec::new(),
+            expanded,
+            visible,
+            cursor: 0,
+            pr_cache: PrCache::new(),
+            last_fast: Instant::now(),
+            last_slow: Instant::now(),
+            should_quit: false,
+            output: Some(OutputPane {
+                run_id: "test-run".into(),
+                lines: output_lines.iter().map(|s| s.to_string()).collect(),
+                scroll: 0,
+                finished: true,
+            }),
+            focus: Focus::Output,
+            read_runs: HashSet::new(),
+            last_run_count: 0,
+            message_input: String::new(),
+            prev_hashes: HashMap::new(),
+        };
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| render(f, &app))
+            .unwrap();
+        format!("{}", terminal.backend())
+    }
+
+    #[test]
+    fn output_pane_renders() {
+        let tasks = vec![
+            Task {
+                name: "agentserver".into(),
+                meta: state::TaskMeta::default(),
+                status: TaskStatus::Working,
+                prs: vec![],
+            },
+            Task {
+                name: "slow-api".into(),
+                meta: state::TaskMeta::default(),
+                status: TaskStatus::Ready,
+                prs: vec![],
+            },
+        ];
+        let output = render_with_output(
+            tasks,
+            vec![
+                "Scanning workspace...",
+                "> Found 2 active tasks",
+                "> agentserver: working",
+                "> slow-api: ready",
+                "> Done.",
+            ],
+            70,
+            16,
+        );
+        eprintln!("\n=== output pane ===\n{output}");
+        // Should have the divider
+        assert!(output.contains("Output"), "missing Output divider");
+        assert!(output.contains("done"), "missing done status");
+        // Should show output content
+        assert!(
+            output.contains("Scanning"),
+            "missing output content"
+        );
+        // Should still show tasks
+        assert!(
+            output.contains("agentserver"),
+            "missing task list"
+        );
     }
 }
