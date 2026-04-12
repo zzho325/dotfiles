@@ -109,7 +109,7 @@ impl App {
         let visible = Self::build_visible(&tasks, &HashSet::new());
         let last_run_count = crate::runs::list_runs(100).len();
 
-        Self {
+        let app = Self {
             tasks,
             order,
             expanded: HashSet::new(),
@@ -125,7 +125,9 @@ impl App {
             last_run_count,
             message_input: String::new(),
             prev_hashes: HashMap::new(),
-        }
+        };
+        app.sync_tmux_numbers();
+        app
     }
 
     fn build_visible(
@@ -347,24 +349,40 @@ impl App {
     }
 
     fn sync_tmux_numbers(&self) {
-        let sessions = load_tmux_sessions();
+        // Collect all rename operations first, then execute.
+        // We list sessions once and match by suffix to find
+        // which tmux session belongs to which task.
+        let output = Command::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .stderr(Stdio::null())
+            .output()
+            .ok();
+        let Some(output) = output.filter(|o| o.status.success())
+        else {
+            return;
+        };
+        let names: Vec<String> =
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(String::from)
+                .collect();
+
         for (i, task) in self.tasks.iter().enumerate() {
             let session = &task.meta.session;
             if session.is_empty() {
                 continue;
             }
             let new_name = format!("{}-{session}", i + 1);
-            let current = sessions.values().find(|s| {
-                s.name == *session
-                    || s.name.ends_with(&format!("-{session}"))
+            let suffix = format!("-{session}");
+            let current = names.iter().find(|n| {
+                *n == session || n.ends_with(&suffix)
             });
             if let Some(current) = current {
-                if current.name != new_name {
+                if *current != new_name {
                     let _ = Command::new("tmux")
                         .args([
                             "rename-session",
-                            "-t",
-                            &current.name,
+                            "-t", current,
                             &new_name,
                         ])
                         .stderr(Stdio::null())
