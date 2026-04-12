@@ -7,6 +7,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+/// Atomic write: write to .tmp then rename to avoid partial reads.
+pub fn atomic_write(path: &Path, content: &str) -> bool {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, content).is_ok()
+        && fs::rename(&tmp, path).is_ok()
+}
+
 // Task state persisted in ~/tasks/.state/<name>.json
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -17,9 +24,6 @@ pub struct TaskMeta {
     pub worktree: String,
     #[serde(default)]
     pub prs: Vec<u32>,
-    #[serde(default)]
-    pub ready: bool,
-    /// Set via `orch - "task-foo: needs input: <question>"`
     #[serde(default)]
     pub needs_input: bool,
 }
@@ -125,8 +129,7 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
         return HashMap::new();
     };
 
-    let active_sessions = load_active_sessions();
-    let pane_hashes = load_pane_hashes();
+    let (active_sessions, pane_hashes) = load_pane_info();
 
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -149,39 +152,13 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
         .collect()
 }
 
-/// Check if any pane in each session is running a worker process.
-fn load_active_sessions() -> HashSet<String> {
-    let output = Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name} #{pane_current_command}",
-        ])
-        .stderr(Stdio::null())
-        .output()
-        .ok();
-    let Some(output) = output.filter(|o| o.status.success()) else {
-        return HashSet::new();
-    };
-    let mut active = HashSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((session, cmd)) = line.split_once(' ') else {
-            continue;
-        };
-        if is_worker_process(cmd) {
-            active.insert(session.to_string());
-        }
-    }
-    active
-}
-
 fn is_worker_process(cmd: &str) -> bool {
     cmd == "claude" || cmd == "node" || cmd.starts_with("codex")
 }
 
-/// Hash the last few lines of each claude pane for change detection.
-fn load_pane_hashes() -> HashMap<String, u64> {
+/// Single tmux list-panes call to detect active workers and hash
+/// pane content for change detection.
+fn load_pane_info() -> (HashSet<String>, HashMap<String, u64>) {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -194,22 +171,28 @@ fn load_pane_hashes() -> HashMap<String, u64> {
         .output()
         .ok();
     let Some(output) = output.filter(|o| o.status.success()) else {
-        return HashMap::new();
+        return (HashSet::new(), HashMap::new());
     };
 
+    let mut active = HashSet::new();
     let mut hashes = HashMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() < 3 {
             continue;
         }
-        let (session, cmd, pane_id) = (parts[0], parts[1], parts[2]);
+        let (session, cmd, pane_id) =
+            (parts[0], parts[1], parts[2]);
         if !is_worker_process(cmd) {
             continue;
         }
-        // Capture last 3 lines of this pane
+        active.insert(session.to_string());
+
+        // Capture last 3 lines for change detection
         let capture = Command::new("tmux")
-            .args(["capture-pane", "-t", pane_id, "-p", "-S", "-3"])
+            .args([
+                "capture-pane", "-t", pane_id, "-p", "-S", "-3",
+            ])
             .stderr(Stdio::null())
             .output()
             .ok();
@@ -220,7 +203,7 @@ fn load_pane_hashes() -> HashMap<String, u64> {
             hashes.insert(session.to_string(), hasher.finish());
         }
     }
-    hashes
+    (active, hashes)
 }
 
 pub fn derive_status(
@@ -313,10 +296,7 @@ pub fn save_task_meta(name: &str, meta: &TaskMeta) {
     fs::create_dir_all(&dir).ok();
     if let Ok(json) = serde_json::to_string_pretty(meta) {
         let path = dir.join(format!("{name}.json"));
-        let tmp = path.with_extension("tmp");
-        if fs::write(&tmp, &json).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
+        atomic_write(&path, &json);
     }
 }
 
@@ -448,4 +428,196 @@ pub fn save_order(order: &[String]) {
     fs::create_dir_all(&dir).ok();
     let json = serde_json::to_string_pretty(order).unwrap_or_default();
     fs::write(dir.join("order.json"), json).ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_creates_file() {
+        let dir = std::env::temp_dir().join("orch-test-atomic");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.json");
+
+        assert!(atomic_write(&path, r#"{"ok": true}"#));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            r#"{"ok": true}"#,
+        );
+        // No leftover .tmp
+        assert!(!path.with_extension("tmp").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn derive_status_no_session() {
+        let meta = TaskMeta::default();
+        let sessions = HashMap::new();
+        let prev = HashMap::new();
+        assert_eq!(
+            derive_status(&meta, &sessions, &prev),
+            TaskStatus::Idle,
+        );
+    }
+
+    #[test]
+    fn derive_status_attached() {
+        let meta = TaskMeta {
+            session: "task-foo".into(),
+            ..Default::default()
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "task-foo".into(),
+            TmuxSession {
+                name: "task-foo".into(),
+                attached: true,
+                has_active_process: true,
+                pane_hash: 123,
+            },
+        );
+        assert_eq!(
+            derive_status(&meta, &sessions, &HashMap::new()),
+            TaskStatus::Attached,
+        );
+    }
+
+    #[test]
+    fn derive_status_needs_input() {
+        let meta = TaskMeta {
+            session: "task-foo".into(),
+            needs_input: true,
+            ..Default::default()
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "task-foo".into(),
+            TmuxSession {
+                name: "task-foo".into(),
+                attached: false,
+                has_active_process: true,
+                pane_hash: 123,
+            },
+        );
+        assert_eq!(
+            derive_status(&meta, &sessions, &HashMap::new()),
+            TaskStatus::Input,
+        );
+    }
+
+    #[test]
+    fn derive_status_no_active_process_is_ready() {
+        let meta = TaskMeta {
+            session: "task-foo".into(),
+            ..Default::default()
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "task-foo".into(),
+            TmuxSession {
+                name: "task-foo".into(),
+                attached: false,
+                has_active_process: false,
+                pane_hash: 0,
+            },
+        );
+        assert_eq!(
+            derive_status(&meta, &sessions, &HashMap::new()),
+            TaskStatus::Ready,
+        );
+    }
+
+    #[test]
+    fn derive_status_working_when_hash_changed() {
+        let meta = TaskMeta {
+            session: "task-foo".into(),
+            ..Default::default()
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "task-foo".into(),
+            TmuxSession {
+                name: "task-foo".into(),
+                attached: false,
+                has_active_process: true,
+                pane_hash: 999,
+            },
+        );
+        let mut prev = HashMap::new();
+        prev.insert("task-foo".to_string(), 111u64);
+        assert_eq!(
+            derive_status(&meta, &sessions, &prev),
+            TaskStatus::Working,
+        );
+    }
+
+    #[test]
+    fn derive_status_ready_when_hash_unchanged() {
+        let meta = TaskMeta {
+            session: "task-foo".into(),
+            ..Default::default()
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "task-foo".into(),
+            TmuxSession {
+                name: "task-foo".into(),
+                attached: false,
+                has_active_process: true,
+                pane_hash: 555,
+            },
+        );
+        let mut prev = HashMap::new();
+        prev.insert("task-foo".to_string(), 555u64);
+        assert_eq!(
+            derive_status(&meta, &sessions, &prev),
+            TaskStatus::Ready,
+        );
+    }
+
+    #[test]
+    fn find_session_by_suffix() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "1-task-foo".into(),
+            TmuxSession {
+                name: "1-task-foo".into(),
+                attached: false,
+                has_active_process: false,
+                pane_hash: 0,
+            },
+        );
+        // Direct match fails, suffix match succeeds
+        assert!(sessions.get("task-foo").is_none());
+        let found = find_session("task-foo", &sessions);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "1-task-foo");
+    }
+
+    #[test]
+    fn task_meta_round_trip() {
+        let meta = TaskMeta {
+            session: "task-test".into(),
+            worktree: "~/code/wt".into(),
+            prs: vec![100, 200],
+            needs_input: true,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: TaskMeta =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.session, "task-test");
+        assert_eq!(parsed.prs, vec![100, 200]);
+        assert!(parsed.needs_input);
+    }
+
+    #[test]
+    fn is_worker_process_checks() {
+        assert!(is_worker_process("claude"));
+        assert!(is_worker_process("node"));
+        assert!(is_worker_process("codex"));
+        assert!(is_worker_process("codex-cli"));
+        assert!(!is_worker_process("nvim"));
+        assert!(!is_worker_process("zsh"));
+    }
 }

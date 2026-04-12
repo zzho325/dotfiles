@@ -62,6 +62,8 @@ struct OutputPane {
     lines: Vec<String>,
     scroll: usize,
     finished: bool,
+    /// Cached file length for change detection
+    last_len: u64,
 }
 
 struct App {
@@ -162,15 +164,16 @@ impl App {
     /// Count unread runs.
     /// Open output pane for the latest unread run.
     fn open_run(&mut self, run: &crate::runs::RunMeta) {
-        let lines: Vec<String> = crate::runs::read_output(&run.id)
-            .lines()
-            .map(String::from)
-            .collect();
+        let content = crate::runs::read_output(&run.id);
+        let last_len = content.len() as u64;
+        let lines: Vec<String> =
+            content.lines().map(String::from).collect();
         self.output = Some(OutputPane {
             run_id: run.id.clone(),
             lines,
             scroll: 0,
             finished: run.finished_at.is_some(),
+            last_len,
         });
         self.focus = Focus::Output;
     }
@@ -189,6 +192,13 @@ impl App {
 
     fn refresh_output(&mut self) {
         if let Some(pane) = &mut self.output {
+            // Skip re-read if file size unchanged
+            let cur_len = crate::runs::output_len(&pane.run_id);
+            if cur_len == pane.last_len {
+                return;
+            }
+            pane.last_len = cur_len;
+
             let content = crate::runs::read_output(&pane.run_id);
             let new_lines: Vec<String> =
                 content.lines().map(String::from).collect();
@@ -307,56 +317,33 @@ impl App {
         }
     }
 
-    fn reorder_up(&mut self) {
+    fn reorder(&mut self, delta: isize) {
         let Some(ListItem::Task(idx)) = self.visible.get(self.cursor)
         else {
             return;
         };
         let idx = *idx;
-        if idx > 0 {
-            self.tasks.swap(idx, idx - 1);
-            // Fix expanded set
-            let had_a = self.expanded.remove(&idx);
-            let had_b = self.expanded.remove(&(idx - 1));
-            if had_a { self.expanded.insert(idx - 1); }
-            if had_b { self.expanded.insert(idx); }
-            self.order =
-                self.tasks.iter().map(|t| t.name.clone()).collect();
-            save_order(&self.order);
-            self.rebuild_visible();
-            // Move cursor to the new position
-            self.cursor = self
-                .visible
-                .iter()
-                .position(|v| matches!(v, ListItem::Task(i) if *i == idx - 1))
-                .unwrap_or(self.cursor);
-            self.sync_tmux_numbers();
-        }
-    }
-
-    fn reorder_down(&mut self) {
-        let Some(ListItem::Task(idx)) = self.visible.get(self.cursor)
-        else {
+        let target = idx.wrapping_add(delta as usize);
+        if target >= self.tasks.len() {
             return;
-        };
-        let idx = *idx;
-        if idx + 1 < self.tasks.len() {
-            self.tasks.swap(idx, idx + 1);
-            let had_a = self.expanded.remove(&idx);
-            let had_b = self.expanded.remove(&(idx + 1));
-            if had_a { self.expanded.insert(idx + 1); }
-            if had_b { self.expanded.insert(idx); }
-            self.order =
-                self.tasks.iter().map(|t| t.name.clone()).collect();
-            save_order(&self.order);
-            self.rebuild_visible();
-            self.cursor = self
-                .visible
-                .iter()
-                .position(|v| matches!(v, ListItem::Task(i) if *i == idx + 1))
-                .unwrap_or(self.cursor);
-            self.sync_tmux_numbers();
         }
+        self.tasks.swap(idx, target);
+        let had_a = self.expanded.remove(&idx);
+        let had_b = self.expanded.remove(&target);
+        if had_a { self.expanded.insert(target); }
+        if had_b { self.expanded.insert(idx); }
+        self.order =
+            self.tasks.iter().map(|t| t.name.clone()).collect();
+        save_order(&self.order);
+        self.rebuild_visible();
+        self.cursor = self
+            .visible
+            .iter()
+            .position(
+                |v| matches!(v, ListItem::Task(i) if *i == target),
+            )
+            .unwrap_or(self.cursor);
+        self.sync_tmux_numbers();
     }
 
     fn sync_tmux_numbers(&self) {
@@ -880,7 +867,6 @@ pub fn run() -> io::Result<()> {
         }
         if app.last_slow.elapsed() >= SLOW_TICK {
             app.refresh_slow();
-            app.refresh_fast();
         }
         if app.should_quit {
             break;
@@ -1002,11 +988,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
                 Action::Continue
             }
             (_, KeyCode::Char('J')) => {
-                app.reorder_down();
+                app.reorder(1);
                 Action::Continue
             }
             (_, KeyCode::Char('K')) => {
-                app.reorder_up();
+                app.reorder(-1);
                 Action::Continue
             }
             (_, KeyCode::Char('r')) => {
@@ -1100,13 +1086,11 @@ mod tests {
         ]
     }
 
-    fn render_to_string(
+    fn make_test_app(
         tasks: Vec<Task>,
         cursor: usize,
-        width: u16,
-        height: u16,
-    ) -> String {
-        // Expand all tasks with PRs so tests see PR rows
+        output: Option<OutputPane>,
+    ) -> App {
         let mut expanded = HashSet::new();
         for (i, t) in tasks.iter().enumerate() {
             if !t.prs.is_empty() {
@@ -1115,7 +1099,12 @@ mod tests {
         }
         let visible =
             App::build_visible(&tasks, &expanded);
-        let app = App {
+        let focus = if output.is_some() {
+            Focus::Output
+        } else {
+            Focus::List
+        };
+        App {
             tasks,
             order: Vec::new(),
             expanded,
@@ -1125,19 +1114,36 @@ mod tests {
             last_fast: Instant::now(),
             last_slow: Instant::now(),
             should_quit: false,
-            output: None,
-            focus: Focus::List,
+            output,
+            focus,
             read_runs: HashSet::new(),
             last_run_count: 0,
             message_input: String::new(),
             prev_hashes: HashMap::new(),
-        };
+        }
+    }
+
+    fn render_app(
+        app: &App,
+        width: u16,
+        height: u16,
+    ) -> String {
         let mut terminal =
             Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|f| render(f, &app))
             .unwrap();
         format!("{}", terminal.backend())
+    }
+
+    fn render_to_string(
+        tasks: Vec<Task>,
+        cursor: usize,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let app = make_test_app(tasks, cursor, None);
+        render_app(&app, width, height)
     }
 
     #[test]
@@ -1389,41 +1395,184 @@ mod tests {
         width: u16,
         height: u16,
     ) -> String {
-        let mut expanded = HashSet::new();
-        for (i, t) in tasks.iter().enumerate() {
-            if !t.prs.is_empty() {
-                expanded.insert(i);
-            }
-        }
-        let visible = App::build_visible(&tasks, &expanded);
-        let app = App {
-            tasks,
-            order: Vec::new(),
-            expanded,
-            visible,
-            cursor: 0,
-            pr_cache: PrCache::new(),
-            last_fast: Instant::now(),
-            last_slow: Instant::now(),
-            should_quit: false,
-            output: Some(OutputPane {
-                run_id: "test-run".into(),
-                lines: output_lines.iter().map(|s| s.to_string()).collect(),
-                scroll: 0,
-                finished: true,
-            }),
-            focus: Focus::Output,
-            read_runs: HashSet::new(),
-            last_run_count: 0,
-            message_input: String::new(),
-            prev_hashes: HashMap::new(),
+        let pane = OutputPane {
+            run_id: "test-run".into(),
+            lines: output_lines
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            scroll: 0,
+            finished: true,
+            last_len: 0,
         };
-        let mut terminal =
-            Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|f| render(f, &app))
-            .unwrap();
-        format!("{}", terminal.backend())
+        let app = make_test_app(tasks, 0, Some(pane));
+        render_app(&app, width, height)
+    }
+
+    // Unit tests for App logic (non-rendering)
+
+    #[test]
+    fn reorder_swaps_and_preserves_expanded() {
+        let mut app = make_test_app(test_tasks(), 0, None);
+        // Task 0 is expanded (has PRs)
+        assert!(app.expanded.contains(&0));
+        assert_eq!(app.tasks[0].name, "migration-safety");
+
+        // Reorder down: migration-safety → position 1
+        app.reorder(1);
+        assert_eq!(app.tasks[0].name, "ach-batch-nacha");
+        assert_eq!(app.tasks[1].name, "migration-safety");
+        // Expanded set follows the task
+        assert!(app.expanded.contains(&1));
+        assert!(!app.expanded.contains(&0));
+    }
+
+    #[test]
+    fn reorder_noop_at_boundaries() {
+        let mut app = make_test_app(test_tasks(), 0, None);
+        let names_before: Vec<_> =
+            app.tasks.iter().map(|t| t.name.clone()).collect();
+        // Can't move first task up
+        app.reorder(-1);
+        let names_after: Vec<_> =
+            app.tasks.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(names_before, names_after);
+    }
+
+    #[test]
+    fn fold_expand_cycle() {
+        let mut app = make_test_app(test_tasks(), 0, None);
+        // Start expanded (make_test_app expands tasks with PRs)
+        let initial_len = app.visible.len();
+        assert!(initial_len > 3); // 3 tasks + 2 PRs = 5
+
+        // Fold task 0
+        app.fold();
+        assert!(!app.expanded.contains(&0));
+        assert_eq!(app.visible.len(), 3); // just tasks
+
+        // Expand again
+        app.expand();
+        assert!(app.expanded.contains(&0));
+        assert_eq!(app.visible.len(), initial_len);
+    }
+
+    #[test]
+    fn cursor_clamps_after_fold() {
+        let mut app = make_test_app(test_tasks(), 0, None);
+        // Move cursor to PR row
+        app.cursor = 2; // second PR
+        assert!(
+            matches!(app.visible[2], ListItem::Pr(0, 1))
+        );
+
+        // Fold — cursor should move to parent task
+        app.fold();
+        assert_eq!(app.cursor, 0);
+        assert!(matches!(app.visible[0], ListItem::Task(0)));
+    }
+
+    #[test]
+    fn truncate_handles_edge_cases() {
+        assert_eq!(truncate("hello", 0), "");
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 6), "hello…");
+    }
+
+    #[test]
+    fn build_visible_with_no_expanded() {
+        let tasks = test_tasks();
+        let visible =
+            App::build_visible(&tasks, &HashSet::new());
+        // No expansions = just task items
+        assert_eq!(visible.len(), 3);
+        assert!(visible.iter().all(
+            |v| matches!(v, ListItem::Task(_))
+        ));
+    }
+
+    #[test]
+    fn handle_key_message_input() {
+        let mut app = make_test_app(test_tasks(), 0, None);
+        app.focus = Focus::MessageInput;
+
+        // Type characters
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.message_input, "hi");
+
+        // Backspace
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(app.message_input, "h");
+
+        // Escape cancels
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert_eq!(app.focus, Focus::List);
+        assert!(app.message_input.is_empty());
+    }
+
+    // Snapshot tests for rendering edge cases
+
+    #[test]
+    fn narrow_terminal_no_panic() {
+        // Very narrow terminal — should not panic
+        let output = render_to_string(test_tasks(), 0, 30, 10);
+        assert!(output.contains("orch"));
+    }
+
+    #[test]
+    fn message_input_renders() {
+        let mut app = make_test_app(test_tasks(), 0, None);
+        app.focus = Focus::MessageInput;
+        app.message_input = "hello orch".into();
+        let output = render_app(&app, 70, 10);
+        eprintln!("\n=== message input ===\n{output}");
+        assert!(output.contains("msg"), "missing msg prompt");
+        assert!(
+            output.contains("hello orch"),
+            "missing input text"
+        );
+    }
+
+    #[test]
+    fn codex_thumbsup_dot() {
+        let tasks = vec![Task {
+            name: "my-task".into(),
+            meta: state::TaskMeta {
+                prs: vec![100],
+                ..Default::default()
+            },
+            status: TaskStatus::Ready,
+            prs: vec![state::PrData {
+                number: 100,
+                title: "some pr".into(),
+                ci_pass: Some(true),
+                approved: true,
+                codex: state::CodexStatus::ThumbsUp,
+            }],
+        }];
+        let output = render_to_string(tasks, 0, 60, 6);
+        // All three columns should show passing dots
+        let pr_line = output
+            .lines()
+            .find(|l| l.contains("#100"))
+            .expect("no PR line");
+        // ci=·, approve=·, codex=· (all passing)
+        let dots = pr_line.chars().filter(|&c| c == '·').count();
+        assert!(dots >= 3, "expected 3 passing dots, got {dots}");
     }
 
     #[test]

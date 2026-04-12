@@ -95,11 +95,7 @@ pub fn finish_run(run_id: &str, exit_code: i32) {
     meta.finished_at = Some(now_epoch());
     meta.exit_code = Some(exit_code);
     if let Ok(json) = serde_json::to_string_pretty(&meta) {
-        // Atomic write via tmp + rename
-        let tmp = meta_path.with_extension("tmp");
-        if fs::write(&tmp, &json).is_ok() {
-            let _ = fs::rename(&tmp, &meta_path);
-        }
+        crate::state::atomic_write(&meta_path, &json);
     }
 }
 
@@ -127,6 +123,65 @@ pub fn list_runs(limit: usize) -> Vec<RunMeta> {
 pub fn read_output(run_id: &str) -> String {
     let path = runs_dir().join(run_id).join("output.log");
     fs::read_to_string(&path).unwrap_or_default()
+}
+
+/// Get the output log file length (for change detection).
+pub fn output_len(run_id: &str) -> u64 {
+    let path = runs_dir().join(run_id).join("output.log");
+    fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_trigger_kinds() {
+        let (kind, _) = classify_trigger("[scan]");
+        assert_eq!(kind, "scan");
+
+        let (kind, _) = classify_trigger("[message] hello");
+        assert_eq!(kind, "message");
+
+        let (kind, _) = classify_trigger("[new-task] foo.md");
+        assert_eq!(kind, "new-task");
+
+        let (kind, _) = classify_trigger("something else");
+        assert_eq!(kind, "other");
+    }
+
+    #[test]
+    fn classify_trigger_truncates_summary() {
+        let long = "x".repeat(200);
+        let (_, summary) = classify_trigger(&long);
+        assert_eq!(summary.len(), 80);
+    }
+
+    #[test]
+    fn run_meta_serde_round_trip() {
+        let meta = RunMeta {
+            id: "123-scan".into(),
+            started_at: 1000,
+            finished_at: Some(2000),
+            exit_code: Some(0),
+            trigger_kind: "scan".into(),
+            trigger_summary: "test".into(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: RunMeta =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "123-scan");
+        assert_eq!(parsed.finished_at, Some(2000));
+        assert_eq!(parsed.exit_code, Some(0));
+    }
+
+    #[test]
+    fn run_meta_defaults_optional_fields() {
+        let json = r#"{"id":"x","started_at":0,"trigger_kind":"scan","trigger_summary":"t"}"#;
+        let meta: RunMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.finished_at, None);
+        assert_eq!(meta.exit_code, None);
+    }
 }
 
 /// Prune old runs (>7 days or >200 total).

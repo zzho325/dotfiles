@@ -143,12 +143,8 @@ enum PrAction {
 
 // Paths
 
-fn tasks_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join("tasks")
-}
-
 fn inbox_dir() -> PathBuf {
-    tasks_dir().join(".inbox")
+    state::tasks_dir().join(".inbox")
 }
 
 fn repo_dir() -> String {
@@ -341,7 +337,7 @@ fn extract_section<'a>(content: &'a str, heading: &str) -> Vec<&'a str> {
 /// Legacy plain-text status output. Used when stdout is not a TTY
 /// (piped, scripted) or via `orch status`.
 fn cmd_status() {
-    let dir = tasks_dir();
+    let dir = state::tasks_dir();
     println!("## Tasks\n");
 
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -445,9 +441,7 @@ fn cmd_spawn(session: &str, task_file: &str, dir: Option<&str>) {
 /// worker messages. On changes, spawns a one-shot orchestrator agent.
 /// Also polls tmux session activity every 20 minutes.
 fn cmd_daemon() {
-    unsafe { std::env::remove_var("CLAUDECODE") };
-
-    let dir = tasks_dir();
+    let dir = state::tasks_dir();
     let inbox = inbox_dir();
     fs::create_dir_all(&dir).ok();
     fs::create_dir_all(&inbox).ok();
