@@ -269,12 +269,21 @@ fn run_orchestrator(message: &str) {
 // Tmux helpers — used by daemon for activity polling and by legacy
 // status/jump commands.
 
+/// Check if a tmux session exists, matching numbered prefixes
+/// (e.g. "task-foo" matches "3-task-foo").
 fn has_tmux_session(name: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", name])
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .ok();
+    let Some(output) = output.filter(|o| o.status.success()) else {
+        return false;
+    };
+    let suffix = format!("-{name}");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|n| n == name || n.ends_with(&suffix))
 }
 
 fn tmux(args: &[&str]) -> bool {
