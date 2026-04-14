@@ -90,14 +90,17 @@ struct App {
     message_input: String,
     /// Previous pane hashes for change detection
     prev_hashes: HashMap<String, u64>,
+    /// Status is unknown until first refresh completes
+    has_baseline: bool,
+    /// Skip file I/O (for tests)
+    readonly: bool,
 }
 
 impl App {
     fn new() -> Self {
         let order = load_order();
         let sessions = load_tmux_sessions();
-        let prev_hashes = HashMap::new();
-        let tasks = load_tasks(&order, &sessions, &prev_hashes);
+        let tasks = load_tasks(&order, &sessions, &HashMap::new());
         let pr_cache = PrCache::new();
 
         let all_prs: Vec<u32> = tasks
@@ -108,6 +111,9 @@ impl App {
 
         let visible = Self::build_visible(&tasks, &HashSet::new());
         let last_run_count = crate::runs::list_runs(100).len();
+
+        let order: Vec<String> =
+            tasks.iter().map(|t| t.name.clone()).collect();
 
         let app = Self {
             tasks,
@@ -124,7 +130,12 @@ impl App {
             read_runs: HashSet::new(),
             last_run_count,
             message_input: String::new(),
-            prev_hashes: HashMap::new(),
+            prev_hashes: sessions
+                .iter()
+                .map(|(k, v)| (k.clone(), v.pane_hash))
+                .collect(),
+            has_baseline: false,
+            readonly: false,
         };
         app.sync_tmux_numbers();
         app
@@ -238,6 +249,15 @@ impl App {
         let sessions = load_tmux_sessions();
         self.tasks =
             load_tasks(&self.order, &sessions, &self.prev_hashes);
+
+        // Save order only when tasks are added or removed
+        let task_count = self.tasks.len();
+        if task_count != self.order.len() {
+            self.order =
+                self.tasks.iter().map(|t| t.name.clone()).collect();
+            if !self.readonly { save_order(&self.order); }
+        }
+
         // Store current hashes for next comparison
         self.prev_hashes = sessions
             .iter()
@@ -261,6 +281,8 @@ impl App {
         }
 
         self.rebuild_visible();
+        self.sync_tmux_numbers();
+        self.has_baseline = true;
         self.last_fast = Instant::now();
     }
 
@@ -325,10 +347,11 @@ impl App {
             return;
         };
         let idx = *idx;
-        let target = idx.wrapping_add(delta as usize);
-        if target >= self.tasks.len() {
+        let target = (idx as isize) + delta;
+        if target < 0 || target as usize >= self.tasks.len() {
             return;
         }
+        let target = target as usize;
         self.tasks.swap(idx, target);
         let had_a = self.expanded.remove(&idx);
         let had_b = self.expanded.remove(&target);
@@ -336,7 +359,7 @@ impl App {
         if had_b { self.expanded.insert(idx); }
         self.order =
             self.tasks.iter().map(|t| t.name.clone()).collect();
-        save_order(&self.order);
+        if !self.readonly { save_order(&self.order); }
         self.rebuild_visible();
         self.cursor = self
             .visible
@@ -349,9 +372,6 @@ impl App {
     }
 
     fn sync_tmux_numbers(&self) {
-        // Collect all rename operations first, then execute.
-        // We list sessions once and match by suffix to find
-        // which tmux session belongs to which task.
         let output = Command::new("tmux")
             .args(["list-sessions", "-F", "#{session_name}"])
             .stderr(Stdio::null())
@@ -361,7 +381,7 @@ impl App {
         else {
             return;
         };
-        let names: Vec<String> =
+        let mut names: Vec<String> =
             String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .map(String::from)
@@ -374,10 +394,11 @@ impl App {
             }
             let new_name = format!("{}-{session}", i + 1);
             let suffix = format!("-{session}");
-            let current = names.iter().find(|n| {
-                *n == session || n.ends_with(&suffix)
+            let pos = names.iter().position(|n| {
+                *n == *session || n.ends_with(&suffix)
             });
-            if let Some(current) = current {
+            if let Some(pos) = pos {
+                let current = &names[pos];
                 if *current != new_name {
                     let _ = Command::new("tmux")
                         .args([
@@ -388,6 +409,8 @@ impl App {
                         .stderr(Stdio::null())
                         .status();
                 }
+                // Remove matched name so it can't match again
+                names.remove(pos);
             }
         }
     }
@@ -588,7 +611,11 @@ fn render(frame: &mut Frame, app: &App) {
         match item {
             ListItem::Task(ti) => {
                 let task = &app.tasks[*ti];
-                let label = status_str(task.status);
+                let label = if app.has_baseline {
+                    status_str(task.status)
+                } else {
+                    ""
+                };
                 let label_start =
                     (cols.status_end + 1).saturating_sub(label.len());
 
@@ -1138,6 +1165,8 @@ mod tests {
             last_run_count: 0,
             message_input: String::new(),
             prev_hashes: HashMap::new(),
+            has_baseline: true,
+            readonly: true,
         }
     }
 
@@ -1446,6 +1475,22 @@ mod tests {
     }
 
     #[test]
+    fn reorder_up_from_middle() {
+        let mut app = make_test_app(test_tasks(), 0, None);
+        // Fold so all items are tasks
+        app.expanded.clear();
+        app.rebuild_visible();
+        // Move cursor to task 2 (slow-api)
+        app.cursor = 2;
+        assert_eq!(app.tasks[2].name, "slow-api");
+
+        // Move up
+        app.reorder(-1);
+        assert_eq!(app.tasks[1].name, "slow-api");
+        assert_eq!(app.tasks[2].name, "ach-batch-nacha");
+    }
+
+    #[test]
     fn reorder_noop_at_boundaries() {
         let mut app = make_test_app(test_tasks(), 0, None);
         let names_before: Vec<_> =
@@ -1455,6 +1500,15 @@ mod tests {
         let names_after: Vec<_> =
             app.tasks.iter().map(|t| t.name.clone()).collect();
         assert_eq!(names_before, names_after);
+
+        // Can't move last task down
+        app.expanded.clear();
+        app.rebuild_visible();
+        app.cursor = app.visible.len() - 1;
+        app.reorder(1);
+        let names_end: Vec<_> =
+            app.tasks.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(names_before, names_end);
     }
 
     #[test]

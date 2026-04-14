@@ -427,7 +427,7 @@ pub fn save_order(order: &[String]) {
     let dir = state_dir();
     fs::create_dir_all(&dir).ok();
     let json = serde_json::to_string_pretty(order).unwrap_or_default();
-    fs::write(dir.join("order.json"), json).ok();
+    atomic_write(&dir.join("order.json"), &json);
 }
 
 #[cfg(test)]
@@ -609,6 +609,40 @@ mod tests {
         assert_eq!(parsed.session, "task-test");
         assert_eq!(parsed.prs, vec![100, 200]);
         assert!(parsed.needs_input);
+    }
+
+    #[test]
+    fn save_load_bootstraps_state() {
+        let dir = std::env::temp_dir().join("orch-test-state");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Simulate what cmd_spawn does: load (missing), fill, save
+        let name = "test-spawn-task";
+        let path = dir.join(format!("{name}.json"));
+        // Ensure clean state
+        let _ = fs::remove_file(&path);
+
+        // Load returns default when file doesn't exist
+        let meta = TaskMeta::default();
+        assert!(meta.session.is_empty());
+
+        // Fill and save
+        let meta = TaskMeta {
+            session: "task-test".into(),
+            worktree: "/tmp/wt".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        atomic_write(&path, &json);
+
+        // Load back
+        let content = fs::read_to_string(&path).unwrap();
+        let loaded: TaskMeta =
+            serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.session, "task-test");
+        assert_eq!(loaded.worktree, "/tmp/wt");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

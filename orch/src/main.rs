@@ -434,6 +434,18 @@ fn cmd_spawn(session: &str, task_file: &str, dir: Option<&str>) {
         return;
     }
 
+    // Create state file if it doesn't exist
+    let task_name = std::path::Path::new(task_file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(session);
+    let mut meta = state::load_task_meta(task_name);
+    if meta.session.is_empty() {
+        meta.session = session.to_string();
+        meta.worktree = work_dir.clone();
+        state::save_task_meta(task_name, &meta);
+    }
+
     eprintln!("[spawn] {session} started with {task_file}");
 }
 

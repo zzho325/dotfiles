@@ -23,15 +23,15 @@ Run codex and present the output. Never auto-fix anything.
 
 **Review:**
 ```bash
-codex exec review "<PR-link>" -o /tmp/codex-output.md 2>/dev/null
+codex exec review "<PR-link>" -o /tmp/codex-output.md < /dev/null 2>/dev/null
 ```
 
 **Default:**
 ```bash
-codex exec "<prompt>" -o /tmp/codex-output.md 2>/dev/null
+codex exec "<prompt>" -o /tmp/codex-output.md < /dev/null 2>/dev/null
 ```
 
-`-o` captures the final response. Stderr is discarded.
+`-o` captures the final response. `< /dev/null` prevents stdin hang. Stderr is discarded.
 
 ## 3. Read and present
 
