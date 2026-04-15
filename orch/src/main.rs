@@ -523,13 +523,16 @@ fn spawn_status_loop() {
     });
 }
 
-/// Background thread: polls GitHub PRs every 30s, writes PR cache.
+/// Background thread: reconciles PRs and fetches PR data every 30s.
 fn spawn_pr_loop() {
     use std::thread;
     thread::spawn(|| {
         let pr_cache = gh::PrCache::new();
         loop {
-            // Collect all PR numbers from task state
+            // Reconcile: add new PRs, remove merged/closed
+            state::reconcile_prs();
+
+            // Fetch PR data for all tracked PRs
             let dir = state::tasks_dir();
             let names = state::load_task_names(&dir);
             let all_prs: Vec<u32> = names
@@ -538,7 +541,6 @@ fn spawn_pr_loop() {
                 .collect();
 
             pr_cache.refresh(all_prs.clone());
-            // Wait for fetches to complete
             std::thread::sleep(Duration::from_secs(3));
 
             let mut cached_prs = HashMap::new();
