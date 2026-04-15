@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::{self, stdout},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -21,14 +21,12 @@ use ratatui::{
     Terminal,
 };
 
-use crate::gh::PrCache;
 use crate::state::{
-    self, Task, TaskStatus, load_order, load_tasks,
-    load_tmux_sessions, save_order,
+    self, Task, TaskStatus, load_order,
+    load_task_meta, load_tmux_sessions, save_order,
 };
 
 const FAST_TICK: Duration = Duration::from_secs(2);
-const SLOW_TICK: Duration = Duration::from_secs(30);
 
 // Rosé Pine Dawn palette
 
@@ -75,9 +73,7 @@ struct App {
     visible: Vec<ListItem>,
     /// Cursor into `visible`
     cursor: usize,
-    pr_cache: PrCache,
     last_fast: Instant,
-    last_slow: Instant,
     should_quit: bool,
     /// Output pane (if open)
     output: Option<OutputPane>,
@@ -88,32 +84,20 @@ struct App {
     last_run_count: usize,
     /// Message input buffer
     message_input: String,
-    /// Previous pane hashes for change detection
-    prev_hashes: HashMap<String, u64>,
-    /// Status is unknown until first refresh completes
-    has_baseline: bool,
     /// Skip file I/O (for tests)
     readonly: bool,
+    /// Whether daemon is providing cache
+    daemon_alive: bool,
 }
 
 impl App {
     fn new() -> Self {
-        let order = load_order();
-        let sessions = load_tmux_sessions();
-        let tasks = load_tasks(&order, &sessions, &HashMap::new());
-        let pr_cache = PrCache::new();
-
-        let all_prs: Vec<u32> = tasks
-            .iter()
-            .flat_map(|t| t.meta.prs.iter().copied())
-            .collect();
-        pr_cache.refresh(all_prs);
-
-        let visible = Self::build_visible(&tasks, &HashSet::new());
-        let last_run_count = crate::runs::list_runs(100).len();
-
+        let tasks = Self::load_from_cache();
         let order: Vec<String> =
             tasks.iter().map(|t| t.name.clone()).collect();
+        let visible = Self::build_visible(&tasks, &HashSet::new());
+        let last_run_count = crate::runs::list_runs(100).len();
+        let daemon_alive = crate::cache::is_daemon_alive();
 
         let app = Self {
             tasks,
@@ -121,24 +105,69 @@ impl App {
             expanded: HashSet::new(),
             visible,
             cursor: 0,
-            pr_cache,
             last_fast: Instant::now(),
-            last_slow: Instant::now(),
             should_quit: false,
             output: None,
             focus: Focus::List,
             read_runs: HashSet::new(),
             last_run_count,
             message_input: String::new(),
-            prev_hashes: sessions
-                .iter()
-                .map(|(k, v)| (k.clone(), v.pane_hash))
-                .collect(),
-            has_baseline: false,
             readonly: false,
+            daemon_alive,
         };
         app.sync_tmux_numbers();
         app
+    }
+
+    /// Load tasks with status and PR data from daemon cache.
+    /// Falls back to direct polling if daemon is not running.
+    fn load_from_cache() -> Vec<Task> {
+        let order = load_order();
+        let status_cache = crate::cache::read_status();
+        let pr_cache = crate::cache::read_prs();
+        let daemon_alive = crate::cache::is_daemon_alive();
+
+        state::ordered_task_names(&order)
+            .into_iter()
+            .map(|name| {
+                let meta = load_task_meta(&name);
+
+                // Status from cache or fallback
+                let status = if daemon_alive {
+                    status_cache
+                        .tasks
+                        .get(&name)
+                        .map(|ct| match ct.status.as_str() {
+                            "ready" => TaskStatus::Ready,
+                            "working" => TaskStatus::Working,
+                            "input" => TaskStatus::Input,
+                            "attached" => TaskStatus::Attached,
+                            _ => TaskStatus::Idle,
+                        })
+                        .unwrap_or(TaskStatus::Idle)
+                } else {
+                    TaskStatus::Idle
+                };
+
+                // PRs from cache
+                let prs: Vec<state::PrData> = meta
+                    .prs
+                    .iter()
+                    .map(|&num| {
+                        pr_cache
+                            .prs
+                            .get(&num)
+                            .map(|cp| cp.to_pr_data())
+                            .unwrap_or(state::PrData {
+                                number: num,
+                                ..Default::default()
+                            })
+                    })
+                    .collect();
+
+                Task { name, meta, status, prs }
+            })
+            .collect()
     }
 
     fn build_visible(
@@ -246,9 +275,8 @@ impl App {
     }
 
     fn refresh_fast(&mut self) {
-        let sessions = load_tmux_sessions();
-        self.tasks =
-            load_tasks(&self.order, &sessions, &self.prev_hashes);
+        self.daemon_alive = crate::cache::is_daemon_alive();
+        self.tasks = Self::load_from_cache();
 
         // Save order only when tasks are added or removed
         let task_count = self.tasks.len();
@@ -258,42 +286,9 @@ impl App {
             if !self.readonly { save_order(&self.order); }
         }
 
-        // Store current hashes for next comparison
-        self.prev_hashes = sessions
-            .iter()
-            .map(|(k, v)| (k.clone(), v.pane_hash))
-            .collect();
-
-        for task in &mut self.tasks {
-            task.prs = task
-                .meta
-                .prs
-                .iter()
-                .map(|&num| {
-                    self.pr_cache
-                        .get(num)
-                        .unwrap_or(state::PrData {
-                            number: num,
-                            ..Default::default()
-                        })
-                })
-                .collect();
-        }
-
         self.rebuild_visible();
         self.sync_tmux_numbers();
-        self.has_baseline = true;
         self.last_fast = Instant::now();
-    }
-
-    fn refresh_slow(&mut self) {
-        let all_prs: Vec<u32> = self
-            .tasks
-            .iter()
-            .flat_map(|t| t.meta.prs.iter().copied())
-            .collect();
-        self.pr_cache.refresh(all_prs);
-        self.last_slow = Instant::now();
     }
 
     fn selected_task(&self) -> Option<&Task> {
@@ -372,6 +367,7 @@ impl App {
     }
 
     fn sync_tmux_numbers(&self) {
+        if self.readonly { return; }
         let output = Command::new("tmux")
             .args(["list-sessions", "-F", "#{session_name}"])
             .stderr(Stdio::null())
@@ -393,23 +389,21 @@ impl App {
                 continue;
             }
             let new_name = format!("{}-{session}", i + 1);
-            let suffix = format!("-{session}");
             let pos = names.iter().position(|n| {
-                *n == *session || n.ends_with(&suffix)
+                state::session_matches(n, session)
             });
             if let Some(pos) = pos {
-                let current = &names[pos];
-                if *current != new_name {
+                let current = names[pos].clone();
+                if current != new_name {
                     let _ = Command::new("tmux")
                         .args([
                             "rename-session",
-                            "-t", current,
+                            "-t", &current,
                             &new_name,
                         ])
                         .stderr(Stdio::null())
                         .status();
                 }
-                // Remove matched name so it can't match again
                 names.remove(pos);
             }
         }
@@ -427,10 +421,7 @@ impl App {
         let sessions = load_tmux_sessions();
         let actual_name = sessions
             .values()
-            .find(|s| {
-                s.name == *session
-                    || s.name.ends_with(&format!("-{session}"))
-            })
+            .find(|s| state::session_matches(&s.name, session))
             .map(|s| s.name.clone())
             .unwrap_or_else(|| session.clone());
 
@@ -611,11 +602,7 @@ fn render(frame: &mut Frame, app: &App) {
         match item {
             ListItem::Task(ti) => {
                 let task = &app.tasks[*ti];
-                let label = if app.has_baseline {
-                    status_str(task.status)
-                } else {
-                    ""
-                };
+                let label = status_str(task.status);
                 let label_start =
                     (cols.status_end + 1).saturating_sub(label.len());
 
@@ -910,9 +897,6 @@ pub fn run() -> io::Result<()> {
             app.check_new_runs();
             app.refresh_output();
         }
-        if app.last_slow.elapsed() >= SLOW_TICK {
-            app.refresh_slow();
-        }
         if app.should_quit {
             break;
         }
@@ -1155,18 +1139,15 @@ mod tests {
             expanded,
             visible,
             cursor,
-            pr_cache: PrCache::new(),
             last_fast: Instant::now(),
-            last_slow: Instant::now(),
             should_quit: false,
             output,
             focus,
             read_runs: HashSet::new(),
             last_run_count: 0,
             message_input: String::new(),
-            prev_hashes: HashMap::new(),
-            has_baseline: true,
             readonly: true,
+            daemon_alive: true,
         }
     }
 

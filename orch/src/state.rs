@@ -156,6 +156,14 @@ fn is_worker_process(cmd: &str) -> bool {
     cmd == "claude" || cmd == "node" || cmd.starts_with("codex")
 }
 
+/// Check if a tmux session name matches an expected name,
+/// accounting for numeric prefixes (e.g. "3-task-foo" matches
+/// "task-foo").
+pub fn session_matches(actual: &str, expected: &str) -> bool {
+    actual == expected
+        || actual.ends_with(&format!("-{expected}"))
+}
+
 /// Single tmux list-panes call to detect active workers and hash
 /// pane content for change detection.
 fn load_pane_info() -> (HashSet<String>, HashMap<String, u64>) {
@@ -256,25 +264,30 @@ fn find_session<'a>(
     })
 }
 
-pub fn load_tasks(
-    order: &[String],
-    sessions: &HashMap<String, TmuxSession>,
-    prev_hashes: &HashMap<String, u64>,
-) -> Vec<Task> {
+/// Merge stored order with current task names: ordered first,
+/// then remaining alphabetically.
+pub fn ordered_task_names(order: &[String]) -> Vec<String> {
     let dir = tasks_dir();
     let all_names = load_task_names(&dir);
-
-    // Ordered names first, then any remaining
-    let mut ordered: Vec<String> = order
+    let mut result: Vec<String> = order
         .iter()
         .filter(|n| all_names.contains(n))
         .cloned()
         .collect();
     for name in &all_names {
-        if !ordered.contains(name) {
-            ordered.push(name.clone());
+        if !result.contains(name) {
+            result.push(name.clone());
         }
     }
+    result
+}
+
+pub fn load_tasks(
+    order: &[String],
+    sessions: &HashMap<String, TmuxSession>,
+    prev_hashes: &HashMap<String, u64>,
+) -> Vec<Task> {
+    let ordered = ordered_task_names(order);
 
     ordered
         .into_iter()

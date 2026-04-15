@@ -60,6 +60,7 @@
 //! - `codex-review` — runs `codex exec review` on a PR, posts
 //!   findings as PR comment, presents proposals to user
 
+mod cache;
 mod gh;
 mod runs;
 mod state;
@@ -79,7 +80,7 @@ use clap::{Parser, Subcommand};
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
 
 const SCAN_MSG: &str = "[scan]";
-const POLL_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 // CLI
 
@@ -280,10 +281,9 @@ fn has_tmux_session(name: &str) -> bool {
     let Some(output) = output.filter(|o| o.status.success()) else {
         return false;
     };
-    let suffix = format!("-{name}");
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(|n| n == name || n.ends_with(&suffix))
+        .any(|n| state::session_matches(n, name))
 }
 
 fn tmux(args: &[&str]) -> bool {
@@ -458,9 +458,110 @@ fn cmd_spawn(session: &str, task_file: &str, dir: Option<&str>) {
     eprintln!("[spawn] {session} started with {task_file}");
 }
 
+/// Background thread: polls tmux every 2s, writes status cache.
+fn spawn_status_loop() {
+    use std::thread;
+    thread::spawn(|| {
+        // Seed prev_hashes from last cached status
+        let cached = cache::read_status();
+        let mut prev_hashes: HashMap<String, u64> = cached
+            .tasks
+            .iter()
+            .map(|(_, t)| (t.actual_session.clone(), t.pane_hash))
+            .filter(|(name, _)| !name.is_empty())
+            .collect();
+
+        loop {
+            let order = state::load_order();
+            let sessions = state::load_tmux_sessions();
+            let tasks =
+                state::load_tasks(&order, &sessions, &prev_hashes);
+
+            let mut cached_tasks = HashMap::new();
+            for task in &tasks {
+                let session = &task.meta.session;
+                let matched = sessions.values().find(|s| {
+                    state::session_matches(&s.name, session)
+                });
+                cached_tasks.insert(
+                    task.name.clone(),
+                    cache::CachedTask {
+                        session: session.clone(),
+                        actual_session: matched
+                            .map(|s| s.name.clone())
+                            .unwrap_or_default(),
+                        status: match task.status {
+                            state::TaskStatus::Ready => "ready",
+                            state::TaskStatus::Working => "working",
+                            state::TaskStatus::Input => "input",
+                            state::TaskStatus::Idle => "idle",
+                            state::TaskStatus::Attached => "attached",
+                        }
+                        .to_string(),
+                        has_active_process: matched
+                            .is_some_and(|s| s.has_active_process),
+                        pane_hash: matched
+                            .map(|s| s.pane_hash)
+                            .unwrap_or(0),
+                    },
+                );
+            }
+
+            prev_hashes = sessions
+                .iter()
+                .map(|(k, v)| (k.clone(), v.pane_hash))
+                .collect();
+
+            cache::write_status(&cache::StatusCache {
+                generated_at: cache::now_epoch(),
+                tasks: cached_tasks,
+            });
+            cache::write_lease();
+
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
+/// Background thread: polls GitHub PRs every 30s, writes PR cache.
+fn spawn_pr_loop() {
+    use std::thread;
+    thread::spawn(|| {
+        let pr_cache = gh::PrCache::new();
+        loop {
+            // Collect all PR numbers from task state
+            let dir = state::tasks_dir();
+            let names = state::load_task_names(&dir);
+            let all_prs: Vec<u32> = names
+                .iter()
+                .flat_map(|n| state::load_task_meta(n).prs)
+                .collect();
+
+            pr_cache.refresh(all_prs.clone());
+            // Wait for fetches to complete
+            std::thread::sleep(Duration::from_secs(3));
+
+            let mut cached_prs = HashMap::new();
+            for num in &all_prs {
+                if let Some(data) = pr_cache.get(*num) {
+                    cached_prs.insert(
+                        *num,
+                        cache::CachedPr::from_pr_data(&data),
+                    );
+                }
+            }
+            cache::write_prs(&cache::PrCache {
+                generated_at: cache::now_epoch(),
+                prs: cached_prs,
+            });
+
+            std::thread::sleep(Duration::from_secs(27));
+        }
+    });
+}
+
 /// Background daemon: watches ~/tasks/ for new files and .inbox/ for
 /// worker messages. On changes, spawns a one-shot orchestrator agent.
-/// Also polls tmux session activity every 20 minutes.
 fn cmd_daemon() {
     let dir = state::tasks_dir();
     let inbox = inbox_dir();
@@ -470,6 +571,11 @@ fn cmd_daemon() {
     runs::prune_old_runs();
     eprintln!("[orch] reconciling PRs...");
     state::reconcile_prs();
+
+    // Start background cache loops
+    spawn_status_loop();
+    spawn_pr_loop();
+
     eprintln!("[orch] daemon started, watching {}", dir.display());
 
     // Fold pending inbox messages into the initial scan
@@ -525,6 +631,9 @@ fn cmd_daemon() {
             }
             Ok(Err(e)) => eprintln!("[orch] watch error: {e:?}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Reconcile PRs on each poll
+                state::reconcile_prs();
+
                 // Poll tmux activity — trigger scan for sessions
                 // that have new output since last check
                 let current = session_activity();

@@ -21,25 +21,46 @@ Run codex and present the output. Never auto-fix anything.
 
 ## 2. Run codex
 
+Use a descriptive filename to avoid collisions between concurrent runs.
+
 **Review:**
 ```bash
-codex exec review "<PR-link>" -o /tmp/codex-output.md < /dev/null 2>/dev/null
+OUT=/tmp/codex-review-<PR-number>.md
+LOG=/tmp/codex-review-<PR-number>.log
+codex exec review "<PR-link>" -o "$OUT" < /dev/null 2>"$LOG"
 ```
 
 **Default:**
 ```bash
-codex exec "<prompt>" -o /tmp/codex-output.md < /dev/null 2>/dev/null
+OUT=/tmp/codex-<short-topic>.md
+LOG=/tmp/codex-<short-topic>.log
+codex exec "<prompt>" -o "$OUT" < /dev/null 2>"$LOG"
 ```
 
-`-o` captures the final response. `< /dev/null` prevents stdin hang. Stderr is discarded.
+`-o` captures the final response. `$LOG` captures the work log (tool calls, reasoning).
+`< /dev/null` prevents stdin hang.
 
 ## 3. Read and present
 
 ```bash
-cat /tmp/codex-output.md
+cat "$OUT"
 ```
 
-Present findings as proposals (with proposed fix or disagreement).
+If the output is empty or codex failed, check the work log:
+```bash
+cat "$LOG"
+```
+
+Clean up after presenting:
+```bash
+rm -f "$OUT" "$LOG"
+```
+
+Present findings as proposals. For each finding, add your response
+(agree, disagree, already handled) underneath. Write to notes.md:
+```
+notes propose "Codex review" -b "1. <finding>\n   → <your response>\n\n2. ..."
+```
 Do NOT post as PR comment — just present in conversation.
 Do NOT implement changes — wait for user approval.
 
