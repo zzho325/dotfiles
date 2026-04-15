@@ -410,6 +410,9 @@ pub fn reconcile_prs() {
             .unwrap_or_default();
 
         // Match pushed branches against open PRs
+        if pushed_branches.is_empty() {
+            continue;
+        }
         let mut task_prs: Vec<u32> = Vec::new();
         for branch in &pushed_branches {
             if let Some(nums) = branch_to_prs.get(branch) {
