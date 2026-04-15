@@ -227,7 +227,7 @@ func analyzeFile(
 	// and that test functions are ordered to match source functions.
 	if isTest {
 		checkTestHelperOrdering(pass, funcs)
-		checkTestFunctionOrdering(pass, fileName, funcs, fileDecls)
+		checkTestFunctionOrdering(pass, fileName, funcs, fileDecls, objToFunc)
 	}
 }
 
@@ -422,30 +422,32 @@ func checkTestFunctionOrdering(
 	testFileName string,
 	funcs []*funcInfo,
 	fileDecls map[string][]*funcInfo,
+	objToFunc map[types.Object]*funcInfo,
 ) {
 	fset := pass.Fset
 
 	// Find the corresponding source file(s) for this test file.
-	// foo_test.go → foo.go, or look at all non-test files in the same dir.
 	sourceFiles := findSourceFiles(testFileName, fileDecls)
 	if len(sourceFiles) == 0 {
 		return
 	}
 
-	// Build a map of source function name → line number.
-	// For methods, key is "Type.Method"; for functions, key is "Func".
+	// Build source function maps: name→location and obj→membership.
 	type sourceLoc struct {
 		line int
 		file string
 	}
 	sourceOrder := map[string]sourceLoc{}
+	sourceObjSet := map[types.Object]bool{}
 	for _, sf := range sourceFiles {
 		for _, fi := range fileDecls[sf] {
 			sourceOrder[fi.name] = sourceLoc{line: fi.line, file: sf}
+			sourceObjSet[fi.obj] = true
 		}
 	}
 
 	// Match each test function to its source function.
+	// First try name-based matching, then fall back to call graph analysis.
 	type testMatch struct {
 		testFunc   *funcInfo
 		sourceName string
@@ -457,6 +459,8 @@ func checkTestFunctionOrdering(
 		if !isTestFunc(fi.name) {
 			continue
 		}
+		// Try name-based matching first.
+		matched := false
 		candidates := testToSourceCandidates(fi.name)
 		for _, srcName := range candidates {
 			if loc, ok := sourceOrder[srcName]; ok {
@@ -466,7 +470,23 @@ func checkTestFunctionOrdering(
 					sourceLine: loc.line,
 					sourceFile: loc.file,
 				})
+				matched = true
 				break
+			}
+		}
+		if matched {
+			continue
+		}
+		// Fall back: find the first source function called by this test.
+		target := firstSourceCall(pass, fi, sourceObjSet, objToFunc)
+		if target != nil {
+			if loc, ok := sourceOrder[target.name]; ok {
+				matches = append(matches, testMatch{
+					testFunc:   fi,
+					sourceName: target.name,
+					sourceLine: loc.line,
+					sourceFile: loc.file,
+				})
 			}
 		}
 	}
@@ -572,6 +592,35 @@ func testToSourceCandidates(testName string) []string {
 	}
 
 	return []string{rest}
+}
+
+// firstSourceCall walks a test function's body and returns the first
+// source-file function it calls, reusing resolveCallee for call resolution.
+func firstSourceCall(
+	pass *analysis.Pass,
+	testFn *funcInfo,
+	sourceObjSet map[types.Object]bool,
+	objToFunc map[types.Object]*funcInfo,
+) *funcInfo {
+	if testFn.decl.Body == nil {
+		return nil
+	}
+	var found *funcInfo
+	ast.Inspect(testFn.decl.Body, func(n ast.Node) bool {
+		if found != nil {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if fi := resolveCallee(pass, call, sourceObjSet, objToFunc); fi != nil {
+			found = fi
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // funcDisplayName returns a human-readable name for a function declaration.
