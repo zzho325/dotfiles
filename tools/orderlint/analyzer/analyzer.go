@@ -129,7 +129,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	// Analyze each file independently.
 	for fileName, funcs := range fileDecls {
 		isTest := strings.HasSuffix(fileName, "_test.go")
-		analyzeFile(pass, fileName, funcs, objToFunc, isTest)
+		analyzeFile(pass, fileName, funcs, objToFunc, fileDecls, isTest)
 	}
 
 	return nil, nil
@@ -141,6 +141,7 @@ func analyzeFile(
 	fileName string,
 	funcs []*funcInfo,
 	objToFunc map[types.Object]*funcInfo,
+	fileDecls map[string][]*funcInfo,
 	isTest bool,
 ) {
 	fset := pass.Fset
@@ -222,9 +223,11 @@ func analyzeFile(
 		}
 	}
 
-	// Test file: check that helpers appear after test functions.
+	// Test file: check that helpers appear after test functions,
+	// and that test functions are ordered to match source functions.
 	if isTest {
 		checkTestHelperOrdering(pass, funcs)
+		checkTestFunctionOrdering(pass, fileName, funcs, fileDecls)
 	}
 }
 
@@ -409,6 +412,166 @@ func checkTestHelperOrdering(pass *analysis.Pass, funcs []*funcInfo) {
 			})
 		}
 	}
+}
+
+// checkTestFunctionOrdering checks that test functions are ordered to match
+// the order of the source functions they test. TestFoo should appear before
+// TestBar if Foo is defined before Bar in the source file.
+func checkTestFunctionOrdering(
+	pass *analysis.Pass,
+	testFileName string,
+	funcs []*funcInfo,
+	fileDecls map[string][]*funcInfo,
+) {
+	fset := pass.Fset
+
+	// Find the corresponding source file(s) for this test file.
+	// foo_test.go → foo.go, or look at all non-test files in the same dir.
+	sourceFiles := findSourceFiles(testFileName, fileDecls)
+	if len(sourceFiles) == 0 {
+		return
+	}
+
+	// Build a map of source function name → line number.
+	// For methods, key is "Type.Method"; for functions, key is "Func".
+	type sourceLoc struct {
+		line int
+		file string
+	}
+	sourceOrder := map[string]sourceLoc{}
+	for _, sf := range sourceFiles {
+		for _, fi := range fileDecls[sf] {
+			sourceOrder[fi.name] = sourceLoc{line: fi.line, file: sf}
+		}
+	}
+
+	// Match each test function to its source function.
+	type testMatch struct {
+		testFunc   *funcInfo
+		sourceName string
+		sourceLine int
+		sourceFile string
+	}
+	var matches []testMatch
+	for _, fi := range funcs {
+		if !isTestFunc(fi.name) {
+			continue
+		}
+		candidates := testToSourceCandidates(fi.name)
+		for _, srcName := range candidates {
+			if loc, ok := sourceOrder[srcName]; ok {
+				matches = append(matches, testMatch{
+					testFunc:   fi,
+					sourceName: srcName,
+					sourceLine: loc.line,
+					sourceFile: loc.file,
+				})
+				break
+			}
+		}
+	}
+
+	// Check ordering: for each pair of matched test functions,
+	// if source A is before source B, test A should be before test B.
+	for i := 0; i < len(matches); i++ {
+		for j := i + 1; j < len(matches); j++ {
+			a, b := matches[i], matches[j]
+			// Only compare tests whose source functions are in the same file.
+			if a.sourceFile != b.sourceFile {
+				continue
+			}
+			// a appears before b in test file (by iteration order from funcs).
+			// If a's source is after b's source, a is out of order.
+			if a.sourceLine > b.sourceLine {
+				if isBaselined(testFileName, a.testFunc.name) {
+					continue
+				}
+				pass.Report(analysis.Diagnostic{
+					Pos: a.testFunc.pos,
+					Message: fmt.Sprintf(
+						"%s (line %d) should appear after %s (line %d) — source function %s (line %d) is defined before %s (line %d)",
+						a.testFunc.name, fset.Position(a.testFunc.pos).Line,
+						b.testFunc.name, fset.Position(b.testFunc.pos).Line,
+						b.sourceName, b.sourceLine,
+						a.sourceName, a.sourceLine,
+					),
+				})
+				break // only report first violation per test function
+			}
+		}
+	}
+}
+
+// findSourceFiles returns non-test file paths in the same directory as the
+// test file.
+func findSourceFiles(
+	testFileName string,
+	fileDecls map[string][]*funcInfo,
+) []string {
+	dir := filepath.Dir(testFileName)
+	var sources []string
+	for fn := range fileDecls {
+		if strings.HasSuffix(fn, "_test.go") {
+			continue
+		}
+		if filepath.Dir(fn) == dir {
+			sources = append(sources, fn)
+		}
+	}
+	return sources
+}
+
+// testToSourceCandidates returns candidate source function names for a test
+// function. Returns candidates in priority order: method match first, then
+// plain function match.
+//
+//	TestFoo                → ["Foo"]
+//	TestFoo_subtest        → ["Foo.subtest", "Foo"]
+//	TestType_Method        → ["Type.Method", "Type"]
+//	TestType_Method_sub    → ["Type.Method_sub", "Type.Method", "Type"]
+func testToSourceCandidates(testName string) []string {
+	// Strip receiver prefix if present.
+	if idx := strings.LastIndex(testName, "."); idx >= 0 {
+		testName = testName[idx+1:]
+	}
+
+	// Strip Test/Benchmark/Example prefix.
+	var rest string
+	for _, prefix := range []string{"Test", "Benchmark", "Example"} {
+		if strings.HasPrefix(testName, prefix) {
+			rest = testName[len(prefix):]
+			break
+		}
+	}
+	if rest == "" {
+		return nil
+	}
+
+	// TestMain is special.
+	if rest == "Main" && strings.HasPrefix(testName, "Test") {
+		return nil
+	}
+
+	// If rest contains underscore, try progressively shorter method names.
+	// TestType_Method         → ["Type.Method", "Type"]
+	// TestType_Method_subtest → ["Type.Method_subtest", "Type.Method", "Type"]
+	if idx := strings.Index(rest, "_"); idx > 0 {
+		prefix := rest[:idx]
+		suffix := rest[idx+1:]
+		var candidates []string
+		for suffix != "" {
+			candidates = append(candidates, prefix+"."+suffix)
+			last := strings.LastIndex(suffix, "_")
+			if last < 0 {
+				break
+			}
+			suffix = suffix[:last]
+		}
+		candidates = append(candidates, prefix)
+		return candidates
+	}
+
+	return []string{rest}
 }
 
 // funcDisplayName returns a human-readable name for a function declaration.

@@ -36,26 +36,18 @@ func main() {
 	switch args[0] {
 	case "wip":
 		if len(args) > 1 {
-			wipArgs := args[1:]
-			readStdin := wipArgs[len(wipArgs)-1] == "-"
-			if readStdin {
-				wipArgs = wipArgs[:len(wipArgs)-1]
-			}
+			wipArgs, readStdin := consumeStdinFlag(args[1:])
 			cmdWipAdd(path, strings.Join(wipArgs, " "), readStdin)
 		} else {
 			cmdWip(path)
 		}
 
 	case "reply":
-		if len(args) < 3 {
+		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: notes reply <N> \"text\" [-]")
 			os.Exit(1)
 		}
-		replyArgs := args[2:]
-		readStdin := replyArgs[len(replyArgs)-1] == "-"
-		if readStdin {
-			replyArgs = replyArgs[:len(replyArgs)-1]
-		}
+		replyArgs, readStdin := consumeStdinFlag(args[2:])
 		cmdReply(path, args[1], strings.Join(replyArgs, " "), readStdin)
 
 	case "resolve":
@@ -71,22 +63,8 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: notes propose \"title\" [-b \"body\" | -]")
 			os.Exit(1)
 		}
-		propArgs := args[1:]
-		var body string
-		var readStdin bool
-		// Check for -b "body" flag
-		for i := 0; i < len(propArgs)-1; i++ {
-			if propArgs[i] == "-b" {
-				body = propArgs[i+1]
-				propArgs = append(propArgs[:i], propArgs[i+2:]...)
-				break
-			}
-		}
-		// Check for trailing "-" (stdin)
-		if len(propArgs) > 0 && propArgs[len(propArgs)-1] == "-" {
-			readStdin = true
-			propArgs = propArgs[:len(propArgs)-1]
-		}
+		body, propArgs := extractBodyFlag(args[1:])
+		propArgs, readStdin := consumeStdinFlag(propArgs)
 		cmdPropose(path, strings.Join(propArgs, " "), body, readStdin)
 	case "proposals":
 		cmdProposals(path)
@@ -95,21 +73,9 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: notes update <N> \"desc\" [-b \"body\" | -]")
 			os.Exit(1)
 		}
-		updateArgs := args[2:]
-		var updateBody string
-		var updateStdin bool
-		for i := 0; i < len(updateArgs)-1; i++ {
-			if updateArgs[i] == "-b" {
-				updateBody = updateArgs[i+1]
-				updateArgs = append(updateArgs[:i], updateArgs[i+2:]...)
-				break
-			}
-		}
-		if len(updateArgs) > 0 && updateArgs[len(updateArgs)-1] == "-" {
-			updateStdin = true
-			updateArgs = updateArgs[:len(updateArgs)-1]
-		}
-		cmdUpdate(path, args[1], strings.Join(updateArgs, " "), updateBody, updateStdin)
+		body, updateArgs := extractBodyFlag(args[2:])
+		updateArgs, readStdin := consumeStdinFlag(updateArgs)
+		cmdUpdate(path, args[1], strings.Join(updateArgs, " "), body, readStdin)
 
 	case "stamp":
 		if len(args) < 2 {
@@ -152,6 +118,65 @@ proposals:
   delete <N>             delete proposal N
   approved               list only approved [x] proposals
   applied                move approved [x] proposals to Done`)
+}
+
+// stdinIsPipe returns true if stdin is a pipe (not a terminal).
+func stdinIsPipe() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice == 0
+}
+
+// consumeStdinFlag checks for a trailing "-" arg (explicit stdin) or a piped
+// stdin. Returns the remaining args and whether to read stdin.
+func consumeStdinFlag(args []string) ([]string, bool) {
+	if len(args) > 0 && args[len(args)-1] == "-" {
+		return args[:len(args)-1], true
+	}
+	return args, stdinIsPipe()
+}
+
+// extractBodyFlag extracts a "-b <value>" flag from args, returning the value
+// and the remaining args. Returns empty string if not present.
+func extractBodyFlag(args []string) (string, []string) {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "-b" {
+			return args[i+1], append(args[:i], args[i+2:]...)
+		}
+	}
+	return "", args
+}
+
+// readIndentedStdin reads all lines from stdin, prepending indent to
+// non-empty lines.
+func readIndentedStdin(indent string) []string {
+	var lines []string
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			lines = append(lines, "")
+		} else {
+			lines = append(lines, indent+line)
+		}
+	}
+	return lines
+}
+
+// indentLines splits text on newlines and prepends indent to non-empty lines.
+func indentLines(text, indent string) []string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		if line == "" {
+			lines = append(lines, "")
+		} else {
+			lines = append(lines, indent+line)
+		}
+	}
+	return lines
 }
 
 func findNotesFile(custom string) string {
@@ -577,17 +602,7 @@ func cmdWipAdd(path string, title string, readStdin bool) {
 
 	if readStdin {
 		threadLines = append(threadLines, "")
-		scanner := bufio.NewScanner(os.Stdin)
-		// Increase buffer for large bodies (1MB).
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				threadLines = append(threadLines, "")
-			} else {
-				threadLines = append(threadLines, "   "+line)
-			}
-		}
+		threadLines = append(threadLines, readIndentedStdin("   ")...)
 	}
 
 	p.threads = append(p.threads, thread{
@@ -635,16 +650,7 @@ func cmdReply(path string, arg string, text string, readStdin bool) {
 	}
 
 	if readStdin {
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				t.lines = append(t.lines, "")
-			} else {
-				t.lines = append(t.lines, "   "+line)
-			}
-		}
+		t.lines = append(t.lines, readIndentedStdin("   ")...)
 	}
 
 	if err := p.writeBack(path); err != nil {
@@ -739,29 +745,11 @@ func cmdPropose(path string, desc string, body string, readStdin bool) {
 	titleLine := fmt.Sprintf("- [ ] **P%d** %s", n, desc)
 	propLines := []string{titleLine}
 
-	// Body from -b argument
 	if body != "" {
-		for _, line := range strings.Split(body, "\n") {
-			if line == "" {
-				propLines = append(propLines, "")
-			} else {
-				propLines = append(propLines, "  "+line)
-			}
-		}
+		propLines = append(propLines, indentLines(body, "  ")...)
 	}
-
-	// Body from stdin
 	if readStdin {
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				propLines = append(propLines, "")
-			} else {
-				propLines = append(propLines, "  "+line)
-			}
-		}
+		propLines = append(propLines, readIndentedStdin("  ")...)
 	}
 
 	pr := proposal{
@@ -809,25 +797,10 @@ func cmdUpdate(path string, arg string, desc string, body string, readStdin bool
 		if hasNewBody {
 			propLines := []string{titleLine}
 			if body != "" {
-				for _, line := range strings.Split(body, "\n") {
-					if line == "" {
-						propLines = append(propLines, "")
-					} else {
-						propLines = append(propLines, "  "+line)
-					}
-				}
+				propLines = append(propLines, indentLines(body, "  ")...)
 			}
 			if readStdin {
-				scanner := bufio.NewScanner(os.Stdin)
-				scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-				for scanner.Scan() {
-					line := scanner.Text()
-					if line == "" {
-						propLines = append(propLines, "")
-					} else {
-						propLines = append(propLines, "  "+line)
-					}
-				}
+				propLines = append(propLines, readIndentedStdin("  ")...)
 			}
 			pr.lines = propLines
 		} else {
