@@ -472,6 +472,7 @@ fn spawn_status_loop() {
             .collect();
 
         loop {
+            state::ensure_state_files();
             let order = state::load_order();
             let sessions = state::load_tmux_sessions();
             let tasks =
@@ -571,6 +572,7 @@ fn cmd_daemon() {
     fs::create_dir_all(&inbox).ok();
 
     runs::prune_old_runs();
+    state::ensure_state_files();
     eprintln!("[orch] reconciling PRs...");
     state::reconcile_prs();
 

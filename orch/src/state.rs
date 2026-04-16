@@ -304,6 +304,24 @@ pub fn load_tasks(
         .collect()
 }
 
+/// Ensure every task .md file has a corresponding state file with
+/// at least `session: task-{name}` set.
+pub fn ensure_state_files() {
+    let dir = tasks_dir();
+    for name in load_task_names(&dir) {
+        let meta = load_task_meta(&name);
+        if meta.session.is_empty() {
+            save_task_meta(
+                &name,
+                &TaskMeta {
+                    session: format!("task-{name}"),
+                    ..meta
+                },
+            );
+        }
+    }
+}
+
 pub fn save_task_meta(name: &str, meta: &TaskMeta) {
     let dir = state_dir();
     fs::create_dir_all(&dir).ok();
