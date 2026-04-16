@@ -384,10 +384,13 @@ impl App {
                 .collect();
 
         for (i, task) in self.tasks.iter().enumerate() {
-            let session = &task.meta.session;
-            if session.is_empty() {
-                continue;
-            }
+            // Fall back to task-{name} if state file has no session
+            let fallback = format!("task-{}", task.name);
+            let session = if task.meta.session.is_empty() {
+                &fallback
+            } else {
+                &task.meta.session
+            };
             let new_name = format!("{}-{session}", i + 1);
             let pos = names.iter().position(|n| {
                 state::session_matches(n, session)
