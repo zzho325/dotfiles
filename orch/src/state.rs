@@ -173,7 +173,8 @@ fn load_pane_info() -> (HashSet<String>, HashMap<String, u64>) {
     let output = Command::new("tmux")
         .args([
             "list-panes", "-a", "-F",
-            "#{session_name} #{pane_current_command} #{pane_id}",
+            "#{session_name} #{pane_current_command} #{pane_id} \
+             #{cursor_x} #{cursor_y}",
         ])
         .stderr(Stdio::null())
         .output()
@@ -185,22 +186,23 @@ fn load_pane_info() -> (HashSet<String>, HashMap<String, u64>) {
     let mut active = HashSet::new();
     let mut hashes = HashMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let parts: Vec<&str> = line.splitn(3, ' ').collect();
-        if parts.len() < 3 {
+        let parts: Vec<&str> = line.splitn(5, ' ').collect();
+        if parts.len() < 5 {
             continue;
         }
-        let (session, cmd, pane_id) =
-            (parts[0], parts[1], parts[2]);
+        let (session, cmd, pane_id, cx, cy) =
+            (parts[0], parts[1], parts[2], parts[3], parts[4]);
         if !is_worker_process(cmd) {
             continue;
         }
         active.insert(session.to_string());
 
-        // Capture last 3 lines for change detection
+        // Capture visible pane content (full screen) + cursor.
+        // Full capture catches streaming token changes; cursor
+        // position catches typing/prompt movement even when
+        // content is static (reduce motion).
         let capture = Command::new("tmux")
-            .args([
-                "capture-pane", "-t", pane_id, "-p", "-S", "-3",
-            ])
+            .args(["capture-pane", "-t", pane_id, "-p"])
             .stderr(Stdio::null())
             .output()
             .ok();
@@ -208,6 +210,8 @@ fn load_pane_info() -> (HashSet<String>, HashMap<String, u64>) {
             let text = String::from_utf8_lossy(&cap.stdout);
             let mut hasher = DefaultHasher::new();
             text.trim().hash(&mut hasher);
+            cx.hash(&mut hasher);
+            cy.hash(&mut hasher);
             hashes.insert(session.to_string(), hasher.finish());
         }
     }
