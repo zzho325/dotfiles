@@ -304,20 +304,29 @@ pub fn load_tasks(
         .collect()
 }
 
-/// Ensure every task .md file has a corresponding state file with
-/// at least `session: task-{name}` set.
+/// Ensure every task .md file has a corresponding state file
+/// with session and worktree populated (by convention).
 pub fn ensure_state_files() {
     let dir = tasks_dir();
+    let repo = std::env::var("ORCH_REPO").ok();
     for name in load_task_names(&dir) {
-        let meta = load_task_meta(&name);
+        let mut meta = load_task_meta(&name);
+        let mut changed = false;
         if meta.session.is_empty() {
-            save_task_meta(
-                &name,
-                &TaskMeta {
-                    session: format!("task-{name}"),
-                    ..meta
-                },
-            );
+            meta.session = format!("task-{name}");
+            changed = true;
+        }
+        if meta.worktree.is_empty() {
+            if let Some(ref r) = repo {
+                let wt = format!("{r}/task-{name}");
+                if Path::new(&wt).exists() {
+                    meta.worktree = wt;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            save_task_meta(&name, &meta);
         }
     }
 }
