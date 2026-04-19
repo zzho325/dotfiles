@@ -300,8 +300,8 @@ fn tmux(args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Get last-activity epoch for each task-* tmux session.
-/// Used by the daemon to detect worker activity changes.
+/// Get last-activity epoch for each worker tmux session.
+/// Accepts both `task-*` and numbered `N-task-*` session names.
 fn session_activity() -> HashMap<String, u64> {
     let output = Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name} #{session_activity}"])
@@ -315,7 +315,8 @@ fn session_activity() -> HashMap<String, u64> {
         .lines()
         .filter_map(|line| {
             let (name, epoch) = line.split_once(' ')?;
-            if !name.starts_with("task-") {
+            if !state::strip_numeric_prefix(name).starts_with("task-")
+            {
                 return None;
             }
             Some((name.to_string(), epoch.parse::<u64>().ok()?))
@@ -480,15 +481,34 @@ fn cmd_spawn(name: &str) {
 fn cmd_pause(name: &str) {
     let mut meta = state::load_task_meta(name);
     if !meta.session.is_empty() {
-        // Kill whatever tmux session matches
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &meta.session])
-            .stderr(Stdio::null())
-            .status();
+        // Find actual tmux name (may be N-task-<name>) and kill it
+        if let Some(actual) = find_actual_session(&meta.session) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &actual])
+                .stderr(Stdio::null())
+                .status();
+        }
     }
     meta.paused = true;
     state::save_task_meta(name, &meta);
     eprintln!("[pause] {name} paused");
+}
+
+/// Find the actual tmux session name for an expected session,
+/// handling numbered prefixes (`task-foo` → `3-task-foo`).
+fn find_actual_session(expected: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|n| state::session_matches(n, expected))
+        .map(String::from)
 }
 
 fn cmd_resume(name: &str) {

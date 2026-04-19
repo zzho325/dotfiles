@@ -168,6 +168,12 @@ pub fn session_matches(actual: &str, expected: &str) -> bool {
         || actual.ends_with(&format!("-{expected}"))
 }
 
+/// Strip the leading `N-` numeric prefix from a tmux session name
+/// (e.g. "3-task-foo" → "task-foo", "task-foo" → "task-foo").
+pub fn strip_numeric_prefix(name: &str) -> &str {
+    name.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
+}
+
 /// Single tmux list-panes call to detect active workers and hash
 /// pane content for change detection.
 fn load_pane_info() -> (HashSet<String>, HashMap<String, u64>) {
@@ -269,11 +275,9 @@ fn find_session<'a>(
         return Some(s);
     }
     // Match by suffix (handles numeric prefix like "1-task-foo")
-    sessions.values().find(|s| {
-        s.name
-            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
-            == session_name
-    })
+    sessions
+        .values()
+        .find(|s| strip_numeric_prefix(&s.name) == session_name)
 }
 
 /// Merge stored order with current task names: ordered first,
@@ -402,7 +406,7 @@ pub fn reconcile_prs() {
     let home = dirs::home_dir().unwrap_or_default();
 
     for name in load_task_names(&dir) {
-        let mut meta = load_task_meta(&name);
+        let meta = load_task_meta(&name);
         let worktree = meta
             .worktree
             .replace("~", &home.to_string_lossy());
@@ -466,10 +470,18 @@ pub fn reconcile_prs() {
         task_prs.dedup();
 
         if meta.prs != task_prs {
-            meta.prs = task_prs;
-            save_task_meta(&name, &meta);
+            update_prs(&name, task_prs);
         }
     }
+}
+
+/// Narrow update: re-read latest meta and replace only the `prs`
+/// field. Prevents clobbering concurrent writes to other fields
+/// (e.g. `paused` set by `orch pause` between reconcile's load and save).
+fn update_prs(name: &str, prs: Vec<u32>) {
+    let mut latest = load_task_meta(name);
+    latest.prs = prs;
+    save_task_meta(name, &latest);
 }
 
 // Order persistence
@@ -518,6 +530,43 @@ mod tests {
             derive_status(&meta, &sessions, &prev),
             TaskStatus::Idle,
         );
+    }
+
+    #[test]
+    fn update_prs_preserves_other_fields() {
+        // Simulates reconcile_prs overwriting while CLI concurrently
+        // sets paused=true. update_prs must re-read before writing.
+        let dir = state_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let name = "_test_update_prs";
+        let path = dir.join(format!("{name}.json"));
+        let _ = fs::remove_file(&path);
+
+        // Initial write
+        save_task_meta(
+            name,
+            &TaskMeta {
+                session: "task-test".into(),
+                prs: vec![1, 2],
+                ..Default::default()
+            },
+        );
+
+        // Simulate CLI writing paused=true after reconcile loaded
+        // its copy but before it saves
+        let mut latest = load_task_meta(name);
+        latest.paused = true;
+        save_task_meta(name, &latest);
+
+        // Now reconcile's update_prs should preserve paused
+        update_prs(name, vec![1, 2, 3]);
+
+        let result = load_task_meta(name);
+        assert_eq!(result.prs, vec![1, 2, 3]);
+        assert!(result.paused, "paused flag was clobbered");
+        assert_eq!(result.session, "task-test");
+
+        fs::remove_file(&path).ok();
     }
 
     #[test]

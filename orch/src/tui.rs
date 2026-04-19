@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, stdout},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -119,20 +119,27 @@ impl App {
         app
     }
 
-    /// Load tasks with status and PR data from daemon cache.
-    /// Falls back to direct polling if daemon is not running.
+    /// Load tasks with status and PR data. Prefers daemon cache;
+    /// falls back to live tmux poll (no PR data) if daemon is dead.
     fn load_from_cache() -> Vec<Task> {
         let order = load_order();
         let status_cache = crate::cache::read_status();
         let pr_cache = crate::cache::read_prs();
         let daemon_alive = crate::cache::is_daemon_alive();
 
+        // Live tmux poll used only when the daemon is not
+        // writing fresh status.
+        let live_sessions = if daemon_alive {
+            None
+        } else {
+            Some(load_tmux_sessions())
+        };
+
         state::ordered_task_names(&order)
             .into_iter()
             .map(|name| {
                 let meta = load_task_meta(&name);
 
-                // Status from cache or fallback
                 let status = if daemon_alive {
                     status_cache
                         .tasks
@@ -146,11 +153,16 @@ impl App {
                             _ => TaskStatus::Idle,
                         })
                         .unwrap_or(TaskStatus::Idle)
+                } else if let Some(sessions) = &live_sessions {
+                    // No prev_hashes without the daemon — worker
+                    // shows as Working while alive, Idle/Paused
+                    // otherwise. Good enough for the rare case
+                    // of running TUI without daemon.
+                    state::derive_status(&meta, sessions, &HashMap::new())
                 } else {
                     TaskStatus::Idle
                 };
 
-                // PRs from cache
                 let prs: Vec<state::PrData> = meta
                     .prs
                     .iter()
