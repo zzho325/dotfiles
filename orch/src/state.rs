@@ -26,6 +26,9 @@ pub struct TaskMeta {
     pub prs: Vec<u32>,
     #[serde(default)]
     pub needs_input: bool,
+    /// User parked this task; do not auto-spawn.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 // Tmux session snapshot
@@ -68,6 +71,7 @@ pub enum TaskStatus {
     Input,
     Idle,
     Attached,
+    Paused,
 }
 
 // Combined task view
@@ -226,7 +230,11 @@ pub fn derive_status(
     let session = find_session(&meta.session, sessions);
 
     let Some(session) = session else {
-        return TaskStatus::Idle;
+        return if meta.paused {
+            TaskStatus::Paused
+        } else {
+            TaskStatus::Idle
+        };
     };
 
     if session.attached {
@@ -308,18 +316,16 @@ pub fn load_tasks(
         .collect()
 }
 
-/// Ensure every task .md file has a corresponding state file
-/// with session and worktree populated (by convention).
+/// Ensure every task .md file has a corresponding state file.
+/// Populates worktree if $ORCH_REPO/task-{name} exists on disk.
+/// Does NOT populate session — empty session signals "unspawned"
+/// to the orchestrator. Session is set by `orch spawn`.
 pub fn ensure_state_files() {
     let dir = tasks_dir();
     let repo = std::env::var("ORCH_REPO").ok();
     for name in load_task_names(&dir) {
         let mut meta = load_task_meta(&name);
         let mut changed = false;
-        if meta.session.is_empty() {
-            meta.session = format!("task-{name}");
-            changed = true;
-        }
         if meta.worktree.is_empty() {
             if let Some(ref r) = repo {
                 let wt = format!("{r}/task-{name}");
@@ -328,6 +334,12 @@ pub fn ensure_state_files() {
                     changed = true;
                 }
             }
+        }
+        // Create the state file if it doesn't exist yet, even
+        // with no populated fields — so the orchestrator knows
+        // the task has been seen.
+        if !state_dir().join(format!("{name}.json")).exists() {
+            changed = true;
         }
         if changed {
             save_task_meta(&name, &meta);
@@ -509,6 +521,20 @@ mod tests {
     }
 
     #[test]
+    fn derive_status_paused_when_no_session() {
+        let meta = TaskMeta {
+            paused: true,
+            ..Default::default()
+        };
+        let sessions = HashMap::new();
+        let prev = HashMap::new();
+        assert_eq!(
+            derive_status(&meta, &sessions, &prev),
+            TaskStatus::Paused,
+        );
+    }
+
+    #[test]
     fn derive_status_attached() {
         let meta = TaskMeta {
             session: "task-foo".into(),
@@ -649,6 +675,7 @@ mod tests {
             worktree: "~/code/wt".into(),
             prs: vec![100, 200],
             needs_input: true,
+            paused: false,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: TaskMeta =

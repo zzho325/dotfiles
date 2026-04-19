@@ -103,15 +103,22 @@ enum Cmd {
     Jump { name: String },
     /// Trigger a one-shot orchestrator scan
     Scan,
-    /// Spawn a worker in a tmux session for a task file
+    /// Spawn (or resume) a worker for a task by name.
+    /// Infers session, task file, and worktree from the name.
     Spawn {
-        /// Session name (e.g. task-tm)
-        session: String,
-        /// Path to the task file (e.g. ~/tasks/tm.md)
-        task_file: String,
-        /// Working directory (defaults to $ORCH_REPO/main)
-        #[arg(long, short = 'C')]
-        dir: Option<String>,
+        /// Task name (e.g. foo for ~/tasks/foo.md)
+        name: String,
+    },
+    /// Pause a task: kill its tmux session, mark paused.
+    /// Orchestrator will not auto-spawn it.
+    Pause {
+        /// Task name
+        name: String,
+    },
+    /// Resume a paused task: clear paused flag, spawn worker.
+    Resume {
+        /// Task name
+        name: String,
     },
     /// Send a message to the orchestrator
     #[command(name = "-")]
@@ -423,39 +430,72 @@ fn cmd_jump(name: &str) {
     let _ = Command::new("tmux").args([action, "-t", &session]).status();
 }
 
-fn cmd_spawn(session: &str, task_file: &str, dir: Option<&str>) {
-    if has_tmux_session(session) {
-        eprintln!("[spawn] session '{session}' already exists");
+fn cmd_spawn(name: &str) {
+    let session = format!("task-{name}");
+    if has_tmux_session(&session) {
+        eprintln!("[spawn] '{name}' already has a tmux session");
         return;
     }
 
-    let work_dir = dir
-        .map(String::from)
-        .unwrap_or_else(|| format!("{}/main", repo_dir()));
-    let cmd = format!("claude '/orch:worker {task_file}'");
+    let mut meta = state::load_task_meta(name);
+    let work_dir = if !meta.worktree.is_empty() {
+        meta.worktree
+            .replace(
+                "~",
+                &dirs::home_dir().unwrap_or_default().to_string_lossy(),
+            )
+    } else {
+        format!("{}/task-{name}", repo_dir())
+    };
 
-    if !tmux(&["new-session", "-d", "-s", session, "-c", &work_dir]) {
-        eprintln!("[spawn] failed to create tmux session '{session}'");
+    let task_file = state::tasks_dir().join(format!("{name}.md"));
+    if !task_file.exists() {
+        eprintln!(
+            "[spawn] task file not found: {}",
+            task_file.display(),
+        );
         return;
     }
-    if !tmux(&["send-keys", "-t", session, &cmd, "Enter"]) {
+    let cmd =
+        format!("claude '/orch:worker {}'", task_file.display());
+
+    if !tmux(&["new-session", "-d", "-s", &session, "-c", &work_dir]) {
+        eprintln!("[spawn] failed to create tmux session");
+        return;
+    }
+    if !tmux(&["send-keys", "-t", &session, &cmd, "Enter"]) {
         eprintln!("[spawn] failed to start worker");
         return;
     }
 
-    // Create state file if it doesn't exist
-    let task_name = std::path::Path::new(task_file)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(session);
-    let mut meta = state::load_task_meta(task_name);
-    if meta.session.is_empty() {
-        meta.session = session.to_string();
-        meta.worktree = work_dir.clone();
-        state::save_task_meta(task_name, &meta);
-    }
+    // Persist session, worktree, and clear paused flag
+    meta.session = session.clone();
+    meta.worktree = work_dir;
+    meta.paused = false;
+    state::save_task_meta(name, &meta);
 
-    eprintln!("[spawn] {session} started with {task_file}");
+    eprintln!("[spawn] {session} started");
+}
+
+fn cmd_pause(name: &str) {
+    let mut meta = state::load_task_meta(name);
+    if !meta.session.is_empty() {
+        // Kill whatever tmux session matches
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &meta.session])
+            .stderr(Stdio::null())
+            .status();
+    }
+    meta.paused = true;
+    state::save_task_meta(name, &meta);
+    eprintln!("[pause] {name} paused");
+}
+
+fn cmd_resume(name: &str) {
+    let mut meta = state::load_task_meta(name);
+    meta.paused = false;
+    state::save_task_meta(name, &meta);
+    cmd_spawn(name);
 }
 
 /// Background thread: polls tmux every 2s, writes status cache.
@@ -496,6 +536,7 @@ fn spawn_status_loop() {
                             state::TaskStatus::Working => "working",
                             state::TaskStatus::Input => "input",
                             state::TaskStatus::Idle => "idle",
+                            state::TaskStatus::Paused => "paused",
                             state::TaskStatus::Attached => "attached",
                         }
                         .to_string(),
@@ -678,9 +719,9 @@ fn main() {
         Some(Cmd::Tui) => tui::run().expect("TUI failed"),
         Some(Cmd::Status) => cmd_status(),
         Some(Cmd::Jump { name }) => cmd_jump(&name),
-        Some(Cmd::Spawn { session, task_file, dir }) => {
-            cmd_spawn(&session, &task_file, dir.as_deref())
-        }
+        Some(Cmd::Spawn { name }) => cmd_spawn(&name),
+        Some(Cmd::Pause { name }) => cmd_pause(&name),
+        Some(Cmd::Resume { name }) => cmd_resume(&name),
         Some(Cmd::Daemon) => cmd_daemon(),
         Some(Cmd::Scan) => {
             write_inbox(SCAN_MSG);
