@@ -139,6 +139,23 @@ enum Cmd {
         /// Task name (e.g. foo for ~/tasks/foo.md)
         name: String,
     },
+    /// Render the new TUI to stdout for debugging (no raw mode).
+    /// Useful for capturing what the layout looks like with live data
+    /// without needing an interactive terminal.
+    RenderDebug {
+        /// Terminal width in cells (default 150)
+        #[arg(long, default_value = "150")]
+        width: u16,
+        /// Terminal height in cells (default 40)
+        #[arg(long, default_value = "40")]
+        height: u16,
+        /// Detail tab: overview | prs | linear | panes
+        #[arg(long, default_value = "overview")]
+        tab: String,
+        /// Pane focus: list | details | log
+        #[arg(long, default_value = "list")]
+        focus: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -955,6 +972,9 @@ fn main() {
         }
         Some(Cmd::Gc) => cmd_gc(),
         Some(Cmd::Close { name }) => cmd_close(&name),
+        Some(Cmd::RenderDebug { width, height, tab, focus }) => {
+            tui3::render_debug(width, height, &tab, &focus)
+        }
         Some(Cmd::Pr { action }) => match action {
             PrAction::Add { task, number } => {
                 let mut meta = state::load_task_meta(&task);

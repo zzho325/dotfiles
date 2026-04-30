@@ -59,7 +59,8 @@ const IRIS: Color = Color::Rgb(0x90, 0x7a, 0xa9);
 const HL_LOW: Color = Color::Rgb(0xf4, 0xed, 0xe8);
 
 // Layout constants.
-const LIST_WIDTH: u16 = 36;
+const LIST_WIDTH: u16 = 34;
+const SEPARATOR_WIDTH: u16 = 1;
 const TAB_BAR_HEIGHT: u16 = 2; // tabs row + divider
 const LOG_HEIGHT_RATIO: u16 = 35; // percent of right column
 const HELP_OVERLAY_WIDTH: u16 = 60;
@@ -449,31 +450,50 @@ fn stub_linear_from_record(record: &crate::store::TaskRecord) -> Vec<LinearStub>
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // If there are no tasks, render the empty layout.
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(LIST_WIDTH),
+            Constraint::Length(SEPARATOR_WIDTH),
             Constraint::Min(0),
         ])
         .split(area);
 
     render_list(frame, outer[0], app);
+    render_vertical_separator(frame, outer[1]);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(100 - LOG_HEIGHT_RATIO),
-            Constraint::Percentage(LOG_HEIGHT_RATIO),
+            Constraint::Length(1), // horizontal separator
+            Constraint::Min(3),
         ])
-        .split(outer[1]);
+        .split(outer[2]);
 
     render_details(frame, right[0], app);
-    render_log(frame, right[1], app);
+    render_horizontal_separator(frame, right[1]);
+    render_log(frame, right[2], app);
 
     if app.show_help {
         render_help_overlay(frame, area);
     }
+}
+
+fn render_vertical_separator(frame: &mut Frame, area: Rect) {
+    let mut lines = Vec::with_capacity(area.height as usize);
+    for _ in 0..area.height {
+        lines.push(Line::styled("│", Style::default().fg(MUTED)));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_horizontal_separator(frame: &mut Frame, area: Rect) {
+    let bar = "─".repeat(area.width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::styled(bar, Style::default().fg(MUTED))),
+        area,
+    );
 }
 
 fn render_list(frame: &mut Frame, area: Rect, app: &App) {
@@ -815,25 +835,12 @@ fn render_log(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::styled(header_text, header_style)),
         header_area,
     );
-    let div_area = Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: 1,
-    };
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(MUTED),
-        )),
-        div_area,
-    );
 
     let body_area = Rect {
         x: area.x,
-        y: area.y + 2,
+        y: area.y + 1,
         width: area.width,
-        height: area.height.saturating_sub(2),
+        height: area.height.saturating_sub(1),
     };
 
     if app.log.lines.is_empty() {
@@ -1219,6 +1226,35 @@ fn send_message(msg: &str) {
         .as_nanos();
     let path = dir.join(format!("{nanos}-{}.msg", std::process::id()));
     let _ = std::fs::write(path, msg);
+}
+
+// Debug rendering — dumps the current TUI to stdout at a fixed size.
+// Useful for diagnosing layout without an interactive terminal.
+
+pub fn render_debug(width: u16, height: u16, tab: &str, focus: &str) {
+    use ratatui::backend::TestBackend;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("debug backend");
+    let mut app = App::new();
+    app.detail_tab = match tab.to_lowercase().as_str() {
+        "prs" => Tab::Prs,
+        "linear" => Tab::Linear,
+        "panes" => Tab::Panes,
+        _ => Tab::Overview,
+    };
+    app.focus = match focus.to_lowercase().as_str() {
+        "details" => Pane::Details,
+        "log" => Pane::Log,
+        _ => Pane::List,
+    };
+    terminal.draw(|f| render(f, &app)).expect("debug draw");
+    let buffer = terminal.backend().buffer().clone();
+    for y in 0..height {
+        for x in 0..width {
+            print!("{}", buffer[(x, y)].symbol());
+        }
+        println!();
+    }
 }
 
 // Run loop.
