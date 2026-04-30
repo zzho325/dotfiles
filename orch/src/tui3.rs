@@ -1008,12 +1008,23 @@ fn build_linear_rows(
             .unwrap_or_default()
     };
 
+    // A stub is shown iff: it's not also someone else's child (dedupe),
+    // it's mine (or unassigned), and Linear actually knows about it
+    // (not in `not_found`). Stale/orphan link entries are silently
+    // hidden — `orch linear rm <task> <key>` cleans them up.
+    let visible = |key: &str| -> bool {
+        if child_keys.contains(key) {
+            return false;
+        }
+        if cache.not_found.contains(&key.to_string()) {
+            return false;
+        }
+        is_mine(&assignee_of(key), &me)
+    };
+
     let mut projects: Vec<String> = Vec::new();
     for s in stubs {
-        if child_keys.contains(&s.key) {
-            continue;
-        }
-        if !is_mine(&assignee_of(&s.key), &me) {
+        if !visible(&s.key) {
             continue;
         }
         let p = cache
@@ -1032,10 +1043,7 @@ fn build_linear_rows(
     let mut prev_project: Option<String> = None;
 
     for stub in stubs {
-        if child_keys.contains(&stub.key) {
-            continue;
-        }
-        if !is_mine(&assignee_of(&stub.key), &me) {
+        if !visible(&stub.key) {
             continue;
         }
         let cached = cache.issues.get(&stub.key);
