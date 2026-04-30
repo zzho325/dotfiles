@@ -64,6 +64,7 @@ mod cache;
 mod gh;
 mod runs;
 mod state;
+mod store;
 mod tui;
 
 use std::{
