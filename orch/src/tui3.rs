@@ -1442,6 +1442,135 @@ fn render_linear_detail(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// When the user has the Linear tab focused with a cursored row, the
+/// log pane renders that issue's preview instead of orchestrator
+/// runs. Returns the key + a discriminator (List vs Detail-stack-top)
+/// when a preview should render; None to fall back to log.
+fn linear_preview_target(app: &App) -> Option<(String, &'static str)> {
+    if app.focus != Pane::Right || app.detail_tab != Tab::Linear {
+        return None;
+    }
+    match &app.linear_view {
+        LinearView::List { cursor_key, .. } if !cursor_key.is_empty() => {
+            Some((cursor_key.clone(), "list"))
+        }
+        _ => None,
+    }
+}
+
+/// Render an issue preview into the log-pane area: title, meta line,
+/// description (wrapped, truncated to fit). Source of truth is the
+/// shared `linear.json` cache.
+fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, _kind: &str) {
+    let cache = crate::cache::read_linear();
+    let cached = cache.issues.get(key);
+
+    let header = format!(" preview: {key}");
+    frame.render_widget(
+        Paragraph::new(Line::styled(header, Style::default().fg(MUTED))),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        },
+    );
+
+    let body_area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let Some(c) = cached else {
+        if cache.not_found.contains(&key.to_string()) {
+            lines.push(Line::styled(
+                " not on Linear",
+                Style::default().fg(LOVE),
+            ));
+        } else {
+            lines.push(Line::styled(
+                " loading…",
+                Style::default().fg(MUTED),
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines), body_area);
+        return;
+    };
+
+    // Title
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(c.title.clone(), Style::default().fg(TEXT)),
+    ]));
+
+    // Meta: state · age · assignee · project · sub-count
+    let state_color = linear_state_color(&c.state);
+    let mut meta: Vec<Span> = vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{} {}", state_glyph(&c.state_kind), c.state),
+            Style::default().fg(state_color),
+        ),
+    ];
+    let age = relative_age(&c.updated_at);
+    if !age.is_empty() {
+        meta.push(Span::styled(
+            format!("  ·  {age}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    if !c.assignee.is_empty() {
+        meta.push(Span::styled(
+            format!("  ·  @{}", c.assignee),
+            Style::default().fg(MUTED),
+        ));
+    }
+    if let Some(p) = &c.project {
+        meta.push(Span::styled(
+            format!("  ·  {}", p.name),
+            Style::default().fg(MUTED),
+        ));
+    }
+    if let Some(parent_key) = &c.parent_key {
+        let title = c.parent_title.clone().unwrap_or_default();
+        meta.push(Span::styled(
+            format!("  ·  parent {parent_key} {title}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    lines.push(Line::from(meta));
+
+    if !c.description.is_empty() {
+        lines.push(Line::raw(""));
+        let width = (body_area.width.saturating_sub(2) as usize).max(20);
+        let wrapped = wrap_text(&c.description, width);
+        let body_room = (body_area.height as usize).saturating_sub(lines.len());
+        let take = if wrapped.len() > body_room {
+            body_room.saturating_sub(1)
+        } else {
+            body_room
+        };
+        for w in wrapped.iter().take(take) {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(w.clone(), Style::default().fg(SUBTLE)),
+            ]));
+        }
+        if wrapped.len() > take && take > 0 {
+            lines.push(Line::styled(
+                " …",
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), body_area);
+}
+
 /// Wrap a text into lines fitting within `width`. Preserves blank lines.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
@@ -1612,6 +1741,15 @@ fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
 }
 
 fn render_log(frame: &mut Frame, area: Rect, app: &App) {
+    // When cursor is on a Linear-tab list row, the log pane becomes
+    // a preview of that issue (title + meta + description) so the
+    // user can read details without drilling. Restores to the run
+    // log as soon as focus leaves Linear.
+    if let Some((key, cursor_kind)) = linear_preview_target(app) {
+        render_linear_preview(frame, area, &key, &cursor_kind);
+        return;
+    }
+
     // Log is a passive viewer — no focus state. Header in MUTED.
     // Toast (if present) overrides the run-id label.
     let header_style = Style::default().fg(MUTED);
