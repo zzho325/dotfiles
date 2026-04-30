@@ -998,6 +998,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
 ]

@@ -131,6 +131,12 @@ enum Cmd {
         #[command(subcommand)]
         action: PrAction,
     },
+    /// Manage Linear tickets linked to a task.
+    #[command(name = "linear")]
+    Linear {
+        #[command(subcommand)]
+        action: LinearAction,
+    },
     /// Garbage-collect orphan worktrees: list `task-*` worktrees under
     /// `$ORCH_REPO` whose `~/tasks/<name>.md` is gone, prompt to remove.
     Gc,
@@ -155,6 +161,34 @@ enum Cmd {
         /// Pane focus: list | details | log
         #[arg(long, default_value = "list")]
         focus: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum LinearAction {
+    /// Add a Linear issue key (e.g. ENG-29151) to a task.
+    Add {
+        /// Task name (e.g. infra-triage)
+        task: String,
+        /// Linear issue key (e.g. ENG-29151)
+        key: String,
+    },
+    /// Remove a Linear issue key from a task.
+    Rm {
+        /// Task name
+        task: String,
+        /// Linear issue key
+        key: String,
+    },
+    /// Auto-scan task markdown for [A-Z]+-\d+ patterns and link them.
+    Scan {
+        /// Task name (omit to scan all open tasks)
+        task: Option<String>,
+    },
+    /// List Linear keys linked to a task.
+    Ls {
+        /// Task name
+        task: String,
     },
 }
 
@@ -733,6 +767,140 @@ fn cmd_close(name: &str) {
     eprintln!("[close] {name} closed");
 }
 
+// Linear ticket linkage. v2-aware writes only — when the v2 store is
+// not authoritative we refuse to silently no-op since the legacy
+// TaskMeta has no field for Linear keys.
+
+fn linear_key_pattern() -> regex::Regex {
+    // PROJ-N or PROJ-NN... — Linear's ticket format
+    regex::Regex::new(r"\b[A-Z][A-Z0-9_]+-\d+\b").expect("valid regex")
+}
+
+fn require_v2_store() -> Option<store::Store> {
+    let s = store::Store::default();
+    if !s.is_authoritative() {
+        eprintln!("[linear] v2 store not authoritative — restart `orch daemon` to migrate");
+        return None;
+    }
+    Some(s)
+}
+
+fn cmd_linear_add(task: &str, key: &str) {
+    let Some(s) = require_v2_store() else { return };
+    let Some(mut record) = s.load_record_by_slug(task) else {
+        eprintln!("[linear] no task: {task}");
+        return;
+    };
+    if record.links.linear_issues.iter().any(|li| li.key == key) {
+        eprintln!("[linear] {key} already linked to {task}");
+        return;
+    }
+    record.links.linear_issues.push(store::LinearLink {
+        key: key.to_string(),
+        source: store::LinkSource::Manual,
+        last_verified_at: None,
+    });
+    record.updated_at = epoch_secs();
+    s.save_record(&record);
+    eprintln!("[linear] linked {key} to {task}");
+}
+
+fn cmd_linear_rm(task: &str, key: &str) {
+    let Some(s) = require_v2_store() else { return };
+    let Some(mut record) = s.load_record_by_slug(task) else {
+        eprintln!("[linear] no task: {task}");
+        return;
+    };
+    let before = record.links.linear_issues.len();
+    record.links.linear_issues.retain(|li| li.key != key);
+    if record.links.linear_issues.len() == before {
+        eprintln!("[linear] {key} not linked to {task}");
+        return;
+    }
+    record.updated_at = epoch_secs();
+    s.save_record(&record);
+    eprintln!("[linear] unlinked {key} from {task}");
+}
+
+fn cmd_linear_ls(task: &str) {
+    let Some(s) = require_v2_store() else { return };
+    let Some(record) = s.load_record_by_slug(task) else {
+        eprintln!("[linear] no task: {task}");
+        return;
+    };
+    if record.links.linear_issues.is_empty() {
+        eprintln!("[linear] {task}: no linked issues");
+        return;
+    }
+    for li in &record.links.linear_issues {
+        let src = match li.source {
+            store::LinkSource::Manual => "manual",
+            store::LinkSource::BranchDiscovery => "branch",
+            store::LinkSource::MarkdownScan => "scan",
+            store::LinkSource::Migration => "migration",
+        };
+        eprintln!("  {}  ({src})", li.key);
+    }
+}
+
+/// Scan one task's .md file for `[A-Z]+-\d+` patterns and link any
+/// not already linked. New links use `source=MarkdownScan`.
+fn scan_task_md_for_keys(task: &str, store: &store::Store) -> usize {
+    let md = state::tasks_dir().join(format!("{task}.md"));
+    let content = match fs::read_to_string(&md) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let Some(mut record) = store.load_record_by_slug(task) else {
+        return 0;
+    };
+    let pattern = linear_key_pattern();
+    let mut added = 0;
+    for m in pattern.find_iter(&content) {
+        let key = m.as_str().to_string();
+        if record.links.linear_issues.iter().any(|li| li.key == key) {
+            continue;
+        }
+        record.links.linear_issues.push(store::LinearLink {
+            key,
+            source: store::LinkSource::MarkdownScan,
+            last_verified_at: None,
+        });
+        added += 1;
+    }
+    if added > 0 {
+        record.updated_at = epoch_secs();
+        store.save_record(&record);
+    }
+    added
+}
+
+fn cmd_linear_scan(task: Option<&str>) {
+    let Some(s) = require_v2_store() else { return };
+    let tasks: Vec<String> = match task {
+        Some(t) => vec![t.to_string()],
+        None => state::ordered_open_slugs(),
+    };
+    let mut total = 0;
+    for t in &tasks {
+        let n = scan_task_md_for_keys(t, &s);
+        if n > 0 {
+            eprintln!("[linear] {t}: linked {n} key(s) from md");
+            total += n;
+        }
+    }
+    if total == 0 {
+        eprintln!("[linear] no new keys found");
+    }
+}
+
+fn epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn cmd_gc() {
     let orphans = find_orphan_worktrees();
     if orphans.is_empty() {
@@ -1030,6 +1198,12 @@ fn main() {
         Some(Cmd::RenderDebug { width, height, tab, focus }) => {
             tui3::render_debug(width, height, &tab, &focus)
         }
+        Some(Cmd::Linear { action }) => match action {
+            LinearAction::Add { task, key } => cmd_linear_add(&task, &key),
+            LinearAction::Rm { task, key } => cmd_linear_rm(&task, &key),
+            LinearAction::Scan { task } => cmd_linear_scan(task.as_deref()),
+            LinearAction::Ls { task } => cmd_linear_ls(&task),
+        },
         Some(Cmd::Pr { action }) => match action {
             PrAction::Add { task, number } => {
                 let mut meta = state::load_task_meta(&task);

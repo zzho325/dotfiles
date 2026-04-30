@@ -788,7 +788,7 @@ fn render_tab_linear(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView)
             Style::default().fg(SUBTLE),
         ));
         lines.push(Line::styled(
-            " add via `linear add ENG-123` (Phase 4b)",
+            " orch linear add <task> ENG-123  ·  orch linear scan <task>",
             Style::default().fg(MUTED),
         ));
     } else {
