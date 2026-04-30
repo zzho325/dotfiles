@@ -123,11 +123,38 @@ pub fn load_task_names(dir: &Path) -> Vec<String> {
 }
 
 pub fn load_task_meta(name: &str) -> TaskMeta {
+    // v2 store dispatch: when `store.version=v2` exists, read from the
+    // new TaskRecord layer and flatten to TaskMeta. The legacy reader
+    // is the fallback for transitional cases (record missing for a slug
+    // that still has a .state/<name>.json on disk).
+    let store = crate::store::Store::default();
+    if store.is_authoritative() {
+        if let Some(record) = store.load_record_by_slug(name) {
+            return TaskMeta::from_record(&record);
+        }
+    }
     let path = state_dir().join(format!("{name}.json"));
     fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+impl TaskMeta {
+    /// Flatten a v2 `TaskRecord` into the legacy `TaskMeta` shape that
+    /// existing read sites expect. Lossy by design — fields not in
+    /// TaskMeta (drift flags, agent mode, link provenance) are dropped.
+    /// Only used during the slice B/C transition; once all consumers
+    /// migrate to TaskRecord directly, this conversion goes away.
+    pub fn from_record(r: &crate::store::TaskRecord) -> Self {
+        Self {
+            session: r.tmux.session_name.clone(),
+            worktree: r.worktree.path.clone(),
+            prs: r.links.prs.iter().map(|p| p.number).collect(),
+            needs_input: r.attention.needs_input,
+            paused: r.desired_state == crate::store::DesiredState::Paused,
+        }
+    }
 }
 
 pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
@@ -824,6 +851,59 @@ mod tests {
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
         let _ = fs::remove_dir_all(&test_runtime);
+    }
+
+    #[test]
+    fn task_meta_from_record_flattens_correctly() {
+        use crate::store;
+        let record = store::TaskRecord {
+            id: 5,
+            slug: "agentserver".into(),
+            desired_state: store::DesiredState::Paused,
+            tmux: store::TmuxInfo {
+                session_name: "agentserver".into(),
+                ..Default::default()
+            },
+            worktree: store::WorktreeInfo {
+                path: "/tmp/wt".into(),
+                ..Default::default()
+            },
+            attention: store::AttentionInfo {
+                needs_input: true,
+                ..Default::default()
+            },
+            links: store::Links {
+                prs: vec![
+                    store::PrLink { number: 100, ..Default::default() },
+                    store::PrLink { number: 200, ..Default::default() },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let meta = TaskMeta::from_record(&record);
+        assert_eq!(meta.session, "agentserver");
+        assert_eq!(meta.worktree, "/tmp/wt");
+        assert_eq!(meta.prs, vec![100, 200]);
+        assert!(meta.needs_input);
+        assert!(meta.paused);
+    }
+
+    #[test]
+    fn task_meta_from_record_paused_only_when_desired_paused() {
+        use crate::store;
+        let record = store::TaskRecord {
+            desired_state: store::DesiredState::Active,
+            ..Default::default()
+        };
+        assert!(!TaskMeta::from_record(&record).paused);
+
+        let record = store::TaskRecord {
+            desired_state: store::DesiredState::Closed,
+            ..Default::default()
+        };
+        // Closed tasks aren't "paused" in TaskMeta semantics
+        assert!(!TaskMeta::from_record(&record).paused);
     }
 
     #[test]
