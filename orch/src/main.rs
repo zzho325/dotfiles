@@ -161,6 +161,9 @@ enum Cmd {
         /// Pane focus: list | details | log
         #[arg(long, default_value = "list")]
         focus: String,
+        /// Selected task index (0-based) — defaults to 0
+        #[arg(long, default_value = "0")]
+        select: usize,
     },
 }
 
@@ -1195,8 +1198,8 @@ fn main() {
         }
         Some(Cmd::Gc) => cmd_gc(),
         Some(Cmd::Close { name }) => cmd_close(&name),
-        Some(Cmd::RenderDebug { width, height, tab, focus }) => {
-            tui3::render_debug(width, height, &tab, &focus)
+        Some(Cmd::RenderDebug { width, height, tab, focus, select }) => {
+            tui3::render_debug(width, height, &tab, &focus, select)
         }
         Some(Cmd::Linear { action }) => match action {
             LinearAction::Add { task, key } => cmd_linear_add(&task, &key),
