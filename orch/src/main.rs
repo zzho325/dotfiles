@@ -809,6 +809,17 @@ fn cmd_daemon() {
     fs::create_dir_all(&inbox).ok();
 
     runs::prune_old_runs();
+
+    // v2 store migration. Runs at most once per environment — once
+    // store.version=v2 exists, this short-circuits. Crashed prior runs
+    // leave a tmp dir that gets discarded and retried.
+    let store = store::Store::default();
+    match store.migrate_from_legacy(&state::tasks_dir()) {
+        Ok(0) => {} // already migrated, no-op
+        Ok(n) => eprintln!("[orch] migrated {n} tasks to v2 store"),
+        Err(e) => eprintln!("[orch] WARNING: v2 migration failed: {e}"),
+    }
+
     state::ensure_state_files();
     state::sweep_stale_markers(state::busy_stale_secs());
     eprintln!("[orch] reconciling PRs...");

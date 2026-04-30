@@ -463,12 +463,93 @@ pub fn ensure_state_files() {
 }
 
 pub fn save_task_meta(name: &str, meta: &TaskMeta) {
+    // Legacy write — always, regardless of whether v2 is authoritative.
+    // The legacy store stays readable as a one-release fallback.
     let dir = state_dir();
     fs::create_dir_all(&dir).ok();
     if let Ok(json) = serde_json::to_string_pretty(meta) {
         let path = dir.join(format!("{name}.json"));
         atomic_write(&path, &json);
     }
+
+    // v2 mirror write when authoritative. Updates the TaskMeta-derived
+    // subset of fields on the existing TaskRecord; everything else
+    // (drift flags, agent mode, link provenance) is preserved.
+    let store = crate::store::Store::default();
+    if store.is_authoritative() {
+        if let Some(mut record) = store.load_record_by_slug(name) {
+            apply_task_meta_to_record(meta, &mut record);
+            store.save_record(&record);
+        }
+        // No record-by-slug: skip silently. Either the slug isn't yet
+        // migrated (transitional) or someone is calling save for a
+        // task that never had an md file. The legacy write above
+        // already captured the state; v2 will sync next time the slug
+        // is seen during reconciliation.
+    }
+}
+
+/// Update a `TaskRecord` from a (legacy) `TaskMeta`. Fields without a
+/// TaskMeta counterpart are left untouched. PRs are replaced wholesale
+/// with `source=Migration` since TaskMeta doesn't carry provenance.
+fn apply_task_meta_to_record(
+    meta: &TaskMeta,
+    record: &mut crate::store::TaskRecord,
+) {
+    use crate::store::{DesiredState, LinkSource, PrLink};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    record.tmux.session_name = meta.session.clone();
+    record.worktree.path = meta.worktree.clone();
+    record.attention.needs_input = meta.needs_input;
+
+    // Recompute desired_state from legacy fields. A `Closed` record
+    // shouldn't be flipped back to Active by a stale TaskMeta save; we
+    // only mutate when the current state is reachable from this map.
+    let new_desired = if meta.paused {
+        DesiredState::Paused
+    } else if !meta.session.is_empty() || !meta.worktree.is_empty() {
+        DesiredState::Active
+    } else {
+        DesiredState::New
+    };
+    if record.desired_state != DesiredState::Closed {
+        record.desired_state = new_desired;
+    }
+    if new_desired == DesiredState::Paused && record.paused_at.is_none() {
+        record.paused_at = Some(now);
+    }
+    if new_desired == DesiredState::Active && record.started_at.is_none() {
+        record.started_at = Some(now);
+    }
+
+    // PRs: replace the migration-sourced subset, preserve manual links.
+    let manual: Vec<_> = record
+        .links
+        .prs
+        .iter()
+        .filter(|p| p.source == LinkSource::Manual)
+        .cloned()
+        .collect();
+    let mut new_prs: Vec<PrLink> = meta
+        .prs
+        .iter()
+        .map(|&number| PrLink {
+            number,
+            source: LinkSource::Migration,
+            ..Default::default()
+        })
+        .collect();
+    for m in manual {
+        if !new_prs.iter().any(|p| p.number == m.number) {
+            new_prs.push(m);
+        }
+    }
+    record.links.prs = new_prs;
+    record.updated_at = now;
 }
 
 /// Reconcile PR state: discover open PRs via jj op log and prune
@@ -887,6 +968,94 @@ mod tests {
         assert_eq!(meta.prs, vec![100, 200]);
         assert!(meta.needs_input);
         assert!(meta.paused);
+    }
+
+    #[test]
+    fn apply_task_meta_to_record_recomputes_desired_state() {
+        use crate::store;
+        let mut record = store::TaskRecord {
+            id: 1,
+            slug: "x".into(),
+            desired_state: store::DesiredState::New,
+            ..Default::default()
+        };
+
+        // session/worktree set -> Active
+        let meta = TaskMeta {
+            session: "task-x".into(),
+            worktree: "/tmp/wt".into(),
+            ..Default::default()
+        };
+        apply_task_meta_to_record(&meta, &mut record);
+        assert_eq!(record.desired_state, store::DesiredState::Active);
+        assert_eq!(record.tmux.session_name, "task-x");
+        assert!(record.started_at.is_some());
+
+        // paused=true -> Paused
+        let meta = TaskMeta {
+            session: "task-x".into(),
+            worktree: "/tmp/wt".into(),
+            paused: true,
+            ..Default::default()
+        };
+        apply_task_meta_to_record(&meta, &mut record);
+        assert_eq!(record.desired_state, store::DesiredState::Paused);
+        assert!(record.paused_at.is_some());
+    }
+
+    #[test]
+    fn apply_task_meta_to_record_does_not_unclose() {
+        use crate::store;
+        let mut record = store::TaskRecord {
+            id: 1,
+            slug: "x".into(),
+            desired_state: store::DesiredState::Closed,
+            ..Default::default()
+        };
+        // Stale TaskMeta with active session shouldn't undo Closed.
+        let meta = TaskMeta {
+            session: "task-x".into(),
+            worktree: "/tmp/wt".into(),
+            ..Default::default()
+        };
+        apply_task_meta_to_record(&meta, &mut record);
+        assert_eq!(record.desired_state, store::DesiredState::Closed);
+    }
+
+    #[test]
+    fn apply_task_meta_to_record_preserves_manual_pr_links() {
+        use crate::store;
+        let mut record = store::TaskRecord {
+            id: 1,
+            slug: "x".into(),
+            links: store::Links {
+                prs: vec![
+                    store::PrLink {
+                        number: 100,
+                        source: store::LinkSource::Manual,
+                        ..Default::default()
+                    },
+                    store::PrLink {
+                        number: 200,
+                        source: store::LinkSource::Migration,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let meta = TaskMeta {
+            prs: vec![300, 400],
+            ..Default::default()
+        };
+        apply_task_meta_to_record(&meta, &mut record);
+        // Migration-sourced 200 dropped; manual 100 retained; new 300, 400 added.
+        let nums: Vec<u32> = record.links.prs.iter().map(|p| p.number).collect();
+        assert!(nums.contains(&300));
+        assert!(nums.contains(&400));
+        assert!(nums.contains(&100));
+        assert!(!nums.contains(&200));
     }
 
     #[test]
