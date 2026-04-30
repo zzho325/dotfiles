@@ -69,7 +69,7 @@ mod tui;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
@@ -128,6 +128,14 @@ enum Cmd {
     Pr {
         #[command(subcommand)]
         action: PrAction,
+    },
+    /// Garbage-collect orphan worktrees: list `task-*` worktrees under
+    /// `$ORCH_REPO` whose `~/tasks/<name>.md` is gone, prompt to remove.
+    Gc,
+    /// Close a task: kill tmux, archive .md to done/, remove worktree.
+    Close {
+        /// Task name (e.g. foo for ~/tasks/foo.md)
+        name: String,
     },
 }
 
@@ -518,25 +526,194 @@ fn cmd_resume(name: &str) {
     cmd_spawn(name);
 }
 
+// Worktree garbage collection — `orch gc`.
+//
+// Worktrees live as `$ORCH_REPO/task-<name>` siblings of `main`. A
+// worktree is "bound" if `~/tasks/<name>.md` exists. Anything else is an
+// orphan that the user can remove. Removal uses plain `git worktree
+// remove` (no `--force`) — dirty worktrees fail with a warning so the
+// user can intervene.
+
+/// Find worktrees under `$ORCH_REPO` matching `task-*` whose
+/// corresponding `~/tasks/<name>.md` is gone.
+fn find_orphan_worktrees() -> Vec<PathBuf> {
+    let repo = match std::env::var("ORCH_REPO") {
+        Ok(r) => PathBuf::from(r),
+        Err(_) => return Vec::new(),
+    };
+    let Ok(entries) = fs::read_dir(&repo) else {
+        return Vec::new();
+    };
+    let task_dir = state::tasks_dir();
+    let mut orphans = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(basename) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(task_name) = basename.strip_prefix("task-") else {
+            continue;
+        };
+        if task_dir.join(format!("{task_name}.md")).exists() {
+            continue;
+        }
+        orphans.push(path);
+    }
+    orphans.sort();
+    orphans
+}
+
+/// Remove a worktree. First tries `git worktree remove`. If git says
+/// "not a working tree" (already disowned — common after a partial
+/// cleanup), the directory is a pure orphan with no git state, so we
+/// `rm -rf` it. Other errors (notably "contains modified or untracked
+/// files") propagate so the caller can warn the user.
+fn remove_worktree(path: &Path) -> Result<(), String> {
+    let repo = std::env::var("ORCH_REPO")
+        .map_err(|_| "ORCH_REPO not set".to_string())?;
+    let main = format!("{repo}/main");
+    let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_string())?;
+    let output = Command::new("git")
+        .args(["worktree", "remove", path_str])
+        .current_dir(&main)
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let msg = stderr.trim().to_string();
+
+    // Disowned worktree: git no longer tracks it, no .git/.jj inside.
+    // Safe to delete the orphan directory.
+    if msg.contains("is not a working tree")
+        && !path.join(".git").exists()
+        && !path.join(".jj").exists()
+    {
+        fs::remove_dir_all(path).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    Err(msg)
+}
+
+/// Close a task: kill its tmux session, archive ~/tasks/<name>.md to
+/// done/, remove the worktree, drop the state file. Each step warns
+/// loudly on failure but does not abort — the user can clean up the
+/// remaining drift manually (or with `orch gc`).
+fn cmd_close(name: &str) {
+    let meta = state::load_task_meta(name);
+
+    if !meta.session.is_empty() {
+        if let Some(actual) = find_actual_session(&meta.session) {
+            let killed = Command::new("tmux")
+                .args(["kill-session", "-t", &actual])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if killed {
+                eprintln!("[close] killed tmux session {actual}");
+            } else {
+                eprintln!("[close] WARNING: failed to kill tmux session {actual}");
+            }
+        }
+    }
+
+    let dir = state::tasks_dir();
+    let md = dir.join(format!("{name}.md"));
+    if md.exists() {
+        let done_dir = dir.join("done");
+        fs::create_dir_all(&done_dir).ok();
+        let archived = done_dir.join(format!("{name}.md"));
+        match fs::rename(&md, &archived) {
+            Ok(()) => eprintln!(
+                "[close] archived {name}.md -> done/",
+            ),
+            Err(e) => eprintln!(
+                "[close] WARNING: failed to archive {name}.md: {e}",
+            ),
+        }
+    }
+
+    if !meta.worktree.is_empty() {
+        let home = dirs::home_dir().unwrap_or_default();
+        let wt = meta.worktree.replace("~", &home.to_string_lossy());
+        let path = Path::new(&wt);
+        if path.exists() {
+            match remove_worktree(path) {
+                Ok(()) => eprintln!("[close] removed worktree {wt}"),
+                Err(e) => eprintln!(
+                    "[close] WARNING: worktree {wt} not removed ({e})\n  run `git worktree remove --force {wt}` to override",
+                ),
+            }
+        }
+    }
+
+    let state_path = dir.join(".state").join(format!("{name}.json"));
+    if state_path.exists() {
+        let _ = fs::remove_file(&state_path);
+    }
+
+    eprintln!("[close] {name} closed");
+}
+
+fn cmd_gc() {
+    let orphans = find_orphan_worktrees();
+    if orphans.is_empty() {
+        eprintln!("[gc] no orphan worktrees");
+        return;
+    }
+
+    eprintln!("[gc] found {} orphan worktree(s):", orphans.len());
+    for path in &orphans {
+        eprintln!("  {}", path.display());
+    }
+    eprint!("[gc] remove all? [y/N] ");
+    io::stderr().flush().ok();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        eprintln!("[gc] aborted");
+        return;
+    }
+    if !input.trim().eq_ignore_ascii_case("y") {
+        eprintln!("[gc] aborted");
+        return;
+    }
+
+    for path in orphans {
+        match remove_worktree(&path) {
+            Ok(()) => eprintln!("[gc] removed {}", path.display()),
+            Err(e) => eprintln!(
+                "[gc] failed to remove {} ({e}); run `git worktree remove --force {}` to override",
+                path.display(),
+                path.display(),
+            ),
+        }
+    }
+}
+
 /// Background thread: polls tmux every 2s, writes status cache.
+/// Sweeps stale busy markers every 5 minutes.
 fn spawn_status_loop() {
     use std::thread;
     thread::spawn(|| {
-        // Seed prev_hashes from last cached status
-        let cached = cache::read_status();
-        let mut prev_hashes: HashMap<String, u64> = cached
-            .tasks
-            .iter()
-            .map(|(_, t)| (t.actual_session.clone(), t.pane_hash))
-            .filter(|(name, _)| !name.is_empty())
-            .collect();
+        let stale_secs = state::busy_stale_secs();
+        let mut sweep_counter: u32 = 0;
 
         loop {
             state::ensure_state_files();
             let order = state::load_order();
             let sessions = state::load_tmux_sessions();
+            state::auto_pause_orphaned(&sessions);
             let tasks =
-                state::load_tasks(&order, &sessions, &prev_hashes);
+                state::load_tasks(&order, &sessions, stale_secs);
 
             let mut cached_tasks = HashMap::new();
             for task in &tasks {
@@ -562,23 +739,21 @@ fn spawn_status_loop() {
                         .to_string(),
                         has_active_process: matched
                             .is_some_and(|s| s.has_active_process),
-                        pane_hash: matched
-                            .map(|s| s.pane_hash)
-                            .unwrap_or(0),
                     },
                 );
             }
-
-            prev_hashes = sessions
-                .iter()
-                .map(|(k, v)| (k.clone(), v.pane_hash))
-                .collect();
 
             cache::write_status(&cache::StatusCache {
                 generated_at: cache::now_epoch(),
                 tasks: cached_tasks,
             });
             cache::write_lease();
+
+            // Sweep stale busy markers every 150 ticks (~5 min at 2s/tick)
+            sweep_counter = sweep_counter.wrapping_add(1);
+            if sweep_counter % 150 == 0 {
+                state::sweep_stale_markers(stale_secs);
+            }
 
             std::thread::sleep(Duration::from_secs(2));
         }
@@ -634,6 +809,7 @@ fn cmd_daemon() {
 
     runs::prune_old_runs();
     state::ensure_state_files();
+    state::sweep_stale_markers(state::busy_stale_secs());
     eprintln!("[orch] reconciling PRs...");
     state::reconcile_prs();
 
@@ -751,6 +927,8 @@ fn main() {
             write_inbox(&message.join(" "));
             eprintln!("[orch] message sent");
         }
+        Some(Cmd::Gc) => cmd_gc(),
+        Some(Cmd::Close { name }) => cmd_close(&name),
         Some(Cmd::Pr { action }) => match action {
             PrAction::Add { task, number } => {
                 let mut meta = state::load_task_meta(&task);

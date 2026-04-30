@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::{self, stdout},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -154,11 +154,9 @@ impl App {
                         })
                         .unwrap_or(TaskStatus::Idle)
                 } else if let Some(sessions) = &live_sessions {
-                    // No prev_hashes without the daemon — worker
-                    // shows as Working while alive, Idle/Paused
-                    // otherwise. Good enough for the rare case
-                    // of running TUI without daemon.
-                    state::derive_status(&meta, sessions, &HashMap::new())
+                    // Without the daemon, marker freshness is read
+                    // directly per derive call.
+                    state::derive_status(&meta, sessions, state::busy_stale_secs())
                 } else {
                     TaskStatus::Idle
                 };

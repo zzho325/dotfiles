@@ -3,9 +3,22 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
+
+/// Default age (seconds) past which a busy marker is considered stale.
+/// Tunable via `ORCH_BUSY_STALE_SECS` env var. 30 minutes is comfortably
+/// larger than the longest Claude turn we'd expect in practice.
+pub const DEFAULT_BUSY_STALE_SECS: u64 = 1800;
+
+pub fn busy_stale_secs() -> u64 {
+    std::env::var("ORCH_BUSY_STALE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BUSY_STALE_SECS)
+}
 
 /// Atomic write: write to .tmp then rename to avoid partial reads.
 pub fn atomic_write(path: &Path, content: &str) -> bool {
@@ -39,8 +52,6 @@ pub struct TmuxSession {
     pub attached: bool,
     /// Whether claude/node is running in any pane
     pub has_active_process: bool,
-    /// Hash of the claude pane's last line (for change detection)
-    pub pane_hash: u64,
 }
 
 // PR status from GitHub
@@ -133,7 +144,7 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
         return HashMap::new();
     };
 
-    let (active_sessions, pane_hashes) = load_pane_info();
+    let active_sessions = load_pane_info();
 
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -143,13 +154,12 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
             let attached = parts.next()? != "0";
             let has_active_process =
                 active_sessions.contains(&name);
-            let pane_hash =
-                pane_hashes.get(&name).copied().unwrap_or(0);
             Some((
                 name.clone(),
                 TmuxSession {
-                    name, attached,
-                    has_active_process, pane_hash,
+                    name,
+                    attached,
+                    has_active_process,
                 },
             ))
         })
@@ -174,64 +184,121 @@ pub fn strip_numeric_prefix(name: &str) -> &str {
     name.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
 }
 
-/// Single tmux list-panes call to detect active workers and hash
-/// pane content for change detection.
-fn load_pane_info() -> (HashSet<String>, HashMap<String, u64>) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
+/// Single tmux list-panes call to detect which sessions have an active
+/// worker process. No more pane-content hashing — busy state comes from
+/// the marker file written by Claude Code's UserPromptSubmit hook.
+fn load_pane_info() -> HashSet<String> {
     let output = Command::new("tmux")
         .args([
             "list-panes", "-a", "-F",
-            "#{session_name} #{pane_current_command} #{pane_id} \
-             #{cursor_x} #{cursor_y}",
+            "#{session_name} #{pane_current_command}",
         ])
         .stderr(Stdio::null())
         .output()
         .ok();
     let Some(output) = output.filter(|o| o.status.success()) else {
-        return (HashSet::new(), HashMap::new());
+        return HashSet::new();
     };
 
     let mut active = HashSet::new();
-    let mut hashes = HashMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let parts: Vec<&str> = line.splitn(5, ' ').collect();
-        if parts.len() < 5 {
-            continue;
-        }
-        let (session, cmd, pane_id, cx, cy) =
-            (parts[0], parts[1], parts[2], parts[3], parts[4]);
-        if !is_worker_process(cmd) {
-            continue;
-        }
-        active.insert(session.to_string());
-
-        // Capture visible pane content (full screen) + cursor.
-        // Full capture catches streaming token changes; cursor
-        // position catches typing/prompt movement even when
-        // content is static (reduce motion).
-        let capture = Command::new("tmux")
-            .args(["capture-pane", "-t", pane_id, "-p"])
-            .stderr(Stdio::null())
-            .output()
-            .ok();
-        if let Some(cap) = capture.filter(|o| o.status.success()) {
-            let text = String::from_utf8_lossy(&cap.stdout);
-            let mut hasher = DefaultHasher::new();
-            text.trim().hash(&mut hasher);
-            cx.hash(&mut hasher);
-            cy.hash(&mut hasher);
-            hashes.insert(session.to_string(), hasher.finish());
+        let (session, cmd) = match line.split_once(' ') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if is_worker_process(cmd) {
+            active.insert(session.to_string());
         }
     }
-    (active, hashes)
+    active
+}
+
+// Busy-marker reading. Markers are written by Claude Code hooks
+// (UserPromptSubmit) and removed by Stop/SessionEnd hooks. See
+// docs/busy-detection-plan.md.
+
+fn busy_dir() -> PathBuf {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    runtime.join("orch").join("busy")
+}
+
+/// Expand `~` in a path against the user's home directory.
+fn expand_home(p: &str) -> String {
+    let home = dirs::home_dir().unwrap_or_default();
+    p.replace("~", &home.to_string_lossy())
+}
+
+/// True if `marker_cwd` is the same as or nested inside `worktree`.
+fn marker_in_worktree(marker_cwd: &str, worktree: &str) -> bool {
+    let a = expand_home(marker_cwd);
+    let b = expand_home(worktree);
+    let b = b.trim_end_matches('/');
+    if b.is_empty() {
+        return false;
+    }
+    a == b || a.starts_with(&format!("{b}/"))
+}
+
+/// True if any fresh busy marker reports a `cwd` inside `worktree`.
+/// "Fresh" = mtime within `stale_secs`. Returns false if `worktree` is
+/// empty (no recorded path), the busy dir doesn't exist, or no markers
+/// match.
+pub fn is_worktree_busy(worktree: &str, stale_secs: u64) -> bool {
+    if worktree.is_empty() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(busy_dir()) else {
+        return false;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue; };
+        let Ok(modified) = meta.modified() else { continue; };
+        let age = now
+            .duration_since(modified)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age >= stale_secs {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else { continue; };
+        let Ok(parsed) =
+            serde_json::from_str::<serde_json::Value>(&content) else { continue; };
+        let Some(cwd) = parsed["cwd"].as_str() else { continue; };
+        if marker_in_worktree(cwd, worktree) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort sweep of busy markers older than `stale_secs`. Called on
+/// daemon startup and periodically from the status loop to clean up
+/// markers leaked by crashed Claude sessions.
+pub fn sweep_stale_markers(stale_secs: u64) {
+    let Ok(entries) = fs::read_dir(busy_dir()) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue; };
+        let Ok(modified) = meta.modified() else { continue; };
+        let age = now
+            .duration_since(modified)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age >= stale_secs {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 pub fn derive_status(
     meta: &TaskMeta,
     sessions: &HashMap<String, TmuxSession>,
-    prev_hashes: &HashMap<String, u64>,
+    busy_stale_secs: u64,
 ) -> TaskStatus {
     let session = find_session(&meta.session, sessions);
 
@@ -255,14 +322,13 @@ pub fn derive_status(
         return TaskStatus::Ready;
     }
 
-    // Compare pane content hash with previous poll.
-    // If the hash changed, the worker is actively producing output.
-    let prev = prev_hashes.get(&session.name).copied().unwrap_or(0);
-    if prev != 0 && prev == session.pane_hash {
-        // Content hasn't changed since last poll → ready
-        TaskStatus::Ready
-    } else {
+    // Working iff a fresh busy marker reports a cwd inside this task's
+    // worktree. Markers are written by Claude Code's UserPromptSubmit
+    // hook and removed on Stop. See docs/busy-detection-plan.md.
+    if is_worktree_busy(&meta.worktree, busy_stale_secs) {
         TaskStatus::Working
+    } else {
+        TaskStatus::Ready
     }
 }
 
@@ -301,7 +367,7 @@ pub fn ordered_task_names(order: &[String]) -> Vec<String> {
 pub fn load_tasks(
     order: &[String],
     sessions: &HashMap<String, TmuxSession>,
-    prev_hashes: &HashMap<String, u64>,
+    busy_stale_secs: u64,
 ) -> Vec<Task> {
     let ordered = ordered_task_names(order);
 
@@ -309,7 +375,7 @@ pub fn load_tasks(
         .into_iter()
         .map(|name| {
             let meta = load_task_meta(&name);
-            let status = derive_status(&meta, sessions, prev_hashes);
+            let status = derive_status(&meta, sessions, busy_stale_secs);
             Task {
                 name,
                 meta,
@@ -318,6 +384,24 @@ pub fn load_tasks(
             }
         })
         .collect()
+}
+
+/// Flip `paused=true` for any task whose recorded tmux session is
+/// no longer alive (e.g. after a laptop restart). Tasks that never
+/// had a session recorded stay as-is (genuinely unspawned → Idle).
+pub fn auto_pause_orphaned(sessions: &HashMap<String, TmuxSession>) {
+    let dir = tasks_dir();
+    for name in load_task_names(&dir) {
+        let meta = load_task_meta(&name);
+        if meta.session.is_empty() || meta.paused {
+            continue;
+        }
+        if find_session(&meta.session, sessions).is_none() {
+            let mut latest = load_task_meta(&name);
+            latest.paused = true;
+            save_task_meta(&name, &latest);
+        }
+    }
 }
 
 /// Ensure every task .md file has a corresponding state file.
@@ -525,9 +609,8 @@ mod tests {
     fn derive_status_no_session() {
         let meta = TaskMeta::default();
         let sessions = HashMap::new();
-        let prev = HashMap::new();
         assert_eq!(
-            derive_status(&meta, &sessions, &prev),
+            derive_status(&meta, &sessions, DEFAULT_BUSY_STALE_SECS),
             TaskStatus::Idle,
         );
     }
@@ -576,9 +659,8 @@ mod tests {
             ..Default::default()
         };
         let sessions = HashMap::new();
-        let prev = HashMap::new();
         assert_eq!(
-            derive_status(&meta, &sessions, &prev),
+            derive_status(&meta, &sessions, DEFAULT_BUSY_STALE_SECS),
             TaskStatus::Paused,
         );
     }
@@ -596,11 +678,10 @@ mod tests {
                 name: "task-foo".into(),
                 attached: true,
                 has_active_process: true,
-                pane_hash: 123,
             },
         );
         assert_eq!(
-            derive_status(&meta, &sessions, &HashMap::new()),
+            derive_status(&meta, &sessions, DEFAULT_BUSY_STALE_SECS),
             TaskStatus::Attached,
         );
     }
@@ -619,11 +700,10 @@ mod tests {
                 name: "task-foo".into(),
                 attached: false,
                 has_active_process: true,
-                pane_hash: 123,
             },
         );
         assert_eq!(
-            derive_status(&meta, &sessions, &HashMap::new()),
+            derive_status(&meta, &sessions, DEFAULT_BUSY_STALE_SECS),
             TaskStatus::Input,
         );
     }
@@ -641,19 +721,20 @@ mod tests {
                 name: "task-foo".into(),
                 attached: false,
                 has_active_process: false,
-                pane_hash: 0,
             },
         );
         assert_eq!(
-            derive_status(&meta, &sessions, &HashMap::new()),
+            derive_status(&meta, &sessions, DEFAULT_BUSY_STALE_SECS),
             TaskStatus::Ready,
         );
     }
 
     #[test]
-    fn derive_status_working_when_hash_changed() {
+    fn derive_status_ready_without_busy_marker() {
+        // No marker file present anywhere -> Ready even with active process
         let meta = TaskMeta {
             session: "task-foo".into(),
+            worktree: "/tmp/orch-test-no-marker".into(),
             ..Default::default()
         };
         let mut sessions = HashMap::new();
@@ -663,37 +744,10 @@ mod tests {
                 name: "task-foo".into(),
                 attached: false,
                 has_active_process: true,
-                pane_hash: 999,
             },
         );
-        let mut prev = HashMap::new();
-        prev.insert("task-foo".to_string(), 111u64);
         assert_eq!(
-            derive_status(&meta, &sessions, &prev),
-            TaskStatus::Working,
-        );
-    }
-
-    #[test]
-    fn derive_status_ready_when_hash_unchanged() {
-        let meta = TaskMeta {
-            session: "task-foo".into(),
-            ..Default::default()
-        };
-        let mut sessions = HashMap::new();
-        sessions.insert(
-            "task-foo".into(),
-            TmuxSession {
-                name: "task-foo".into(),
-                attached: false,
-                has_active_process: true,
-                pane_hash: 555,
-            },
-        );
-        let mut prev = HashMap::new();
-        prev.insert("task-foo".to_string(), 555u64);
-        assert_eq!(
-            derive_status(&meta, &sessions, &prev),
+            derive_status(&meta, &sessions, DEFAULT_BUSY_STALE_SECS),
             TaskStatus::Ready,
         );
     }
@@ -707,7 +761,6 @@ mod tests {
                 name: "1-task-foo".into(),
                 attached: false,
                 has_active_process: false,
-                pane_hash: 0,
             },
         );
         // Direct match fails, suffix match succeeds
@@ -715,6 +768,74 @@ mod tests {
         let found = find_session("task-foo", &sessions);
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "1-task-foo");
+    }
+
+    #[test]
+    fn marker_in_worktree_exact_and_nested() {
+        assert!(marker_in_worktree("/tmp/wt", "/tmp/wt"));
+        assert!(marker_in_worktree("/tmp/wt/sub", "/tmp/wt"));
+        assert!(!marker_in_worktree("/tmp/other", "/tmp/wt"));
+        assert!(!marker_in_worktree("/tmp/wtx", "/tmp/wt"));
+    }
+
+    #[test]
+    fn marker_in_worktree_handles_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let home_str = home.to_string_lossy().to_string();
+        let abs_wt = format!("{home_str}/code/wt-foo");
+        assert!(marker_in_worktree(&abs_wt, "~/code/wt-foo"));
+        assert!(marker_in_worktree("~/code/wt-foo", &abs_wt));
+    }
+
+    #[test]
+    fn marker_in_worktree_empty_worktree() {
+        assert!(!marker_in_worktree("/tmp/anything", ""));
+    }
+
+    #[test]
+    fn is_worktree_busy_fresh_marker() {
+        // Use a unique busy dir so this test doesn't interfere with the
+        // user's running orch.
+        let test_runtime = std::env::temp_dir().join("orch-test-busy-fresh");
+        let _ = fs::remove_dir_all(&test_runtime);
+        let busy = test_runtime.join("orch").join("busy");
+        fs::create_dir_all(&busy).unwrap();
+
+        let wt = "/tmp/test-wt";
+        let marker = busy.join("test-sid-1");
+        fs::write(
+            &marker,
+            format!(r#"{{"cwd": "{wt}", "started_at": "x", "pid": 1}}"#),
+        )
+        .unwrap();
+
+        // Point XDG_RUNTIME_DIR at the test dir for this thread
+        // SAFETY: tests are single-threaded and we restore after
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &test_runtime);
+        }
+        assert!(is_worktree_busy(wt, 60));
+        assert!(!is_worktree_busy("/tmp/other", 60));
+
+        // Stale: 0 stale_secs threshold means everything is stale
+        assert!(!is_worktree_busy(wt, 0));
+
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let _ = fs::remove_dir_all(&test_runtime);
+    }
+
+    #[test]
+    fn busy_stale_secs_reads_env() {
+        unsafe {
+            std::env::set_var("ORCH_BUSY_STALE_SECS", "120");
+        }
+        assert_eq!(busy_stale_secs(), 120);
+        unsafe {
+            std::env::remove_var("ORCH_BUSY_STALE_SECS");
+        }
+        assert_eq!(busy_stale_secs(), DEFAULT_BUSY_STALE_SECS);
     }
 
     #[test]

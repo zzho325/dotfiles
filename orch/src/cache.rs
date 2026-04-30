@@ -26,7 +26,6 @@ pub struct CachedTask {
     pub actual_session: String,
     pub status: String,
     pub has_active_process: bool,
-    pub pane_hash: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -162,7 +161,6 @@ mod tests {
                 actual_session: "3-task-foo".into(),
                 status: "working".into(),
                 has_active_process: true,
-                pane_hash: 12345,
             },
         );
         let cache = StatusCache {
@@ -173,7 +171,7 @@ mod tests {
         let parsed: StatusCache =
             serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tasks["foo"].status, "working");
-        assert_eq!(parsed.tasks["foo"].pane_hash, 12345);
+        assert_eq!(parsed.tasks["foo"].actual_session, "3-task-foo");
     }
 
     #[test]
