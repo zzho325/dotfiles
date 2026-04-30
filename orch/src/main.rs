@@ -66,6 +66,7 @@ mod runs;
 mod state;
 mod store;
 mod tui;
+mod tui3;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -913,19 +914,31 @@ fn cmd_daemon() {
     }
 }
 
+fn run_tui() {
+    let use_legacy =
+        std::env::var("ORCH_TUI").is_ok_and(|v| v == "legacy");
+    if use_legacy {
+        tui::run().expect("TUI failed");
+    } else {
+        tui3::run().expect("TUI failed");
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        // Default: TUI if interactive terminal, plain status otherwise
+        // Default: TUI if interactive terminal, plain status otherwise.
+        // ORCH_TUI=legacy keeps the pre-Phase-3 layout for emergency
+        // rollback; default is the new three-pane TUI.
         None => {
             if atty::is(atty::Stream::Stdout) {
-                tui::run().expect("TUI failed");
+                run_tui();
             } else {
                 cmd_status();
             }
         }
-        Some(Cmd::Tui) => tui::run().expect("TUI failed"),
+        Some(Cmd::Tui) => run_tui(),
         Some(Cmd::Status) => cmd_status(),
         Some(Cmd::Jump { name }) => cmd_jump(&name),
         Some(Cmd::Spawn { name }) => cmd_spawn(&name),

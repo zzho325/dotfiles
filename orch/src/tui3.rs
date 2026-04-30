@@ -1,0 +1,1681 @@
+//! Phase 3 TUI — three-pane layout (list / details / log).
+//!
+//! See `docs/redesign.md` §5 (TUI Layout) and `docs/redesign-notes.md`
+//! Phase 3 for the contract this module implements.
+//!
+//! Focus model:
+//!
+//! ```text
+//! ┌─────────────────┬──────────────────────────────────────┐
+//! │ tasks list      │ Overview · PRs · Linear · Panes      │
+//! │  #1 task-foo  · │ ─────────────────────────────────── │
+//! │  #2 task-bar  ⚡ │ <selected tab content>              │
+//! │  #3 task-baz  ✓ │                                      │
+//! │                 ├──────────────────────────────────────┤
+//! │                 │ log: latest run output, wrapped      │
+//! └─────────────────┴──────────────────────────────────────┘
+//! ```
+
+#![allow(dead_code)] // Some bindings stubbed for Phase 4+.
+
+use std::{
+    collections::HashSet,
+    io::{self, stdout},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent},
+    terminal::{
+        disable_raw_mode, enable_raw_mode,
+        EnterAlternateScreen, LeaveAlternateScreen,
+    },
+    ExecutableCommand,
+};
+use ratatui::{
+    prelude::*,
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Paragraph, Wrap},
+    Terminal,
+};
+
+use crate::state::{
+    self, TaskStatus, load_order, load_task_meta, load_tmux_sessions,
+};
+
+const FAST_TICK: Duration = Duration::from_secs(2);
+
+// Rosé Pine Dawn palette.
+const TEXT: Color = Color::Rgb(0x57, 0x52, 0x79);
+const SUBTLE: Color = Color::Rgb(0x79, 0x75, 0x93);
+const MUTED: Color = Color::Rgb(0x98, 0x93, 0xa5);
+const LOVE: Color = Color::Rgb(0xb4, 0x63, 0x7a);
+const GOLD: Color = Color::Rgb(0xea, 0x9d, 0x34);
+const PINE: Color = Color::Rgb(0x28, 0x69, 0x83);
+const FOAM: Color = Color::Rgb(0x56, 0x94, 0x9f);
+const IRIS: Color = Color::Rgb(0x90, 0x7a, 0xa9);
+const HL_LOW: Color = Color::Rgb(0xf4, 0xed, 0xe8);
+
+// Layout constants.
+const LIST_WIDTH: u16 = 36;
+const TAB_BAR_HEIGHT: u16 = 2; // tabs row + divider
+const LOG_HEIGHT_RATIO: u16 = 35; // percent of right column
+const HELP_OVERLAY_WIDTH: u16 = 60;
+const HELP_OVERLAY_HEIGHT: u16 = 22;
+
+// State.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    List,
+    Details,
+    Log,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Overview,
+    Prs,
+    Linear,
+    Panes,
+}
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Overview => "Overview",
+            Tab::Prs => "PRs",
+            Tab::Linear => "Linear",
+            Tab::Panes => "Panes",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Tab::Overview => Tab::Prs,
+            Tab::Prs => Tab::Linear,
+            Tab::Linear => Tab::Panes,
+            Tab::Panes => Tab::Overview,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Tab::Overview => Tab::Panes,
+            Tab::Prs => Tab::Overview,
+            Tab::Linear => Tab::Prs,
+            Tab::Panes => Tab::Linear,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TmuxPaneInfo {
+    pub id: String,
+    pub session: String,
+    pub command: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskView {
+    pub name: String,
+    pub meta: state::TaskMeta,
+    pub status: TaskStatus,
+    pub prs: Vec<state::PrData>,
+    pub panes: Vec<TmuxPaneInfo>,
+    /// Stub Linear data — slice 4b replaces this with real cache.
+    pub linear: Vec<LinearStub>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinearStub {
+    pub key: String,
+    pub title: String,
+    pub state: String,
+    pub assignee: Option<String>,
+    pub depth: u8,
+}
+
+pub struct LogPane {
+    pub run_id: Option<String>,
+    pub lines: Vec<String>,
+    /// Visual-row offset from top (after wrap).
+    pub scroll: usize,
+    /// True when scroll is at the bottom; new lines auto-scroll to keep
+    /// it pinned. Toggles to false when the user scrolls up.
+    pub follow_bottom: bool,
+    pub last_len: u64,
+    pub finished: bool,
+}
+
+impl Default for LogPane {
+    fn default() -> Self {
+        Self {
+            run_id: None,
+            lines: Vec::new(),
+            scroll: 0,
+            follow_bottom: true,
+            last_len: 0,
+            finished: false,
+        }
+    }
+}
+
+pub struct App {
+    pub tasks: Vec<TaskView>,
+    pub selected: usize,
+    pub focus: Pane,
+    pub detail_tab: Tab,
+    /// Pane selected within the Panes tab.
+    pub panes_selected: usize,
+    pub log: LogPane,
+    pub show_help: bool,
+    pub daemon_alive: bool,
+    pub last_fast: Instant,
+    pub should_quit: bool,
+    pub message_input: Option<String>,
+    pub read_runs: HashSet<String>,
+    pub last_run_count: usize,
+    /// Skip live IO during tests.
+    pub readonly: bool,
+}
+
+impl App {
+    pub fn new() -> Self {
+        let tasks = Self::load_tasks();
+        let last_run_count = crate::runs::list_runs(100).len();
+        let daemon_alive = crate::cache::is_daemon_alive();
+
+        let mut app = Self {
+            tasks,
+            selected: 0,
+            focus: Pane::List,
+            detail_tab: Tab::Overview,
+            panes_selected: 0,
+            log: LogPane::default(),
+            show_help: false,
+            daemon_alive,
+            last_fast: Instant::now(),
+            should_quit: false,
+            message_input: None,
+            read_runs: HashSet::new(),
+            last_run_count,
+            readonly: false,
+        };
+        app.open_latest_run();
+        app
+    }
+
+    fn load_tasks() -> Vec<TaskView> {
+        let order = load_order();
+        let status_cache = crate::cache::read_status();
+        let pr_cache = crate::cache::read_prs();
+        let daemon_alive = crate::cache::is_daemon_alive();
+
+        let live_sessions = if daemon_alive {
+            None
+        } else {
+            Some(load_tmux_sessions())
+        };
+
+        let store = crate::store::Store::default();
+
+        state::ordered_task_names(&order)
+            .into_iter()
+            .map(|name| {
+                let meta = load_task_meta(&name);
+                let status = if daemon_alive {
+                    status_cache
+                        .tasks
+                        .get(&name)
+                        .map(|ct| status_from_str(&ct.status))
+                        .unwrap_or(TaskStatus::Idle)
+                } else if let Some(sessions) = &live_sessions {
+                    state::derive_status(&meta, sessions, state::busy_stale_secs())
+                } else {
+                    TaskStatus::Idle
+                };
+
+                let prs: Vec<state::PrData> = meta
+                    .prs
+                    .iter()
+                    .map(|&num| {
+                        pr_cache
+                            .prs
+                            .get(&num)
+                            .map(|cp| cp.to_pr_data())
+                            .unwrap_or(state::PrData {
+                                number: num,
+                                ..Default::default()
+                            })
+                    })
+                    .collect();
+
+                let panes = panes_for_session(&meta.session);
+
+                // Linear stub: pull from v2 record if present, otherwise empty.
+                let linear = if store.is_authoritative() {
+                    store
+                        .load_record_by_slug(&name)
+                        .map(|r| stub_linear_from_record(&r))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                TaskView {
+                    name,
+                    meta,
+                    status,
+                    prs,
+                    panes,
+                    linear,
+                }
+            })
+            .collect()
+    }
+
+    fn open_latest_run(&mut self) {
+        if self.readonly {
+            return;
+        }
+        let runs = crate::runs::list_runs(50);
+        let run = runs
+            .iter()
+            .find(|r| !self.read_runs.contains(&r.id))
+            .or(runs.first())
+            .cloned();
+        if let Some(run) = run {
+            self.open_run(&run);
+        }
+    }
+
+    fn open_run(&mut self, run: &crate::runs::RunMeta) {
+        let content = crate::runs::read_output(&run.id);
+        let last_len = content.len() as u64;
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+        self.log = LogPane {
+            run_id: Some(run.id.clone()),
+            lines,
+            scroll: 0,
+            follow_bottom: true,
+            last_len,
+            finished: run.finished_at.is_some(),
+        };
+    }
+
+    fn refresh_log(&mut self) {
+        let Some(run_id) = self.log.run_id.clone() else {
+            return;
+        };
+        let cur_len = crate::runs::output_len(&run_id);
+        if cur_len == self.log.last_len {
+            return;
+        }
+        self.log.last_len = cur_len;
+        let content = crate::runs::read_output(&run_id);
+        let was_following = self.log.follow_bottom;
+        self.log.lines = content.lines().map(String::from).collect();
+        if was_following {
+            self.log.scroll = usize::MAX; // pin to bottom; render clamps.
+        }
+    }
+
+    fn refresh_status(&mut self) {
+        if self.readonly {
+            return;
+        }
+        let next_tasks = Self::load_tasks();
+        // Preserve selection by name when possible.
+        let prev_name = self
+            .tasks
+            .get(self.selected)
+            .map(|t| t.name.clone());
+        self.tasks = next_tasks;
+        if let Some(name) = prev_name {
+            self.selected = self
+                .tasks
+                .iter()
+                .position(|t| t.name == name)
+                .unwrap_or(0);
+        }
+        if self.selected >= self.tasks.len() {
+            self.selected = self.tasks.len().saturating_sub(1);
+        }
+        self.daemon_alive = crate::cache::is_daemon_alive();
+        // Selected pane index might now be out of bounds.
+        let pane_count = self
+            .tasks
+            .get(self.selected)
+            .map(|t| t.panes.len())
+            .unwrap_or(0);
+        if self.panes_selected >= pane_count {
+            self.panes_selected = pane_count.saturating_sub(1);
+        }
+    }
+
+    pub fn selected_task(&self) -> Option<&TaskView> {
+        self.tasks.get(self.selected)
+    }
+}
+
+fn status_from_str(s: &str) -> TaskStatus {
+    match s {
+        "ready" => TaskStatus::Ready,
+        "working" => TaskStatus::Working,
+        "input" => TaskStatus::Input,
+        "attached" => TaskStatus::Attached,
+        "paused" => TaskStatus::Paused,
+        "error" => TaskStatus::Error,
+        _ => TaskStatus::Idle,
+    }
+}
+
+/// List tmux panes that belong to a session. Returns empty if session
+/// doesn't exist or tmux isn't running.
+fn panes_for_session(session: &str) -> Vec<TmuxPaneInfo> {
+    if session.is_empty() {
+        return Vec::new();
+    }
+    // tmux's session_matches handles numeric prefixes.
+    let actual = match find_actual_session(session) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let output = Command::new("tmux")
+        .args([
+            "list-panes", "-t", &actual, "-F",
+            "#{pane_id}|#{session_name}|#{pane_current_command}|#{pane_active}",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok();
+    let Some(output) = output.filter(|o| o.status.success()) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '|');
+            let id = parts.next()?.to_string();
+            let session = parts.next()?.to_string();
+            let command = parts.next()?.to_string();
+            let active = parts.next()? == "1";
+            Some(TmuxPaneInfo {
+                id,
+                session,
+                command,
+                active,
+            })
+        })
+        .collect()
+}
+
+fn find_actual_session(expected: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|n| state::session_matches(n, expected))
+        .map(String::from)
+}
+
+fn stub_linear_from_record(record: &crate::store::TaskRecord) -> Vec<LinearStub> {
+    record
+        .links
+        .linear_issues
+        .iter()
+        .map(|li| LinearStub {
+            key: li.key.clone(),
+            title: format!("(stub: {} — fetched in Phase 4b)", li.key),
+            state: "—".into(),
+            assignee: None,
+            depth: 0,
+        })
+        .collect()
+}
+
+// Rendering.
+
+pub fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+
+    // If there are no tasks, render the empty layout.
+    let outer = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(LIST_WIDTH),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    render_list(frame, outer[0], app);
+
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(100 - LOG_HEIGHT_RATIO),
+            Constraint::Percentage(LOG_HEIGHT_RATIO),
+        ])
+        .split(outer[1]);
+
+    render_details(frame, right[0], app);
+    render_log(frame, right[1], app);
+
+    if app.show_help {
+        render_help_overlay(frame, area);
+    }
+}
+
+fn render_list(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header.
+    let header_style = if app.focus == Pane::List {
+        Style::default().fg(LOVE)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    lines.push(Line::styled(" tasks", header_style));
+    lines.push(Line::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(MUTED),
+    ));
+
+    if app.tasks.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            " no tasks · n to create",
+            Style::default().fg(SUBTLE),
+        ));
+    } else {
+        for (i, task) in app.tasks.iter().enumerate() {
+            let selected = i == app.selected;
+            let badge = status_str(task.status);
+            let badge_color = status_color(task.status);
+            let row_bg = if selected && app.focus == Pane::List {
+                Some(HL_LOW)
+            } else {
+                None
+            };
+
+            let pr_count = task.prs.len();
+            let linear_count = task.linear.len();
+
+            let mut counts = String::new();
+            if pr_count > 0 {
+                counts.push_str(&format!(" P{pr_count}"));
+            }
+            if linear_count > 0 {
+                counts.push_str(&format!(" L{linear_count}"));
+            }
+            let badge_text = format!(" {badge}");
+
+            let cursor = if selected { "▸ " } else { "  " };
+            // Width available for the name itself = total - cursor (2) -
+            // counts - badge - trailing space (1).
+            let reserved = 2 + counts.chars().count() + badge_text.chars().count() + 1;
+            let name_room = (area.width as usize).saturating_sub(reserved);
+            let name_str = truncate(&task.name, name_room);
+            let pad = name_room.saturating_sub(name_str.chars().count());
+
+            let mut spans = vec![
+                Span::styled(
+                    cursor,
+                    Style::default().fg(if selected { LOVE } else { MUTED }),
+                ),
+                Span::styled(name_str, Style::default().fg(TEXT)),
+                Span::raw(" ".repeat(pad)),
+            ];
+            if !counts.is_empty() {
+                spans.push(Span::styled(counts, Style::default().fg(SUBTLE)));
+            }
+            spans.push(Span::styled(
+                badge_text,
+                Style::default().fg(badge_color),
+            ));
+
+            let mut line = Line::from(spans);
+            if let Some(bg) = row_bg {
+                line = line.style(Style::default().bg(bg));
+            }
+            lines.push(line);
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_details(frame: &mut Frame, area: Rect, app: &App) {
+    if app.tasks.is_empty() {
+        let placeholder = Paragraph::new(vec![
+            Line::raw(""),
+            Line::styled(" select a task", Style::default().fg(SUBTLE)),
+        ]);
+        frame.render_widget(placeholder, area);
+        return;
+    }
+
+    // Tab bar at top.
+    let tabs = [Tab::Overview, Tab::Prs, Tab::Linear, Tab::Panes];
+    let mut tab_spans: Vec<Span> = Vec::new();
+    for (i, tab) in tabs.iter().enumerate() {
+        let style = if *tab == app.detail_tab {
+            if app.focus == Pane::Details {
+                Style::default().fg(LOVE)
+            } else {
+                Style::default().fg(TEXT)
+            }
+        } else {
+            Style::default().fg(SUBTLE)
+        };
+        tab_spans.push(Span::styled(format!(" {} ", tab.label()), style));
+        if i + 1 < tabs.len() {
+            tab_spans.push(Span::styled("·", Style::default().fg(MUTED)));
+        }
+    }
+    let tab_bar = Paragraph::new(Line::from(tab_spans));
+    let tab_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(tab_bar, tab_area);
+    let divider = Paragraph::new(Line::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(MUTED),
+    ));
+    let div_area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(divider, div_area);
+
+    let body_area = Rect {
+        x: area.x,
+        y: area.y + TAB_BAR_HEIGHT,
+        width: area.width,
+        height: area.height.saturating_sub(TAB_BAR_HEIGHT),
+    };
+
+    let task = match app.selected_task() {
+        Some(t) => t,
+        None => return,
+    };
+
+    match app.detail_tab {
+        Tab::Overview => render_tab_overview(frame, body_area, app, task),
+        Tab::Prs => render_tab_prs(frame, body_area, app, task),
+        Tab::Linear => render_tab_linear(frame, body_area, app, task),
+        Tab::Panes => render_tab_panes(frame, body_area, app, task),
+    }
+}
+
+fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView) {
+    let session_str = if task.meta.session.is_empty() {
+        "—".to_string()
+    } else {
+        task.meta.session.clone()
+    };
+    let worktree_str = if task.meta.worktree.is_empty() {
+        "—".to_string()
+    } else {
+        task.meta.worktree.clone()
+    };
+    let prs_str = if task.prs.is_empty() {
+        "—".to_string()
+    } else {
+        task.prs
+            .iter()
+            .map(|p| format!("#{}", p.number))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let linear_str = if task.linear.is_empty() {
+        "—".to_string()
+    } else {
+        task.linear
+            .iter()
+            .map(|l| l.key.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let panes_str = task.panes.len().to_string();
+
+    let mut lines = vec![
+        Line::raw(""),
+        kv_line(" title:    ", &task.name),
+        kv_line(" status:   ", status_str(task.status)),
+        kv_line(" session:  ", &session_str),
+        kv_line(" worktree: ", &worktree_str),
+        kv_line(" prs:      ", &prs_str),
+        kv_line(" linear:   ", &linear_str),
+        kv_line(" panes:    ", &panes_str),
+    ];
+    if task.meta.needs_input {
+        lines.push(kv_line(" attention:", "needs input"));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_tab_prs(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView) {
+    let mut lines = vec![Line::raw("")];
+    if task.prs.is_empty() {
+        lines.push(Line::styled(
+            " (no linked PRs)",
+            Style::default().fg(SUBTLE),
+        ));
+    } else {
+        for pr in &task.prs {
+            let title = if pr.title.is_empty() {
+                "(no title cached)".into()
+            } else {
+                pr.title.clone()
+            };
+            let ci = match pr.ci_pass {
+                Some(true) => Span::styled("✓ ci", Style::default().fg(PINE)),
+                Some(false) => Span::styled("✗ ci", Style::default().fg(LOVE)),
+                None => Span::styled("· ci", Style::default().fg(MUTED)),
+            };
+            let approval = if pr.approved {
+                Span::styled(" ✓ review", Style::default().fg(PINE))
+            } else {
+                Span::styled(" · review", Style::default().fg(MUTED))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" #{}", pr.number),
+                    Style::default().fg(IRIS),
+                ),
+                Span::raw("  "),
+                Span::styled(title, Style::default().fg(TEXT)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                ci,
+                approval,
+            ]));
+            lines.push(Line::raw(""));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_tab_linear(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView) {
+    let mut lines = vec![Line::raw("")];
+    if task.linear.is_empty() {
+        lines.push(Line::styled(
+            " (no linked Linear issues)",
+            Style::default().fg(SUBTLE),
+        ));
+        lines.push(Line::styled(
+            " add via `linear add ENG-123` (Phase 4b)",
+            Style::default().fg(MUTED),
+        ));
+    } else {
+        for (i, item) in task.linear.iter().enumerate() {
+            let glyph = if i == 0 { "*" } else { " ├" };
+            let indent = " ".repeat(item.depth as usize * 2);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{indent} {glyph} "),
+                    Style::default().fg(GOLD),
+                ),
+                Span::styled(
+                    format!("{}  ", item.key),
+                    Style::default().fg(IRIS),
+                ),
+                Span::styled(item.title.clone(), Style::default().fg(TEXT)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw(format!("{indent}    ")),
+                Span::styled(
+                    format!("{} ", item.state),
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled(
+                    item.assignee.clone().unwrap_or_else(|| "—".into()),
+                    Style::default().fg(SUBTLE),
+                ),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
+    let mut lines = vec![Line::raw("")];
+    if task.panes.is_empty() {
+        lines.push(Line::styled(
+            " (no live tmux panes — task not spawned)",
+            Style::default().fg(SUBTLE),
+        ));
+    } else {
+        for (i, pane) in task.panes.iter().enumerate() {
+            let selected = i == app.panes_selected;
+            let focused = app.focus == Pane::Details && app.detail_tab == Tab::Panes;
+            let marker = if pane.active { "●" } else { "·" };
+            let prefix = if selected && focused { "▸" } else { " " };
+            let style = if selected && focused {
+                Style::default().fg(LOVE).bg(HL_LOW)
+            } else if selected {
+                Style::default().fg(TEXT).bg(HL_LOW)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {prefix} {marker} "),
+                    Style::default().fg(if pane.active { PINE } else { MUTED }),
+                ),
+                Span::styled(
+                    format!("{}  {}", pane.id, pane.command),
+                    style,
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            " [ prev · ] next · \\ last · Enter attach",
+            Style::default().fg(MUTED),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_log(frame: &mut Frame, area: Rect, app: &App) {
+    let header_style = if app.focus == Pane::Log {
+        Style::default().fg(LOVE)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    let header_text = match &app.log.run_id {
+        Some(id) => format!(" log: {}{}", id, if app.log.finished { " ·done" } else { "" }),
+        None => " log: no activity".to_string(),
+    };
+    let header_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(header_text, header_style)),
+        header_area,
+    );
+    let div_area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(MUTED),
+        )),
+        div_area,
+    );
+
+    let body_area = Rect {
+        x: area.x,
+        y: area.y + 2,
+        width: area.width,
+        height: area.height.saturating_sub(2),
+    };
+
+    if app.log.lines.is_empty() {
+        let placeholder = Paragraph::new(Line::styled(
+            " (no activity)",
+            Style::default().fg(SUBTLE),
+        ));
+        frame.render_widget(placeholder, body_area);
+        return;
+    }
+
+    // Compute visual rows after wrap to clamp scroll for follow-bottom.
+    let total_visual_rows = total_wrapped_rows(&app.log.lines, body_area.width as usize);
+    let visible_rows = body_area.height as usize;
+    let max_scroll = total_visual_rows.saturating_sub(visible_rows);
+    let scroll = if app.log.follow_bottom {
+        max_scroll
+    } else {
+        app.log.scroll.min(max_scroll)
+    };
+
+    let log_lines: Vec<Line> = app
+        .log
+        .lines
+        .iter()
+        .map(|l| Line::styled(l.as_str(), Style::default().fg(SUBTLE)))
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(log_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll as u16, 0)),
+        body_area,
+    );
+}
+
+fn render_help_overlay(frame: &mut Frame, area: Rect) {
+    let w = HELP_OVERLAY_WIDTH.min(area.width.saturating_sub(4));
+    let h = HELP_OVERLAY_HEIGHT.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let overlay = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+
+    // Clear the overlay area first.
+    frame.render_widget(
+        ratatui::widgets::Clear,
+        overlay,
+    );
+
+    let lines = vec![
+        Line::styled(
+            " key bindings",
+            Style::default().fg(LOVE),
+        ),
+        Line::styled(
+            "─".repeat(w as usize),
+            Style::default().fg(MUTED),
+        ),
+        Line::styled(" Global", Style::default().fg(IRIS)),
+        kv_line("   q          ", "quit"),
+        kv_line("   Tab/S-Tab  ", "cycle pane focus"),
+        kv_line("   ?          ", "toggle this overlay"),
+        kv_line("   r          ", "refresh integrations"),
+        kv_line("   m          ", "message orchestrator"),
+        Line::raw(""),
+        Line::styled(" Task list", Style::default().fg(IRIS)),
+        kv_line("   j/k g/G    ", "move · top/bottom"),
+        kv_line("   J/K        ", "reorder open tasks"),
+        kv_line("   Enter      ", "attach to session"),
+        kv_line("   n s p R    ", "new · start · pause · Resume"),
+        kv_line("   M x        ", "Modify slug · close"),
+        kv_line("   o W        ", "open external · stranded"),
+        Line::raw(""),
+        Line::styled(" Details · Panes · Log", Style::default().fg(IRIS)),
+        kv_line("   h/l        ", "switch tab"),
+        kv_line("   [ ] \\\\      ", "prev / next / last pane"),
+        kv_line("   PgUp PgDn  ", "scroll log"),
+    ];
+
+    let text_area = Rect {
+        x: overlay.x + 1,
+        y: overlay.y + 1,
+        width: overlay.width.saturating_sub(2),
+        height: overlay.height.saturating_sub(2),
+    };
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        text_area,
+    );
+
+    // Border around overlay.
+    use ratatui::widgets::{Block, Borders};
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(LOVE));
+    frame.render_widget(block, overlay);
+}
+
+fn kv_line<'a>(key: &'a str, value: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(key, Style::default().fg(MUTED)),
+        Span::styled(value, Style::default().fg(TEXT)),
+    ])
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i + 1 >= max {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn status_str(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Ready => "ready",
+        TaskStatus::Working => "working",
+        TaskStatus::Input => "input",
+        TaskStatus::Idle => "idle",
+        TaskStatus::Paused => "paused",
+        TaskStatus::Attached => "attach",
+        TaskStatus::Error => "error",
+    }
+}
+
+fn status_color(status: TaskStatus) -> Color {
+    match status {
+        TaskStatus::Ready => PINE,
+        TaskStatus::Working => FOAM,
+        TaskStatus::Input => GOLD,
+        TaskStatus::Paused => IRIS,
+        TaskStatus::Idle | TaskStatus::Attached => MUTED,
+        TaskStatus::Error => LOVE,
+    }
+}
+
+/// Total visual rows a list of lines occupies after word wrap into a
+/// fixed-width column. Rough but sufficient for scroll clamping.
+fn total_wrapped_rows(lines: &[String], width: usize) -> usize {
+    if width == 0 {
+        return lines.len();
+    }
+    lines
+        .iter()
+        .map(|l| {
+            if l.is_empty() {
+                1
+            } else {
+                let n = l.chars().count();
+                (n + width - 1) / width
+            }
+        })
+        .sum()
+}
+
+// Key handling.
+
+pub fn handle_key(app: &mut App, key: KeyEvent) {
+    if app.show_help {
+        // Any key dismisses the help overlay.
+        app.show_help = false;
+        return;
+    }
+    if app.message_input.is_some() {
+        handle_message_input_key(app, key);
+        return;
+    }
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+            app.should_quit = true;
+        }
+        (KeyCode::Char('?'), _) => {
+            app.show_help = true;
+        }
+        (KeyCode::Tab, _) => {
+            app.focus = match app.focus {
+                Pane::List => Pane::Details,
+                Pane::Details => Pane::Log,
+                Pane::Log => Pane::List,
+            };
+        }
+        (KeyCode::BackTab, _) => {
+            app.focus = match app.focus {
+                Pane::List => Pane::Log,
+                Pane::Details => Pane::List,
+                Pane::Log => Pane::Details,
+            };
+        }
+        (KeyCode::Char('m'), _) => {
+            app.message_input = Some(String::new());
+        }
+        _ => match app.focus {
+            Pane::List => handle_list_key(app, key),
+            Pane::Details => handle_details_key(app, key),
+            Pane::Log => handle_log_key(app, key),
+        },
+    }
+}
+
+fn handle_list_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if app.selected + 1 < app.tasks.len() {
+                app.selected += 1;
+                app.panes_selected = 0;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.selected = app.selected.saturating_sub(1);
+            app.panes_selected = 0;
+        }
+        KeyCode::Char('g') => app.selected = 0,
+        KeyCode::Char('G') => {
+            app.selected = app.tasks.len().saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            // Attach to selected task's tmux session.
+            if let Some(task) = app.selected_task() {
+                if !task.meta.session.is_empty() {
+                    attach_session(&task.meta.session);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_details_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('h') | KeyCode::Left => {
+            app.detail_tab = app.detail_tab.prev();
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            app.detail_tab = app.detail_tab.next();
+        }
+        KeyCode::Char('[') => {
+            if app.detail_tab == Tab::Panes && app.panes_selected > 0 {
+                app.panes_selected -= 1;
+            }
+        }
+        KeyCode::Char(']') => {
+            if app.detail_tab == Tab::Panes {
+                let n = app
+                    .selected_task()
+                    .map(|t| t.panes.len())
+                    .unwrap_or(0);
+                if app.panes_selected + 1 < n {
+                    app.panes_selected += 1;
+                }
+            }
+        }
+        KeyCode::Char('\\') => {
+            // Last pane in the list. Phase 5 wires "previous selected"
+            // properly; for now this jumps to the active pane.
+            if app.detail_tab == Tab::Panes {
+                if let Some(task) = app.selected_task() {
+                    if let Some(idx) = task.panes.iter().position(|p| p.active) {
+                        app.panes_selected = idx;
+                    }
+                }
+            }
+        }
+        KeyCode::Enter => {
+            // Attach to the selected pane.
+            if app.detail_tab == Tab::Panes {
+                if let Some(task) = app.selected_task() {
+                    if let Some(pane) = task.panes.get(app.panes_selected) {
+                        attach_pane(&pane.session, &pane.id);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_log_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.log.follow_bottom = false;
+            app.log.scroll = app.log.scroll.saturating_add(1);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.log.follow_bottom = false;
+            app.log.scroll = app.log.scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown => {
+            app.log.follow_bottom = false;
+            app.log.scroll = app.log.scroll.saturating_add(10);
+        }
+        KeyCode::PageUp => {
+            app.log.follow_bottom = false;
+            app.log.scroll = app.log.scroll.saturating_sub(10);
+        }
+        KeyCode::Char('g') => {
+            app.log.follow_bottom = false;
+            app.log.scroll = 0;
+        }
+        KeyCode::Char('G') => {
+            app.log.follow_bottom = true;
+        }
+        _ => {}
+    }
+}
+
+fn handle_message_input_key(app: &mut App, key: KeyEvent) {
+    let Some(buf) = app.message_input.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.message_input = None;
+        }
+        KeyCode::Enter => {
+            let msg = std::mem::take(buf);
+            app.message_input = None;
+            if !msg.trim().is_empty() && !app.readonly {
+                send_message(&msg);
+            }
+        }
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char(c) => {
+            buf.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn attach_session(session: &str) {
+    let actual = match find_actual_session(session) {
+        Some(s) => s,
+        None => return,
+    };
+    let action = if std::env::var("TMUX").is_ok() {
+        "switch-client"
+    } else {
+        "attach-session"
+    };
+    let _ = Command::new("tmux").args([action, "-t", &actual]).status();
+}
+
+fn attach_pane(session: &str, pane_id: &str) {
+    let actual = match find_actual_session(session) {
+        Some(s) => s,
+        None => return,
+    };
+    // Switch to the session, then select the target pane.
+    let action = if std::env::var("TMUX").is_ok() {
+        "switch-client"
+    } else {
+        "attach-session"
+    };
+    let _ = Command::new("tmux").args([action, "-t", &actual]).status();
+    let _ = Command::new("tmux")
+        .args(["select-pane", "-t", pane_id])
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn send_message(msg: &str) {
+    let dir = state::tasks_dir().join(".inbox");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = dir.join(format!("{nanos}-{}.msg", std::process::id()));
+    let _ = std::fs::write(path, msg);
+}
+
+// Run loop.
+
+pub fn run() -> io::Result<()> {
+    enable_raw_mode()?;
+    stdout().execute(EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut app = App::new();
+
+    let res: io::Result<()> = (|| {
+        while !app.should_quit {
+            terminal.draw(|f| render(f, &app))?;
+
+            if event::poll(Duration::from_millis(200))? {
+                if let Event::Key(key) = event::read()? {
+                    handle_key(&mut app, key);
+                }
+            }
+
+            if app.last_fast.elapsed() >= FAST_TICK {
+                app.last_fast = Instant::now();
+                app.refresh_status();
+                app.refresh_log();
+            }
+        }
+        Ok(())
+    })();
+
+    disable_raw_mode()?;
+    stdout().execute(LeaveAlternateScreen)?;
+    res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn test_tasks() -> Vec<TaskView> {
+        vec![
+            TaskView {
+                name: "infra-triage".into(),
+                meta: state::TaskMeta {
+                    session: "task-infra-triage".into(),
+                    worktree: "/Users/a/column/task-infra-triage".into(),
+                    prs: vec![25163],
+                    ..Default::default()
+                },
+                status: TaskStatus::Working,
+                prs: vec![state::PrData {
+                    number: 25163,
+                    title: "Fix bene-matching boundary".into(),
+                    ci_pass: Some(true),
+                    approved: true,
+                    ..Default::default()
+                }],
+                panes: vec![
+                    TmuxPaneInfo {
+                        id: "%1".into(),
+                        session: "task-infra-triage".into(),
+                        command: "claude".into(),
+                        active: true,
+                    },
+                    TmuxPaneInfo {
+                        id: "%2".into(),
+                        session: "task-infra-triage".into(),
+                        command: "jj".into(),
+                        active: false,
+                    },
+                ],
+                linear: vec![LinearStub {
+                    key: "ENG-29151".into(),
+                    title: "(stub: ENG-29151)".into(),
+                    state: "—".into(),
+                    assignee: None,
+                    depth: 0,
+                }],
+            },
+            TaskView {
+                name: "ach-sanitize".into(),
+                meta: state::TaskMeta {
+                    session: "task-ach-sanitize".into(),
+                    paused: true,
+                    ..Default::default()
+                },
+                status: TaskStatus::Paused,
+                prs: vec![],
+                panes: vec![],
+                linear: vec![],
+            },
+            TaskView {
+                name: "fresh-task".into(),
+                meta: state::TaskMeta::default(),
+                status: TaskStatus::Idle,
+                prs: vec![],
+                panes: vec![],
+                linear: vec![],
+            },
+        ]
+    }
+
+    fn test_app() -> App {
+        App {
+            tasks: test_tasks(),
+            selected: 0,
+            focus: Pane::List,
+            detail_tab: Tab::Overview,
+            panes_selected: 0,
+            log: LogPane {
+                run_id: Some("1234-test".into()),
+                lines: vec![
+                    "[scan] starting".into(),
+                    "checking 3 tasks".into(),
+                    "".into(),
+                    "infra-triage: working".into(),
+                ],
+                scroll: 0,
+                follow_bottom: true,
+                last_len: 100,
+                finished: false,
+            },
+            show_help: false,
+            daemon_alive: true,
+            last_fast: Instant::now(),
+            should_quit: false,
+            message_input: None,
+            read_runs: HashSet::new(),
+            last_run_count: 0,
+            readonly: true,
+        }
+    }
+
+    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn snapshot_three_pane_base() {
+        let app = test_app();
+        let s = render_to_string(&app, 100, 25);
+        // Left pane: tasks list.
+        assert!(s.contains("tasks"));
+        assert!(s.contains("infra-triage"));
+        assert!(s.contains("ach-sanitize"));
+        // Right top: tab bar with Overview selected.
+        assert!(s.contains("Overview"));
+        assert!(s.contains("PRs"));
+        assert!(s.contains("Linear"));
+        assert!(s.contains("Panes"));
+        // Right bottom: log header.
+        assert!(s.contains("log:"));
+        assert!(s.contains("infra-triage: working"));
+    }
+
+    #[test]
+    fn snapshot_three_pane_list_focus() {
+        let mut app = test_app();
+        app.focus = Pane::List;
+        app.selected = 0;
+        let s = render_to_string(&app, 100, 25);
+        // Selected row has the focus marker.
+        assert!(s.contains("▸ infra-triage"));
+    }
+
+    #[test]
+    fn snapshot_three_pane_details_focus() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        let s = render_to_string(&app, 100, 25);
+        // Tab "Overview" should still be the active tab.
+        assert!(s.contains("Overview"));
+    }
+
+    #[test]
+    fn snapshot_three_pane_log_focus() {
+        let mut app = test_app();
+        app.focus = Pane::Log;
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("log:"));
+    }
+
+    #[test]
+    fn snapshot_detail_tab_overview() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        app.detail_tab = Tab::Overview;
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("infra-triage"));
+        assert!(s.contains("session:"));
+        assert!(s.contains("worktree:"));
+        assert!(s.contains("/Users/a/column/task-infra-triage"));
+    }
+
+    #[test]
+    fn snapshot_detail_tab_prs() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        app.detail_tab = Tab::Prs;
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("#25163"));
+        assert!(s.contains("Fix bene-matching boundary"));
+        assert!(s.contains("ci"));
+    }
+
+    #[test]
+    fn snapshot_detail_tab_linear() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        app.detail_tab = Tab::Linear;
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("ENG-29151"));
+    }
+
+    #[test]
+    fn snapshot_detail_tab_panes() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        app.detail_tab = Tab::Panes;
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("%1"));
+        assert!(s.contains("%2"));
+        assert!(s.contains("claude"));
+        assert!(s.contains("[ prev"));
+    }
+
+    #[test]
+    fn snapshot_detail_tab_panes_selection() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        app.detail_tab = Tab::Panes;
+        app.panes_selected = 1;
+        let s = render_to_string(&app, 100, 25);
+        // Second pane (jj) is now selected
+        assert!(s.contains("jj"));
+    }
+
+    #[test]
+    fn snapshot_log_wrapped_lines() {
+        let mut app = test_app();
+        app.focus = Pane::Log;
+        app.log.lines = vec![
+            "this is a really long log line that absolutely will not fit in 60 columns of width and must wrap onto multiple visual rows when rendered".into(),
+            "".into(),
+            "[scan] short line".into(),
+        ];
+        // Use 60 cols of total width — log pane gets ~60 of right column.
+        let s = render_to_string(&app, 100, 25);
+        // Should contain the start of the long line and some tail content
+        // (if it didn't wrap, the tail would be off-screen).
+        assert!(s.contains("this is a really long"));
+        assert!(s.contains("[scan] short line"));
+    }
+
+    #[test]
+    fn snapshot_log_scroll_preserved() {
+        let mut app = test_app();
+        app.focus = Pane::Log;
+        app.log.lines = (0..30).map(|i| format!("line {i}")).collect();
+        app.log.scroll = 5;
+        app.log.follow_bottom = false;
+
+        let s = render_to_string(&app, 100, 25);
+        // line 5 should be near the top of the log pane
+        assert!(s.contains("line 5"));
+        // line 0 should be scrolled off
+        assert!(!s.lines().any(|l| l.contains(" line 0 ")));
+    }
+
+    #[test]
+    fn snapshot_empty_state_no_tasks() {
+        let mut app = test_app();
+        app.tasks.clear();
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("no tasks"));
+        assert!(s.contains("n to create"));
+        assert!(s.contains("select a task"));
+    }
+
+    #[test]
+    fn snapshot_key_help_overlay() {
+        let mut app = test_app();
+        app.show_help = true;
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("key bindings"));
+        assert!(s.contains("Tab/S-Tab"));
+        assert!(s.contains("cycle pane focus"));
+        assert!(s.contains("Resume"));
+    }
+
+    #[test]
+    fn snapshot_linear_anchor_subissues() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        app.detail_tab = Tab::Linear;
+        let task = &mut app.tasks[0];
+        task.linear = vec![
+            LinearStub {
+                key: "ENG-29151".into(),
+                title: "Fix bene-matching boundary".into(),
+                state: "In Progress".into(),
+                assignee: Some("@ashley".into()),
+                depth: 0,
+            },
+            LinearStub {
+                key: "ENG-30210".into(),
+                title: "Tighten name normalize".into(),
+                state: "Backlog".into(),
+                assignee: None,
+                depth: 1,
+            },
+            LinearStub {
+                key: "ENG-30444".into(),
+                title: "Investigate ALERT".into(),
+                state: "Done".into(),
+                assignee: Some("@ashley".into()),
+                depth: 1,
+            },
+        ];
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("ENG-29151"));
+        assert!(s.contains("ENG-30210"));
+        assert!(s.contains("ENG-30444"));
+        assert!(s.contains("In Progress"));
+        assert!(s.contains("Done"));
+    }
+
+    #[test]
+    fn snapshot_linear_empty() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        app.detail_tab = Tab::Linear;
+        app.tasks[0].linear.clear();
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("(no linked Linear issues)"));
+    }
+
+    #[test]
+    fn tab_cycling_next_prev() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        assert_eq!(app.detail_tab, Tab::Overview);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.detail_tab, Tab::Prs);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.detail_tab, Tab::Linear);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.detail_tab, Tab::Panes);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.detail_tab, Tab::Overview); // wrap
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(app.detail_tab, Tab::Panes); // wrap back
+    }
+
+    #[test]
+    fn pane_focus_cycles() {
+        let mut app = test_app();
+        assert_eq!(app.focus, Pane::List);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Pane::Details);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Pane::Log);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Pane::List);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn list_navigation_j_k_g_G() {
+        let mut app = test_app();
+        assert_eq!(app.selected, 0);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.selected, 1);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')));
+        assert_eq!(app.selected, 2);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(app.selected, 0);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('k')));
+        // Already at top; saturating_sub keeps it at 0
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn pane_switching_brackets() {
+        let mut app = test_app();
+        app.focus = Pane::Details;
+        app.detail_tab = Tab::Panes;
+        app.panes_selected = 0;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')));
+        assert_eq!(app.panes_selected, 1);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')));
+        // Only 2 panes; should clamp.
+        assert_eq!(app.panes_selected, 1);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('[')));
+        assert_eq!(app.panes_selected, 0);
+    }
+
+    #[test]
+    fn log_scroll_disables_follow() {
+        let mut app = test_app();
+        app.focus = Pane::Log;
+        app.log.follow_bottom = true;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('k')));
+        assert!(!app.log.follow_bottom);
+        // G re-enables follow
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')));
+        assert!(app.log.follow_bottom);
+    }
+
+    #[test]
+    fn help_overlay_dismisses_on_any_key() {
+        let mut app = test_app();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('?')));
+        assert!(app.show_help);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn message_input_captures_text() {
+        let mut app = test_app();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('m')));
+        assert!(app.message_input.is_some());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('i')));
+        assert_eq!(app.message_input.as_deref(), Some("hi"));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.message_input.is_none());
+    }
+
+    #[test]
+    fn total_wrapped_rows_handles_long_and_empty() {
+        let lines = vec![
+            "short".to_string(),
+            "".to_string(),
+            "x".repeat(100),
+        ];
+        // Width 50: "short"=1, ""=1, 100/50=2  -> total 4
+        assert_eq!(total_wrapped_rows(&lines, 50), 4);
+        // Width 0 falls back to line count
+        assert_eq!(total_wrapped_rows(&lines, 0), 3);
+    }
+
+    #[test]
+    fn truncate_handles_short_and_long() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("a longer string", 8), "a longe…");
+    }
+}
