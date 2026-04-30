@@ -223,6 +223,7 @@ impl App {
     fn load_tasks() -> Vec<TaskView> {
         let status_cache = crate::cache::read_status();
         let pr_cache = crate::cache::read_prs();
+        let linear_cache = crate::cache::read_linear();
         let daemon_alive = crate::cache::is_daemon_alive();
 
         let live_sessions = if daemon_alive {
@@ -273,7 +274,7 @@ impl App {
                 };
                 let linear = record
                     .as_ref()
-                    .map(|r| stub_linear_from_record(r))
+                    .map(|r| linear_from_record(r, &linear_cache))
                     .unwrap_or_default();
                 let id = record.as_ref().map(|r| r.id);
                 let drift = record.as_ref().map(|r| r.drift.any()).unwrap_or(false);
@@ -443,23 +444,46 @@ fn find_actual_session(expected: &str) -> Option<String> {
         .map(String::from)
 }
 
-fn stub_linear_from_record(record: &crate::store::TaskRecord) -> Vec<LinearStub> {
+/// Build LinearStub list for a task. When the cache has fresh data
+/// for a key, the stub gets the real title/state/assignee. Otherwise
+/// the title is empty and state shows the link provenance, so the
+/// TUI can render keys immediately while the daemon backfills.
+fn linear_from_record(
+    record: &crate::store::TaskRecord,
+    cache: &crate::cache::LinearCache,
+) -> Vec<LinearStub> {
     record
         .links
         .linear_issues
         .iter()
-        .map(|li| LinearStub {
-            key: li.key.clone(),
-            // No fake titles. Phase 4b populates these from the API.
-            title: String::new(),
-            state: match li.source {
-                crate::store::LinkSource::Manual => "manual".into(),
-                crate::store::LinkSource::BranchDiscovery => "branch".into(),
-                crate::store::LinkSource::MarkdownScan => "scan".into(),
-                crate::store::LinkSource::Migration => "migration".into(),
-            },
-            assignee: None,
-            depth: 0,
+        .map(|li| {
+            if let Some(cached) = cache.issues.get(&li.key) {
+                LinearStub {
+                    key: cached.identifier.clone(),
+                    title: cached.title.clone(),
+                    state: cached.state.clone(),
+                    assignee: if cached.assignee.is_empty() {
+                        None
+                    } else {
+                        Some(cached.assignee.clone())
+                    },
+                    depth: 0,
+                }
+            } else {
+                let provenance = match li.source {
+                    crate::store::LinkSource::Manual => "manual",
+                    crate::store::LinkSource::BranchDiscovery => "branch",
+                    crate::store::LinkSource::MarkdownScan => "scan",
+                    crate::store::LinkSource::Migration => "migration",
+                };
+                LinearStub {
+                    key: li.key.clone(),
+                    title: String::new(),
+                    state: format!("{provenance}, loading…"),
+                    assignee: None,
+                    depth: 0,
+                }
+            }
         })
         .collect()
 }
@@ -798,27 +822,37 @@ fn render_tab_linear(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView)
             Style::default().fg(MUTED),
         ));
     } else {
-        // Phase 3 contract: keys + source only. Phase 4b will replace
-        // the source label with real Linear state + title + sub-issue
-        // hierarchy. Until then, no fake titles or hierarchy glyphs.
         for item in &task.linear {
-            lines.push(Line::from(vec![
+            // Bullet + key (always).
+            let mut line = vec![
                 Span::styled(" • ", Style::default().fg(GOLD)),
                 Span::styled(
                     format!("{}  ", item.key),
                     Style::default().fg(IRIS),
                 ),
+            ];
+            if !item.title.is_empty() {
+                line.push(Span::styled(item.title.clone(), Style::default().fg(TEXT)));
+            }
+            lines.push(Line::from(line));
+
+            // Second row: state · assignee, indented.
+            let state_color = linear_state_color(&item.state);
+            let mut second = vec![
+                Span::raw("    "),
                 Span::styled(
-                    format!("({})", item.state),
-                    Style::default().fg(MUTED),
+                    if item.state.is_empty() { "—" } else { item.state.as_str() }.to_string(),
+                    Style::default().fg(state_color),
                 ),
-            ]));
+            ];
+            if let Some(a) = &item.assignee {
+                second.push(Span::styled(
+                    format!("  ·  {a}"),
+                    Style::default().fg(SUBTLE),
+                ));
+            }
+            lines.push(Line::from(second));
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            " title · state · assignee land in Phase 4b (Linear API)",
-            Style::default().fg(MUTED),
-        ));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -1022,6 +1056,25 @@ fn status_str(status: TaskStatus) -> &'static str {
         TaskStatus::Paused => "paused",
         TaskStatus::Attached => "attach",
         TaskStatus::Error => "error",
+    }
+}
+
+/// Color a Linear workflow state name. Falls back to `MUTED` for
+/// unknowns (including the loading-stub `manual, loading…`).
+fn linear_state_color(state: &str) -> Color {
+    let lower = state.to_lowercase();
+    if lower.contains("progress") {
+        FOAM
+    } else if lower.contains("done") || lower.contains("complete") {
+        PINE
+    } else if lower.contains("review") {
+        GOLD
+    } else if lower.contains("cancel") {
+        LOVE
+    } else if lower.contains("backlog") || lower.contains("todo") {
+        IRIS
+    } else {
+        MUTED
     }
 }
 

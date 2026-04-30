@@ -35,6 +35,30 @@ pub struct StatusCache {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachedLinear {
+    pub identifier: String,
+    pub title: String,
+    /// Workflow state name (e.g. "In Progress", "Done").
+    pub state: String,
+    /// State category: `backlog | unstarted | started | completed | canceled | triage`.
+    pub state_kind: String,
+    pub assignee: String,
+    pub fetched_at: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LinearCache {
+    pub generated_at: u64,
+    /// Keyed by issue identifier (e.g. "ENG-29535").
+    pub issues: HashMap<String, CachedLinear>,
+    /// True when the most recent refresh failed (e.g. no API key,
+    /// network error). The cache content is retained — TUI can render
+    /// last-known data with a "stale/disconnected" badge.
+    #[serde(default)]
+    pub disconnected: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CachedPr {
     pub number: u32,
     pub title: String,
@@ -70,6 +94,47 @@ pub fn read_prs() -> PrCache {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+pub fn read_linear() -> LinearCache {
+    let path = cache_dir().join("linear.json");
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_linear(cache: &LinearCache) {
+    let dir = cache_dir();
+    fs::create_dir_all(&dir).ok();
+    if let Ok(json) = serde_json::to_string_pretty(cache) {
+        state::atomic_write(&dir.join("linear.json"), &json);
+    }
+}
+
+impl CachedLinear {
+    pub fn from_issue(issue: &crate::linear::LinearIssue) -> Self {
+        Self {
+            identifier: issue.identifier.clone(),
+            title: issue.title.clone(),
+            state: issue
+                .state
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_default(),
+            state_kind: issue
+                .state
+                .as_ref()
+                .map(|s| s.kind.clone())
+                .unwrap_or_default(),
+            assignee: issue
+                .assignee
+                .as_ref()
+                .map(|a| a.display_name.clone())
+                .unwrap_or_default(),
+            fetched_at: now_epoch(),
+        }
+    }
 }
 
 pub fn read_lease() -> Lease {

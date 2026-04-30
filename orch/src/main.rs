@@ -62,6 +62,7 @@
 
 mod cache;
 mod gh;
+mod linear;
 mod runs;
 mod state;
 mod store;
@@ -1006,6 +1007,88 @@ fn spawn_status_loop() {
     });
 }
 
+/// Background thread: refreshes Linear issue data every 2 min.
+/// Writes `.orch/cache/linear.json`. Disconnected (no key, network
+/// failure) is cached as a flag so the TUI can show it without
+/// retrying every render.
+fn spawn_linear_loop() {
+    use std::thread;
+    thread::spawn(|| {
+        loop {
+            let api_key = match linear::api_key_from_env() {
+                Some(k) => k,
+                None => {
+                    let mut cache = cache::read_linear();
+                    cache.disconnected = true;
+                    cache.generated_at = cache::now_epoch();
+                    cache::write_linear(&cache);
+                    std::thread::sleep(Duration::from_secs(120));
+                    continue;
+                }
+            };
+
+            // Collect every distinct linear key across open tasks.
+            let store = store::Store::default();
+            let mut keys: Vec<String> = Vec::new();
+            if store.is_authoritative() {
+                for record in store.load_open_records() {
+                    for li in &record.links.linear_issues {
+                        if !keys.contains(&li.key) {
+                            keys.push(li.key.clone());
+                        }
+                    }
+                }
+            }
+
+            if keys.is_empty() {
+                cache::write_linear(&cache::LinearCache {
+                    generated_at: cache::now_epoch(),
+                    issues: std::collections::HashMap::new(),
+                    disconnected: false,
+                });
+                std::thread::sleep(Duration::from_secs(120));
+                continue;
+            }
+
+            // Per-issue fetches: tolerate not-found / individual errors
+            // by skipping the key, only mark disconnected on persistent
+            // failures (auth, network). One issue's 404 doesn't poison
+            // the whole cache.
+            let mut cached_issues = std::collections::HashMap::new();
+            let mut hard_failures = 0u32;
+            for key in &keys {
+                match linear::fetch_issue(&api_key, key) {
+                    Ok(Some(issue)) => {
+                        cached_issues.insert(
+                            key.clone(),
+                            cache::CachedLinear::from_issue(&issue),
+                        );
+                    }
+                    Ok(None) => {
+                        // Not found — skip silently; the link probably
+                        // points at a deleted or misspelled key.
+                    }
+                    Err(e) => {
+                        hard_failures += 1;
+                        if hard_failures <= 1 {
+                            eprintln!("[orch] linear fetch {key} failed: {e}");
+                        }
+                    }
+                }
+            }
+            let disconnected = hard_failures > 0
+                && cached_issues.is_empty();
+            cache::write_linear(&cache::LinearCache {
+                generated_at: cache::now_epoch(),
+                issues: cached_issues,
+                disconnected,
+            });
+
+            std::thread::sleep(Duration::from_secs(120));
+        }
+    });
+}
+
 /// Background thread: reconciles PRs and fetches PR data every 30s.
 fn spawn_pr_loop() {
     use std::thread;
@@ -1073,6 +1156,7 @@ fn cmd_daemon() {
     // Start background cache loops
     spawn_status_loop();
     spawn_pr_loop();
+    spawn_linear_loop();
 
     eprintln!("[orch] daemon started, watching {}", dir.display());
 
