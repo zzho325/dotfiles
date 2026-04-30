@@ -454,7 +454,9 @@ impl Store {
         fsync_path(&registry_path)
             .map_err(|e| format!("fsync registry: {e}"))?;
 
-        // Step 4: fsync the tmp dir.
+        // Step 4: fsync the tasks/ subdir + the tmp root dir.
+        fsync_path(&tmp_tasks)
+            .map_err(|e| format!("fsync tmp tasks dir: {e}"))?;
         fsync_path(&tmp_root)
             .map_err(|e| format!("fsync tmp dir: {e}"))?;
 

@@ -398,14 +398,42 @@ pub fn ordered_task_names(order: &[String]) -> Vec<String> {
     result
 }
 
+/// Enumerate open task slugs in their canonical order. When the v2
+/// store is authoritative (`store.version=v2`), this comes from
+/// `Registry.open_order` — the durable identity-of-record. Otherwise
+/// falls back to legacy `order.json` + `~/tasks/*.md` discovery.
+///
+/// This is the single source of truth for "which tasks does the TUI
+/// show, in what order"; callers should prefer it over
+/// `ordered_task_names` so the v2 cutover affects everything at once.
+pub fn ordered_open_slugs() -> Vec<String> {
+    let store = crate::store::Store::default();
+    if store.is_authoritative() {
+        if let Some(registry) = store.load_registry() {
+            let mut slugs = Vec::new();
+            for id in &registry.open_order {
+                if let Some(r) = store.load_record(*id) {
+                    if r.desired_state != crate::store::DesiredState::Closed {
+                        slugs.push(r.slug);
+                    }
+                }
+            }
+            return slugs;
+        }
+    }
+    // Legacy fallback.
+    let order = load_order();
+    ordered_task_names(&order)
+}
+
 pub fn load_tasks(
-    order: &[String],
+    _order: &[String],
     sessions: &HashMap<String, TmuxSession>,
     busy_stale_secs: u64,
 ) -> Vec<Task> {
-    let ordered = ordered_task_names(order);
-
-    ordered
+    // _order kept in signature for legacy callers; v2-aware ordering
+    // is now centralized in `ordered_open_slugs`.
+    ordered_open_slugs()
         .into_iter()
         .map(|name| {
             let meta = load_task_meta(&name);
@@ -423,6 +451,13 @@ pub fn load_tasks(
 /// Flip `paused=true` for any task whose recorded tmux session is
 /// no longer alive (e.g. after a laptop restart). Tasks that never
 /// had a session recorded stay as-is (genuinely unspawned → Idle).
+///
+/// **Deprecated** — this mutates persisted lifecycle from runtime
+/// observation, breaking the "persisted intent / observed runtime"
+/// split. No longer called from the polling path; `session_missing`
+/// drift is the right surface for "session was here, now it's gone".
+/// Kept for one release as a last-resort recovery utility.
+#[allow(dead_code)]
 pub fn auto_pause_orphaned(sessions: &HashMap<String, TmuxSession>) {
     let dir = tasks_dir();
     for name in load_task_names(&dir) {

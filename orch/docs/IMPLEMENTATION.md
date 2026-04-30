@@ -3,21 +3,27 @@
 Snapshot of what shipped from `redesign.md` / `redesign-notes.md` between
 2026-04-30 and now. Pair this with `redesign.md` (the contract) and
 `redesign-notes.md` (the phase plan with snapshot deliverables) to know
-what is live, what is deferred, and where to look in the code.
+what is live, what is partial, and what is deferred.
 
-## What's live
+This doc is split into **code-status** (what the source actually does)
+and **deployment-status** (what's running on this machine right now).
+The latter is unverifiable from a code review.
+
+## Code status
 
 ```
-P0  Stability quick wins ............ ✅
-P1  Persistence + FSM foundation .... ✅ (slices A-E; F deferred)
-P2  PR display layer ................ ✅ (folded into P1+P3 by side effect)
-P3  TUI rewrite + minimal Linear .... ✅
-P4a Session rename .................. deferred
-P4b Linear data layer ............... deferred
-P5  Pane state polish ............... deferred
+P0  Stability quick wins ........... ✅
+P1  Persistence + FSM foundation ... 🟨 (A-E shipped, F deferred,
+                                         lifecycle still partly legacy)
+P2  PR display layer ............... 🟨 (data shape done, discovery
+                                         still legacy `jj op log` only)
+P3  TUI rewrite + minimal Linear ... ✅
+P4a Session rename ................. deferred
+P4b Linear data layer .............. deferred
+P5  Pane state polish .............. deferred
 ```
 
-10 commits, ~5800 LOC, 91 tests passing.
+13 commits, ~6200 LOC, 94 tests passing.
 
 ## P0 — Stability quick wins
 
@@ -212,28 +218,44 @@ No dedicated commit — folded into P1 + P3 by side effect.
 PR-discovery scan on branch change is still via `state::reconcile_prs`
 (unchanged from pre-redesign — uses `jj op log` to detect pushes).
 
-## What is live in production right now
+## Deployment status (this machine, point-in-time — not code-derivable)
 
 | Surface | Where |
 |---|---|
-| `orch daemon` | running with the new binary; migrated 8 tasks to `~/tasks/.orch/store.v2/` |
-| Marker hooks | symlinked into `~/.claude/hooks/`; fire on every Claude turn for every session |
-| `~/tasks/.orch/store.version` | `v2` — reads come from the new store, writes mirror to both |
+| `orch daemon` | running with the new binary; one-time migration ran; populated `~/tasks/.orch/store.v2/` |
+| Marker hooks | live in `~/dotfiles/claude/.claude/hooks/`, symlinked into `~/.claude/hooks/`; fire on every Claude turn |
+| `~/tasks/.orch/store.version` | set to `v2` — `Store::is_authoritative()` returns true |
 | TUI | new three-pane layout default; `ORCH_TUI=legacy orch` rolls back |
-| Subcommands | `gc` (orphan worktrees), `close` (kill+archive+remove-wt), `render-debug` (dump TUI to stdout) |
+| Subcommands | `gc`, `close`, `render-debug` |
+
+## What v2 authority actually drives today
+
+The v2 store is **partially authoritative** — `Store::is_authoritative()` is true,
+but only some read paths consult it:
+
+| Path | Authoritative source | Notes |
+|---|---|---|
+| `load_task_meta(slug)` | v2 record (flattened to TaskMeta) | falls back to legacy `.state/<n>.json` if record missing |
+| Task enumeration + ordering | `Registry.open_order` | `state::ordered_open_slugs` routes through v2 when authoritative |
+| `cmd_close` | v2: persists `Closed`, moves id to `closed_order` | archive failure aborts cleanup |
+| `save_task_meta` | mirrored: legacy + v2 | preserves manual PR provenance |
+| Drift flags + durable id in TUI | v2 record | rendered as `#id` + `⚠` glyph |
+| **Badge derivation** | **still legacy** | `derive_status` uses `TaskMeta`, returns `Idle` not `Detached` (matrix only partly wired in slice E) |
+| **PR discovery** | **still legacy** | only `jj op log`-based; no markdown URL scan |
+| **Lifecycle FSM transitions** | **only `close`** | start / pause / resume still update `TaskMeta.paused` directly |
 
 ## Pain points addressed (from original list)
 
 | Pain | Status |
 |---|---|
-| "Not stable" | ✅ busy markers replace pane-hash; `worker_dead` → `Error` badge |
-| "PR not show up" | ✅ TaskRecord owns `links.prs`; tab renders from links, not from gh-cache |
-| "Switching needs `tmux prefix+o`" | ✅ Panes tab + `[`, `]`, `\` |
-| "Number gaps" | ✅ data model has durable `task_id`; TUI shows current ordering |
-| "Frequent start/close uncodified" | ✅ `orch close` shipped (kill + archive + remove-wt) |
+| "Not stable" | 🟨 busy markers replace pane-hash + `worker_dead` → `Error` badge; **but** busy detection still matches by cwd not session_id (cross-session leak risk in same worktree) |
+| "PR not show up" | 🟨 `TaskRecord.links.prs` persisted with provenance; tab renders from records; **but** discovery is still `jj op log`-only — no markdown URL scan |
+| "Switching needs `tmux prefix+o`" | ✅ Panes tab + `j/k` navigation, `Enter` attaches to pane (post-nav-redesign) |
+| "Number gaps" | ✅ TUI shows durable `#id` from v2 Registry; closed tasks leave gaps but the id stays stable |
+| "Frequent start/close uncodified" | 🟨 `orch close` is v2-aware (persists `Closed`, updates `closed_order`, aborts on archive failure); **but** start/pause/resume still mutate `TaskMeta.paused` directly, not the FSM |
 | "Architecture from oldest forms" | ✅ full redesign + foundation slices |
-| "Log truncated" | ✅ Phase 3 log wraps + scroll-preserves |
-| "Linear integration" | partial — data model ready, stub render in TUI; Phase 4b ships real API |
+| "Log truncated" | ✅ Phase 3 log wraps + scroll-preserves; global PgUp/PgDn from any focus |
+| "Linear integration" | 🟨 data model ready, stub render in TUI; Phase 4b ships real API |
 
 ## Deferred work
 
@@ -256,26 +278,28 @@ PR-discovery scan on branch change is still via `state::reconcile_prs`
 ## Files to know
 
 ```
-orch/
-├── docs/
-│   ├── redesign.md              # contract (v2 store, FSM, matrix, etc.)
-│   ├── redesign-notes.md        # phased plan + snapshot deliverables
-│   ├── busy-detection-plan.md   # marker mechanics
-│   ├── linear-tui-design.md     # exploratory; superseded
-│   ├── redesign-review*.md      # codex review iterations 1-6
-│   └── IMPLEMENTATION.md        # this file
-├── src/
-│   ├── main.rs                  # CLI, daemon, gc, close, render-debug
-│   ├── state.rs                 # TaskMeta (legacy), TaskStatus, derive_status, busy markers
-│   ├── store.rs                 # v2: TaskRecord, Registry, Store, migration
-│   ├── tui.rs                   # legacy TUI (kept behind ORCH_TUI=legacy)
-│   ├── tui3.rs                  # new three-pane TUI (default)
-│   ├── cache.rs                 # status + PR caches written by daemon
-│   ├── gh.rs                    # PR data fetching
-│   └── runs.rs                  # orchestrator run history
-└── claude/.claude/hooks/
-    ├── orch-busy-start.sh       # marker write on UserPromptSubmit
-    └── orch-busy-stop.sh        # marker remove on Stop / SessionEnd
+~/dotfiles/
+├── orch/
+│   ├── docs/
+│   │   ├── redesign.md              # contract (v2 store, FSM, matrix, etc.)
+│   │   ├── redesign-notes.md        # phased plan + snapshot deliverables
+│   │   ├── busy-detection-plan.md   # marker mechanics
+│   │   ├── linear-tui-design.md     # exploratory; superseded
+│   │   ├── tui-nav-redesign.md      # navigation contract (current TUI)
+│   │   ├── redesign-review*.md      # codex review iterations 1-6 + final
+│   │   └── IMPLEMENTATION.md        # this file
+│   └── src/
+│       ├── main.rs                  # CLI, daemon, gc, close, render-debug
+│       ├── state.rs                 # TaskMeta (legacy), TaskStatus, derive_status, busy markers
+│       ├── store.rs                 # v2: TaskRecord, Registry, Store, migration
+│       ├── tui.rs                   # legacy TUI (kept behind ORCH_TUI=legacy)
+│       ├── tui3.rs                  # new three-pane TUI (default)
+│       ├── cache.rs                 # status + PR caches written by daemon
+│       ├── gh.rs                    # PR data fetching
+│       └── runs.rs                  # orchestrator run history
+└── claude/.claude/hooks/            # sibling package, not under orch/
+    ├── orch-busy-start.sh           # marker write on UserPromptSubmit
+    └── orch-busy-stop.sh            # marker remove on Stop / SessionEnd
 ```
 
 ## Validation

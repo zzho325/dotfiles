@@ -42,7 +42,7 @@ use ratatui::{
 };
 
 use crate::state::{
-    self, TaskStatus, load_order, load_task_meta, load_tmux_sessions,
+    self, TaskStatus, load_task_meta, load_tmux_sessions,
 };
 
 const FAST_TICK: Duration = Duration::from_secs(2);
@@ -130,6 +130,10 @@ pub struct TaskView {
     pub panes: Vec<TmuxPaneInfo>,
     /// Stub Linear data — slice 4b replaces this with real cache.
     pub linear: Vec<LinearStub>,
+    /// Durable v2 task id when the v2 store is authoritative.
+    pub id: Option<crate::store::TaskId>,
+    /// True iff any drift flag is set on the v2 record.
+    pub drift: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +221,6 @@ impl App {
     }
 
     fn load_tasks() -> Vec<TaskView> {
-        let order = load_order();
         let status_cache = crate::cache::read_status();
         let pr_cache = crate::cache::read_prs();
         let daemon_alive = crate::cache::is_daemon_alive();
@@ -230,7 +233,7 @@ impl App {
 
         let store = crate::store::Store::default();
 
-        state::ordered_task_names(&order)
+        state::ordered_open_slugs()
             .into_iter()
             .map(|name| {
                 let meta = load_task_meta(&name);
@@ -263,15 +266,17 @@ impl App {
 
                 let panes = panes_for_session(&meta.session);
 
-                // Linear stub: pull from v2 record if present, otherwise empty.
-                let linear = if store.is_authoritative() {
-                    store
-                        .load_record_by_slug(&name)
-                        .map(|r| stub_linear_from_record(&r))
-                        .unwrap_or_default()
+                let record = if store.is_authoritative() {
+                    store.load_record_by_slug(&name)
                 } else {
-                    Vec::new()
+                    None
                 };
+                let linear = record
+                    .as_ref()
+                    .map(|r| stub_linear_from_record(r))
+                    .unwrap_or_default();
+                let id = record.as_ref().map(|r| r.id);
+                let drift = record.as_ref().map(|r| r.drift.any()).unwrap_or(false);
 
                 TaskView {
                     name,
@@ -280,6 +285,8 @@ impl App {
                     prs,
                     panes,
                     linear,
+                    id,
+                    drift,
                 }
             })
             .collect()
@@ -553,6 +560,9 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             let linear_count = task.linear.len();
 
             let mut counts = String::new();
+            if task.drift {
+                counts.push_str(" ⚠");
+            }
             if pr_count > 0 {
                 counts.push_str(&format!(" P{pr_count}"));
             }
@@ -560,11 +570,16 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
                 counts.push_str(&format!(" L{linear_count}"));
             }
             let badge_text = format!(" {badge}");
-
+            let id_text = task.id.map(|i| format!("#{i} ")).unwrap_or_default();
             let cursor = if selected { "▸ " } else { "  " };
+
             // Width available for the name itself = total - cursor (2) -
-            // counts - badge - trailing space (1).
-            let reserved = 2 + counts.chars().count() + badge_text.chars().count() + 1;
+            // id - counts - badge - trailing space (1).
+            let reserved = 2
+                + id_text.chars().count()
+                + counts.chars().count()
+                + badge_text.chars().count()
+                + 1;
             let name_room = (area.width as usize).saturating_sub(reserved);
             let name_str = truncate(&task.name, name_room);
             let pad = name_room.saturating_sub(name_str.chars().count());
@@ -574,11 +589,17 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
                     cursor,
                     Style::default().fg(if selected { LOVE } else { MUTED }),
                 ),
+                Span::styled(id_text, Style::default().fg(MUTED)),
                 Span::styled(name_str, Style::default().fg(name_color)),
                 Span::raw(" ".repeat(pad)),
             ];
             if !counts.is_empty() {
-                spans.push(Span::styled(counts, Style::default().fg(SUBTLE)));
+                let counts_color = if task.drift && counts.starts_with(" ⚠") {
+                    LOVE
+                } else {
+                    SUBTLE
+                };
+                spans.push(Span::styled(counts, Style::default().fg(counts_color)));
             }
             spans.push(Span::styled(
                 badge_text,
@@ -1371,6 +1392,8 @@ mod tests {
                     assignee: None,
                     depth: 0,
                 }],
+                id: Some(2),
+                drift: false,
             },
             TaskView {
                 name: "ach-sanitize".into(),
@@ -1383,6 +1406,8 @@ mod tests {
                 prs: vec![],
                 panes: vec![],
                 linear: vec![],
+                id: None,
+                drift: false,
             },
             TaskView {
                 name: "fresh-task".into(),
@@ -1391,6 +1416,8 @@ mod tests {
                 prs: vec![],
                 panes: vec![],
                 linear: vec![],
+                id: None,
+                drift: false,
             },
         ]
     }
@@ -1466,8 +1493,8 @@ mod tests {
         app.focus = Pane::List;
         app.selected = 0;
         let s = render_to_string(&app, 100, 25);
-        // Selected row has the focus marker.
-        assert!(s.contains("▸ infra-triage"));
+        // Selected row has the focus marker; id is rendered before the name.
+        assert!(s.contains("▸ #2 infra-triage"));
     }
 
     #[test]

@@ -622,13 +622,74 @@ fn remove_worktree(path: &Path) -> Result<(), String> {
     Err(msg)
 }
 
-/// Close a task: kill its tmux session, archive ~/tasks/<name>.md to
-/// done/, remove the worktree, drop the state file. Each step warns
-/// loudly on failure but does not abort — the user can clean up the
-/// remaining drift manually (or with `orch gc`).
+/// Close a task. v2-aware: persists `desired_state=Closed` and moves
+/// the id from `Registry.open_order` to `closed_order` first, then runs
+/// destructive cleanup (tmux kill, .md archive, worktree remove).
+///
+/// Archive failure aborts the cleanup — the only durable handle to the
+/// task's history is its markdown file; if we can't archive it,
+/// removing the worktree would lose context. tmux/worktree failures
+/// warn but don't roll back the FSM (drift flags surface those cases).
 fn cmd_close(name: &str) {
+    let store = store::Store::default();
+    let v2_authoritative = store.is_authoritative();
     let meta = state::load_task_meta(name);
 
+    let record_id = if v2_authoritative {
+        store.load_record_by_slug(name).map(|r| r.id)
+    } else {
+        None
+    };
+
+    // 1. v2 FSM transition first. If v2 isn't authoritative, this is
+    //    a no-op and we fall back to legacy semantics.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let archive_path = state::tasks_dir().join("done").join(
+        record_id
+            .map(|id| format!("{id}-{name}.md"))
+            .unwrap_or_else(|| format!("{name}.md")),
+    );
+    if let Some(id) = record_id {
+        if let Some(mut record) = store.load_record(id) {
+            record.desired_state = store::DesiredState::Closed;
+            record.closed_at = Some(now);
+            record.archived_task_file = Some(archive_path.clone());
+            record.updated_at = now;
+            store.save_record(&record);
+        }
+        if let Some(mut registry) = store.load_registry() {
+            registry.open_order.retain(|i| *i != id);
+            if !registry.closed_order.contains(&id) {
+                registry.closed_order.push(id);
+            }
+            store.save_registry(&registry);
+        }
+    }
+
+    // 2. Archive .md to done/. ABORT on failure — the rest of cleanup
+    //    is destructive and we'd lose history.
+    let dir = state::tasks_dir();
+    let md = dir.join(format!("{name}.md"));
+    if md.exists() {
+        if fs::create_dir_all(archive_path.parent().unwrap_or(&dir)).is_err() {
+            eprintln!("[close] FAIL: could not create done/ — aborting cleanup");
+            return;
+        }
+        if let Err(e) = fs::rename(&md, &archive_path) {
+            eprintln!(
+                "[close] FAIL: could not archive {name}.md ({e}) — aborting cleanup"
+            );
+            return;
+        }
+        eprintln!("[close] archived {} -> {}", md.display(), archive_path.display());
+    }
+
+    // 3. Kill tmux. Failure warns but does not roll back the FSM —
+    //    the cleanup_pending drift flag is the right place for this
+    //    once F-1F lands.
     if !meta.session.is_empty() {
         if let Some(actual) = find_actual_session(&meta.session) {
             let killed = Command::new("tmux")
@@ -644,23 +705,12 @@ fn cmd_close(name: &str) {
         }
     }
 
-    let dir = state::tasks_dir();
-    let md = dir.join(format!("{name}.md"));
-    if md.exists() {
-        let done_dir = dir.join("done");
-        fs::create_dir_all(&done_dir).ok();
-        let archived = done_dir.join(format!("{name}.md"));
-        match fs::rename(&md, &archived) {
-            Ok(()) => eprintln!(
-                "[close] archived {name}.md -> done/",
-            ),
-            Err(e) => eprintln!(
-                "[close] WARNING: failed to archive {name}.md: {e}",
-            ),
-        }
-    }
-
-    if !meta.worktree.is_empty() {
+    // 4. Remove worktree if cleanup_on_close is true (default).
+    let cleanup_on_close = record_id
+        .and_then(|id| store.load_record(id))
+        .map(|r| r.worktree.cleanup_on_close)
+        .unwrap_or(true);
+    if cleanup_on_close && !meta.worktree.is_empty() {
         let home = dirs::home_dir().unwrap_or_default();
         let wt = meta.worktree.replace("~", &home.to_string_lossy());
         let path = Path::new(&wt);
@@ -674,6 +724,7 @@ fn cmd_close(name: &str) {
         }
     }
 
+    // 5. Drop legacy state file. Keep the v2 record for closed-history.
     let state_path = dir.join(".state").join(format!("{name}.json"));
     if state_path.exists() {
         let _ = fs::remove_file(&state_path);
@@ -730,7 +781,11 @@ fn spawn_status_loop() {
             state::ensure_state_files();
             let order = state::load_order();
             let sessions = state::load_tmux_sessions();
-            state::auto_pause_orphaned(&sessions);
+            // Note: auto_pause_orphaned removed from the poll path —
+            // it mutated lifecycle from runtime observation, breaking
+            // the "persisted intent / observed runtime" split. Missing
+            // sessions now surface via drift flags + Detached badge,
+            // not by silently flipping desired_state.
             let tasks =
                 state::load_tasks(&order, &sessions, stale_secs);
 

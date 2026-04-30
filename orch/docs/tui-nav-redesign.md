@@ -3,6 +3,22 @@
 Supersedes the keymap section of `redesign.md` §3 and the focus model in
 `redesign.md` §5. Layout (three panes, four detail tabs) is unchanged.
 
+> **Status:** This contract is now implemented in `src/tui3.rs`. The
+> diagnosis below describes the *pre-redesign* state for context. The
+> "what to delete" section (§7) was the work plan; nothing in it is
+> outstanding.
+
+## Esc — canonical rule
+
+`Esc` resolves in this strict order:
+
+1. If a modal is open (help overlay, message input) → cancel the modal.
+2. Else if focus is the right zone → focus returns to the list.
+3. Else (focus is list) → quit orch.
+
+This rule is mirrored in §3 keymap and §5C help mockup; if any of those
+disagrees, this section is the source of truth.
+
 ## 1. Diagnosis
 
 The current `tui3.rs` has three nested focus levels and overloads keys
