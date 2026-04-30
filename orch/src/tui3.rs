@@ -64,15 +64,16 @@ const SEPARATOR_WIDTH: u16 = 1;
 const TAB_BAR_HEIGHT: u16 = 2; // tabs row + divider
 const LOG_HEIGHT_RATIO: u16 = 35; // percent of right column
 const HELP_OVERLAY_WIDTH: u16 = 60;
-const HELP_OVERLAY_HEIGHT: u16 = 22;
+const HELP_OVERLAY_HEIGHT: u16 = 25;
 
 // State.
 
+/// Focus is a two-state toggle. The Log is a passive viewer — always
+/// scrolled via global PgUp/PgDn/`<`/`>` regardless of focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     List,
-    Details,
-    Log,
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +181,10 @@ pub struct App {
     pub message_input: Option<String>,
     pub read_runs: HashSet<String>,
     pub last_run_count: usize,
+    /// Transient single-line message rendered in the log header.
+    /// Used to surface "not yet wired" feedback for unimplemented keys.
+    /// Cleared on next non-toast key press.
+    pub toast: Option<String>,
     /// Skip live IO during tests.
     pub readonly: bool,
 }
@@ -204,6 +209,7 @@ impl App {
             message_input: None,
             read_runs: HashSet::new(),
             last_run_count,
+            toast: None,
             readonly: false,
         };
         app.open_latest_run();
@@ -453,14 +459,18 @@ pub fn render(frame: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Length(1), // left ruler
             Constraint::Length(LIST_WIDTH),
             Constraint::Length(SEPARATOR_WIDTH),
+            Constraint::Length(1), // right ruler
             Constraint::Min(0),
         ])
         .split(area);
 
-    render_list(frame, outer[0], app);
-    render_vertical_separator(frame, outer[1]);
+    render_focus_ruler(frame, outer[0], app.focus == Pane::List);
+    render_list(frame, outer[1], app);
+    render_vertical_separator(frame, outer[2]);
+    render_focus_ruler(frame, outer[3], app.focus == Pane::Right);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -469,7 +479,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(1), // horizontal separator
             Constraint::Min(3),
         ])
-        .split(outer[2]);
+        .split(outer[4]);
 
     render_details(frame, right[0], app);
     render_horizontal_separator(frame, right[1]);
@@ -478,6 +488,17 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.show_help {
         render_help_overlay(frame, area);
     }
+}
+
+fn render_focus_ruler(frame: &mut Frame, area: Rect, focused: bool) {
+    if !focused {
+        return;
+    }
+    let mut lines = Vec::with_capacity(area.height as usize);
+    for _ in 0..area.height {
+        lines.push(Line::styled("▎", Style::default().fg(LOVE)));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_vertical_separator(frame: &mut Frame, area: Rect) {
@@ -498,10 +519,11 @@ fn render_horizontal_separator(frame: &mut Frame, area: Rect) {
 
 fn render_list(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
+    let focused = app.focus == Pane::List;
 
     // Header.
-    let header_style = if app.focus == Pane::List {
-        Style::default().fg(LOVE)
+    let header_style = if focused {
+        Style::default().fg(TEXT)
     } else {
         Style::default().fg(MUTED)
     };
@@ -518,15 +540,14 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(SUBTLE),
         ));
     } else {
+        let name_color = if focused { TEXT } else { SUBTLE };
         for (i, task) in app.tasks.iter().enumerate() {
             let selected = i == app.selected;
             let badge = status_str(task.status);
             let badge_color = status_color(task.status);
-            let row_bg = if selected && app.focus == Pane::List {
-                Some(HL_LOW)
-            } else {
-                None
-            };
+            // Selected row keeps HL_LOW background regardless of focus,
+            // so the user can navigate back to it.
+            let row_bg = if selected { Some(HL_LOW) } else { None };
 
             let pr_count = task.prs.len();
             let linear_count = task.linear.len();
@@ -553,7 +574,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
                     cursor,
                     Style::default().fg(if selected { LOVE } else { MUTED }),
                 ),
-                Span::styled(name_str, Style::default().fg(TEXT)),
+                Span::styled(name_str, Style::default().fg(name_color)),
                 Span::raw(" ".repeat(pad)),
             ];
             if !counts.is_empty() {
@@ -585,22 +606,27 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Tab bar at top.
+    // Tab bar. Active tab gets a `▎` underline glyph next to its label
+    // so the user can identify the live tab without relying on color alone.
+    let focused = app.focus == Pane::Right;
     let tabs = [Tab::Overview, Tab::Prs, Tab::Linear, Tab::Panes];
     let mut tab_spans: Vec<Span> = Vec::new();
+    tab_spans.push(Span::raw(" "));
     for (i, tab) in tabs.iter().enumerate() {
-        let style = if *tab == app.detail_tab {
-            if app.focus == Pane::Details {
-                Style::default().fg(LOVE)
-            } else {
-                Style::default().fg(TEXT)
-            }
-        } else {
+        let active = *tab == app.detail_tab;
+        let style = if active {
+            Style::default().fg(if focused { LOVE } else { TEXT })
+        } else if focused {
             Style::default().fg(SUBTLE)
+        } else {
+            Style::default().fg(MUTED)
         };
-        tab_spans.push(Span::styled(format!(" {} ", tab.label()), style));
+        if active {
+            tab_spans.push(Span::styled("▎", Style::default().fg(LOVE)));
+        }
+        tab_spans.push(Span::styled(tab.label(), style));
         if i + 1 < tabs.len() {
-            tab_spans.push(Span::styled("·", Style::default().fg(MUTED)));
+            tab_spans.push(Span::styled("  ·  ", Style::default().fg(MUTED)));
         }
     }
     let tab_bar = Paragraph::new(Line::from(tab_spans));
@@ -783,17 +809,20 @@ fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
             Style::default().fg(SUBTLE),
         ));
     } else {
+        let focused =
+            app.focus == Pane::Right && app.detail_tab == Tab::Panes;
         for (i, pane) in task.panes.iter().enumerate() {
             let selected = i == app.panes_selected;
-            let focused = app.focus == Pane::Details && app.detail_tab == Tab::Panes;
             let marker = if pane.active { "●" } else { "·" };
             let prefix = if selected && focused { "▸" } else { " " };
             let style = if selected && focused {
                 Style::default().fg(LOVE).bg(HL_LOW)
             } else if selected {
                 Style::default().fg(TEXT).bg(HL_LOW)
-            } else {
+            } else if focused {
                 Style::default().fg(TEXT)
+            } else {
+                Style::default().fg(SUBTLE)
             };
             lines.push(Line::from(vec![
                 Span::styled(
@@ -808,7 +837,7 @@ fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            " [ prev · ] next · \\ last · Enter attach",
+            " j/k navigate · Enter attach",
             Style::default().fg(MUTED),
         ));
     }
@@ -816,14 +845,16 @@ fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
 }
 
 fn render_log(frame: &mut Frame, area: Rect, app: &App) {
-    let header_style = if app.focus == Pane::Log {
-        Style::default().fg(LOVE)
+    // Log is a passive viewer — no focus state. Header in MUTED.
+    // Toast (if present) overrides the run-id label.
+    let header_style = Style::default().fg(MUTED);
+    let header_text = if let Some(toast) = &app.toast {
+        format!(" log: {toast}")
     } else {
-        Style::default().fg(MUTED)
-    };
-    let header_text = match &app.log.run_id {
-        Some(id) => format!(" log: {}{}", id, if app.log.finished { " ·done" } else { "" }),
-        None => " log: no activity".to_string(),
+        match &app.log.run_id {
+            Some(id) => format!(" log: {}{}", id, if app.log.finished { " ·done" } else { "" }),
+            None => " log: no activity".to_string(),
+        }
     };
     let header_area = Rect {
         x: area.x,
@@ -879,7 +910,7 @@ fn render_log(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
     let w = HELP_OVERLAY_WIDTH.min(area.width.saturating_sub(4));
-    let h = HELP_OVERLAY_HEIGHT.min(area.height.saturating_sub(4));
+    let h = HELP_OVERLAY_HEIGHT.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let overlay = Rect {
@@ -899,25 +930,24 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::styled(" key bindings", Style::default().fg(LOVE)),
         Line::styled("─".repeat(w as usize), Style::default().fg(MUTED)),
         Line::styled(" Global", Style::default().fg(IRIS)),
-        kv_line("   q / Esc    ", "quit"),
-        kv_line("   ?          ", "toggle this overlay"),
-        kv_line("   Tab/S-Tab  ", "cycle pane focus (List → Details → Log)"),
-        kv_line("   1 2 3 4    ", "jump to tab: Overview · PRs · Linear · Panes"),
-        kv_line("   m          ", "message orchestrator"),
-        Line::raw(""),
-        Line::styled(" Task list (focus = list)", Style::default().fg(IRIS)),
-        kv_line("   j/k g/G    ", "move · top/bottom"),
-        kv_line("   Enter      ", "attach to selected task's tmux session"),
-        Line::raw(""),
-        Line::styled(" Right pane (focus = details)", Style::default().fg(IRIS)),
-        kv_line("   h/l        ", "prev / next tab (or use 1-4)"),
-        kv_line("   j/k        ", "navigate within tab (e.g. select pane)"),
-        kv_line("   Enter      ", "act on cursored item (e.g. attach pane)"),
-        Line::raw(""),
-        Line::styled(" Log (focus = log)", Style::default().fg(IRIS)),
-        kv_line("   j/k        ", "scroll line"),
-        kv_line("   PgUp PgDn  ", "scroll page"),
-        kv_line("   G          ", "follow bottom"),
+        kv_line("  q        ", "quit"),
+        kv_line("  Tab      ", "toggle list ↔ right"),
+        kv_line("  1 2 3 4  ", "Overview · PRs · Linear · Panes"),
+        kv_line("  Esc      ", "right → list; list → quit"),
+        kv_line("  PgUp/Dn  ", "scroll log"),
+        kv_line("  < / >    ", "log: top / tail"),
+        kv_line("  ?        ", "this overlay"),
+        kv_line("  r m      ", "refresh · message"),
+        Line::styled(" List", Style::default().fg(IRIS)),
+        kv_line("  j k g G  ", "move · top / bottom"),
+        kv_line("  Enter    ", "attach to active pane"),
+        Line::styled(" Right zone", Style::default().fg(IRIS)),
+        kv_line("  j k      ", "move cursor in active tab"),
+        kv_line("  Enter    ", "open / attach in active tab"),
+        Line::styled(
+            " Phase 1F+:  n s p R x M J K o W (not yet wired)",
+            Style::default().fg(MUTED),
+        ),
     ];
 
     let text_area = Rect {
@@ -1004,6 +1034,12 @@ fn total_wrapped_rows(lines: &[String], width: usize) -> usize {
 }
 
 // Key handling.
+//
+// Two-zone focus (List ↔ Right). Log is a passive viewer — scrolled
+// via global PgUp/PgDn/`<`/`>` regardless of focus. See
+// `docs/tui-nav-redesign.md`.
+
+const UNWIRED_KEYS: &[char] = &['n', 's', 'p', 'R', 'x', 'M', 'J', 'K', 'o', 'W'];
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     if app.show_help {
@@ -1016,54 +1052,88 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Most keys clear any active toast. The unwired-key handler sets
+    // a fresh toast and returns early before this clear runs.
+    let was_toasted = app.toast.is_some();
+
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+        // Quit semantics: from list, q or Esc quits. From right zone,
+        // Esc returns focus to the list (one stable home base).
+        (KeyCode::Char('q'), _) => {
             app.should_quit = true;
+            return;
+        }
+        (KeyCode::Esc, _) => {
+            if app.focus == Pane::Right {
+                app.focus = Pane::List;
+            } else {
+                app.should_quit = true;
+            }
+            if was_toasted { app.toast = None; }
+            return;
         }
         (KeyCode::Char('?'), _) => {
             app.show_help = true;
+            return;
         }
-        (KeyCode::Tab, _) => {
+        // Two-zone toggle.
+        (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
             app.focus = match app.focus {
-                Pane::List => Pane::Details,
-                Pane::Details => Pane::Log,
-                Pane::Log => Pane::List,
+                Pane::List => Pane::Right,
+                Pane::Right => Pane::List,
             };
         }
-        (KeyCode::BackTab, _) => {
-            app.focus = match app.focus {
-                Pane::List => Pane::Log,
-                Pane::Details => Pane::List,
-                Pane::Log => Pane::Details,
-            };
-        }
-        // Number keys jump directly to a detail tab from any focus.
-        // Auto-moves focus to Details so subsequent keys (j/k for pane
-        // selection, etc) act on the tab body without an extra Tab press.
+        // Number keys jump to a detail tab and focus right.
         (KeyCode::Char('1'), _) => {
             app.detail_tab = Tab::Overview;
-            app.focus = Pane::Details;
+            app.focus = Pane::Right;
         }
         (KeyCode::Char('2'), _) => {
             app.detail_tab = Tab::Prs;
-            app.focus = Pane::Details;
+            app.focus = Pane::Right;
         }
         (KeyCode::Char('3'), _) => {
             app.detail_tab = Tab::Linear;
-            app.focus = Pane::Details;
+            app.focus = Pane::Right;
         }
         (KeyCode::Char('4'), _) => {
             app.detail_tab = Tab::Panes;
-            app.focus = Pane::Details;
+            app.focus = Pane::Right;
         }
         (KeyCode::Char('m'), _) => {
             app.message_input = Some(String::new());
         }
+        // Global log controls.
+        (KeyCode::PageUp, _) => {
+            app.log.follow_bottom = false;
+            app.log.scroll = app.log.scroll.saturating_sub(10);
+        }
+        (KeyCode::PageDown, _) => {
+            app.log.follow_bottom = false;
+            app.log.scroll = app.log.scroll.saturating_add(10);
+        }
+        (KeyCode::Char('<'), _) => {
+            app.log.follow_bottom = false;
+            app.log.scroll = 0;
+        }
+        (KeyCode::Char('>'), _) => {
+            app.log.follow_bottom = true;
+        }
+        // Unwired keys produce a toast instead of silently no-op'ing.
+        (KeyCode::Char(c), _) if UNWIRED_KEYS.contains(&c) => {
+            app.toast = Some(format!(
+                "not yet wired — see redesign-notes Phase 1F/4a ({c})"
+            ));
+            return;
+        }
         _ => match app.focus {
             Pane::List => handle_list_key(app, key),
-            Pane::Details => handle_details_key(app, key),
-            Pane::Log => handle_log_key(app, key),
+            Pane::Right => handle_right_key(app, key),
         },
+    }
+
+    if was_toasted {
+        app.toast = None;
     }
 }
 
@@ -1084,7 +1154,8 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             app.selected = app.tasks.len().saturating_sub(1);
         }
         KeyCode::Enter => {
-            // Attach to selected task's tmux session.
+            // Attach to selected task's tmux session (active pane is
+            // whatever tmux had selected last).
             if let Some(task) = app.selected_task() {
                 if !task.meta.session.is_empty() {
                     attach_session(&task.meta.session);
@@ -1095,79 +1166,32 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_details_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char('h') | KeyCode::Left => {
+/// Right-zone key dispatch. j/k always means "move cursor in active
+/// tab"; Enter always means "act on cursored item".
+fn handle_right_key(app: &mut App, key: KeyEvent) {
+    match (app.detail_tab, key.code) {
+        // Tab cycling via h/l is kept as a fallback; numbers are the primary path.
+        (_, KeyCode::Char('h')) | (_, KeyCode::Left) => {
             app.detail_tab = app.detail_tab.prev();
         }
-        KeyCode::Char('l') | KeyCode::Right => {
+        (_, KeyCode::Char('l')) | (_, KeyCode::Right) => {
             app.detail_tab = app.detail_tab.next();
         }
-        KeyCode::Char('[') => {
-            if app.detail_tab == Tab::Panes && app.panes_selected > 0 {
-                app.panes_selected -= 1;
+        (Tab::Panes, KeyCode::Char('j')) | (Tab::Panes, KeyCode::Down) => {
+            let n = app.selected_task().map(|t| t.panes.len()).unwrap_or(0);
+            if app.panes_selected + 1 < n {
+                app.panes_selected += 1;
             }
         }
-        KeyCode::Char(']') => {
-            if app.detail_tab == Tab::Panes {
-                let n = app
-                    .selected_task()
-                    .map(|t| t.panes.len())
-                    .unwrap_or(0);
-                if app.panes_selected + 1 < n {
-                    app.panes_selected += 1;
+        (Tab::Panes, KeyCode::Char('k')) | (Tab::Panes, KeyCode::Up) => {
+            app.panes_selected = app.panes_selected.saturating_sub(1);
+        }
+        (Tab::Panes, KeyCode::Enter) => {
+            if let Some(task) = app.selected_task() {
+                if let Some(pane) = task.panes.get(app.panes_selected) {
+                    attach_pane(&pane.session, &pane.id);
                 }
             }
-        }
-        KeyCode::Char('\\') => {
-            // Last pane in the list. Phase 5 wires "previous selected"
-            // properly; for now this jumps to the active pane.
-            if app.detail_tab == Tab::Panes {
-                if let Some(task) = app.selected_task() {
-                    if let Some(idx) = task.panes.iter().position(|p| p.active) {
-                        app.panes_selected = idx;
-                    }
-                }
-            }
-        }
-        KeyCode::Enter => {
-            // Attach to the selected pane.
-            if app.detail_tab == Tab::Panes {
-                if let Some(task) = app.selected_task() {
-                    if let Some(pane) = task.panes.get(app.panes_selected) {
-                        attach_pane(&pane.session, &pane.id);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_log_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.log.follow_bottom = false;
-            app.log.scroll = app.log.scroll.saturating_add(1);
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.log.follow_bottom = false;
-            app.log.scroll = app.log.scroll.saturating_sub(1);
-        }
-        KeyCode::PageDown => {
-            app.log.follow_bottom = false;
-            app.log.scroll = app.log.scroll.saturating_add(10);
-        }
-        KeyCode::PageUp => {
-            app.log.follow_bottom = false;
-            app.log.scroll = app.log.scroll.saturating_sub(10);
-        }
-        KeyCode::Char('g') => {
-            app.log.follow_bottom = false;
-            app.log.scroll = 0;
-        }
-        KeyCode::Char('G') => {
-            app.log.follow_bottom = true;
         }
         _ => {}
     }
@@ -1257,8 +1281,8 @@ pub fn render_debug(width: u16, height: u16, tab: &str, focus: &str) {
         _ => Tab::Overview,
     };
     app.focus = match focus.to_lowercase().as_str() {
-        "details" => Pane::Details,
-        "log" => Pane::Log,
+        "details" => Pane::Right,
+        "log" => Pane::Right,
         _ => Pane::List,
     };
     terminal.draw(|f| render(f, &app)).expect("debug draw");
@@ -1398,6 +1422,7 @@ mod tests {
             message_input: None,
             read_runs: HashSet::new(),
             last_run_count: 0,
+            toast: None,
             readonly: true,
         }
     }
@@ -1448,7 +1473,7 @@ mod tests {
     #[test]
     fn snapshot_three_pane_details_focus() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         let s = render_to_string(&app, 100, 25);
         // Tab "Overview" should still be the active tab.
         assert!(s.contains("Overview"));
@@ -1457,7 +1482,7 @@ mod tests {
     #[test]
     fn snapshot_three_pane_log_focus() {
         let mut app = test_app();
-        app.focus = Pane::Log;
+        app.focus = Pane::Right;
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("log:"));
     }
@@ -1465,7 +1490,7 @@ mod tests {
     #[test]
     fn snapshot_detail_tab_overview() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         app.detail_tab = Tab::Overview;
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("infra-triage"));
@@ -1477,7 +1502,7 @@ mod tests {
     #[test]
     fn snapshot_detail_tab_prs() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         app.detail_tab = Tab::Prs;
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("#25163"));
@@ -1488,7 +1513,7 @@ mod tests {
     #[test]
     fn snapshot_detail_tab_linear() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         app.detail_tab = Tab::Linear;
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("ENG-29151"));
@@ -1497,19 +1522,19 @@ mod tests {
     #[test]
     fn snapshot_detail_tab_panes() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         app.detail_tab = Tab::Panes;
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("%1"));
         assert!(s.contains("%2"));
         assert!(s.contains("claude"));
-        assert!(s.contains("[ prev"));
+        assert!(s.contains("j/k navigate"));
     }
 
     #[test]
     fn snapshot_detail_tab_panes_selection() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         app.detail_tab = Tab::Panes;
         app.panes_selected = 1;
         let s = render_to_string(&app, 100, 25);
@@ -1520,7 +1545,7 @@ mod tests {
     #[test]
     fn snapshot_log_wrapped_lines() {
         let mut app = test_app();
-        app.focus = Pane::Log;
+        app.focus = Pane::Right;
         app.log.lines = vec![
             "this is a really long log line that absolutely will not fit in 60 columns of width and must wrap onto multiple visual rows when rendered".into(),
             "".into(),
@@ -1537,7 +1562,7 @@ mod tests {
     #[test]
     fn snapshot_log_scroll_preserved() {
         let mut app = test_app();
-        app.focus = Pane::Log;
+        app.focus = Pane::Right;
         app.log.lines = (0..30).map(|i| format!("line {i}")).collect();
         app.log.scroll = 5;
         app.log.follow_bottom = false;
@@ -1565,16 +1590,16 @@ mod tests {
         app.show_help = true;
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("key bindings"));
-        assert!(s.contains("Tab/S-Tab"));
-        assert!(s.contains("cycle pane focus"));
+        assert!(s.contains("toggle list ↔ right"));
         assert!(s.contains("1 2 3 4"));
         assert!(s.contains("Overview"));
+        assert!(s.contains("Phase 1F+"));
     }
 
     #[test]
     fn snapshot_linear_anchor_subissues() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         app.detail_tab = Tab::Linear;
         let task = &mut app.tasks[0];
         task.linear = vec![
@@ -1611,7 +1636,7 @@ mod tests {
     #[test]
     fn snapshot_linear_empty() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         app.detail_tab = Tab::Linear;
         app.tasks[0].linear.clear();
         let s = render_to_string(&app, 100, 25);
@@ -1621,7 +1646,7 @@ mod tests {
     #[test]
     fn tab_cycling_next_prev() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         assert_eq!(app.detail_tab, Tab::Overview);
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
         assert_eq!(app.detail_tab, Tab::Prs);
@@ -1642,13 +1667,13 @@ mod tests {
         app.focus = Pane::List;
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('2')));
         assert_eq!(app.detail_tab, Tab::Prs);
-        assert_eq!(app.focus, Pane::Details);
+        assert_eq!(app.focus, Pane::Right);
 
         // From Log focus
-        app.focus = Pane::Log;
+        app.focus = Pane::Right;
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('4')));
         assert_eq!(app.detail_tab, Tab::Panes);
-        assert_eq!(app.focus, Pane::Details);
+        assert_eq!(app.focus, Pane::Right);
 
         // 1 = Overview, 3 = Linear
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('1')));
@@ -1658,15 +1683,26 @@ mod tests {
     }
 
     #[test]
-    fn pane_focus_cycles() {
+    fn pane_focus_two_state_toggle() {
         let mut app = test_app();
         assert_eq!(app.focus, Pane::List);
         handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.focus, Pane::Details);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.focus, Pane::Log);
+        assert_eq!(app.focus, Pane::Right);
         handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.focus, Pane::List);
+    }
+
+    #[test]
+    fn esc_from_right_returns_to_list() {
+        let mut app = test_app();
+        app.focus = Pane::Right;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.focus, Pane::List);
+        assert!(!app.should_quit);
+
+        // From list, Esc quits.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.should_quit);
     }
 
     #[test]
@@ -1686,30 +1722,52 @@ mod tests {
     }
 
     #[test]
-    fn pane_switching_brackets() {
+    fn panes_tab_jk_navigation() {
         let mut app = test_app();
-        app.focus = Pane::Details;
+        app.focus = Pane::Right;
         app.detail_tab = Tab::Panes;
         app.panes_selected = 0;
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')));
+        // j moves down within panes
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
         assert_eq!(app.panes_selected, 1);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')));
-        // Only 2 panes; should clamp.
+        // Clamps at the end (only 2 panes in fixture)
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
         assert_eq!(app.panes_selected, 1);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('[')));
+        // k moves up
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('k')));
         assert_eq!(app.panes_selected, 0);
     }
 
     #[test]
-    fn log_scroll_disables_follow() {
+    fn log_scroll_via_global_keys() {
+        // Log is no longer a focus zone. PgUp/PgDn/`<`/`>` work from any focus.
         let mut app = test_app();
-        app.focus = Pane::Log;
+        app.focus = Pane::List;
         app.log.follow_bottom = true;
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('k')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::PageUp));
         assert!(!app.log.follow_bottom);
-        // G re-enables follow
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')));
+        // > re-enables follow_bottom (tail-follow)
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('>')));
         assert!(app.log.follow_bottom);
+        // < scrolls to top
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('<')));
+        assert!(!app.log.follow_bottom);
+        assert_eq!(app.log.scroll, 0);
+    }
+
+    #[test]
+    fn unwired_keys_show_toast() {
+        let mut app = test_app();
+        // R is a Phase 4a key, not yet wired
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('R')));
+        assert!(app.toast.is_some());
+        let toast = app.toast.as_ref().unwrap();
+        assert!(toast.contains("not yet wired"));
+        assert!(toast.contains("R"));
+
+        // Next non-toast key clears the toast
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
+        assert!(app.toast.is_none());
     }
 
     #[test]
