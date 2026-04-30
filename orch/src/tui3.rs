@@ -473,11 +473,14 @@ fn find_actual_session(expected: &str) -> Option<String> {
 /// for a key, the stub gets the real title/state/assignee. Otherwise
 /// the title is empty and state shows the link provenance, so the
 /// TUI can render keys immediately while the daemon backfills.
+///
+/// Stubs are sorted by project name so the list view can group by
+/// project without re-shuffling the cursor.
 fn linear_from_record(
     record: &crate::store::TaskRecord,
     cache: &crate::cache::LinearCache,
 ) -> Vec<LinearStub> {
-    record
+    let mut stubs: Vec<LinearStub> = record
         .links
         .linear_issues
         .iter()
@@ -518,7 +521,26 @@ fn linear_from_record(
                 }
             }
         })
-        .collect()
+        .collect();
+    // Stable sort by project name (then by key as tiebreaker) so the
+    // list-view groups cleanly without permuting the underlying record
+    // order.
+    stubs.sort_by(|a, b| {
+        let pa = cache
+            .issues
+            .get(&a.key)
+            .and_then(|c| c.project.as_ref())
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let pb = cache
+            .issues
+            .get(&b.key)
+            .and_then(|c| c.project.as_ref())
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        pa.cmp(&pb).then(a.key.cmp(&b.key))
+    });
+    stubs
 }
 
 // Rendering.
@@ -868,8 +890,10 @@ fn render_linear_list(
     cache: &crate::cache::LinearCache,
 ) {
     let focused = app.focus == Pane::Right && app.detail_tab == Tab::Linear;
-    let mut lines = vec![Line::raw("")];
+    let mut lines: Vec<Line> = Vec::new();
+
     if task.linear.is_empty() {
+        lines.push(Line::raw(""));
         lines.push(Line::styled(
             " (no linked Linear issues)",
             Style::default().fg(SUBTLE),
@@ -878,97 +902,126 @@ fn render_linear_list(
             " orch linear add <task> ENG-123  ·  orch linear scan <task>",
             Style::default().fg(MUTED),
         ));
-    } else {
-        for (i, item) in task.linear.iter().enumerate() {
-            let selected = i == cursor;
-            let bullet = if selected && focused { "▸ " } else { "  " };
-            let bullet_color = if selected && focused { LOVE } else { GOLD };
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        return;
+    }
 
-            let cached = cache.issues.get(&item.key);
-            let priority_label = cached
-                .map(|c| priority_glyph(c.priority))
-                .unwrap_or("");
-            let age = cached
-                .map(|c| relative_age(&c.updated_at))
-                .unwrap_or_default();
+    // Group by project — header emitted once per project. Tickets
+    // already sorted by project in `linear_from_record`.
+    let mut prev_project: Option<String> = None;
+    let mut project_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for item in &task.linear {
+        let p = cache
+            .issues
+            .get(&item.key)
+            .and_then(|c| c.project.as_ref())
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "—".to_string());
+        *project_counts.entry(p).or_insert(0) += 1;
+    }
 
-            // Row 1: cursor + key + priority + state-glyph + state + age
-            let mut row1 = vec![
-                Span::styled(bullet, Style::default().fg(bullet_color)),
+    for (i, item) in task.linear.iter().enumerate() {
+        let selected = i == cursor;
+        let cached = cache.issues.get(&item.key);
+        let project_name = cached
+            .and_then(|c| c.project.as_ref())
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "—".to_string());
+
+        // Project header on transition.
+        if prev_project.as_ref() != Some(&project_name) {
+            if prev_project.is_some() {
+                lines.push(Line::raw(""));
+            }
+            let count = project_counts.get(&project_name).copied().unwrap_or(0);
+            lines.push(Line::from(vec![
+                Span::styled(" ", Style::default()),
                 Span::styled(
-                    format!("{}  ", item.key),
+                    project_name.to_uppercase(),
                     Style::default().fg(IRIS),
                 ),
-            ];
-            if !priority_label.is_empty() {
-                row1.push(Span::styled(
-                    format!("{priority_label}  "),
-                    Style::default().fg(priority_color(cached.map(|c| c.priority).unwrap_or(0))),
-                ));
-            }
-            let state_color = linear_state_color(&item.state);
+                Span::styled(
+                    format!("  ·  {count}"),
+                    Style::default().fg(MUTED),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+            prev_project = Some(project_name.clone());
+        }
+
+        // Identity row: cursor + key + state-glyph state · age · @assignee · sub-count
+        let bullet = if selected && focused { " ▸ " } else { "   " };
+        let bullet_color = if selected && focused { LOVE } else { MUTED };
+        let state_color = linear_state_color(&item.state);
+        let glyph =
+            state_glyph(cached.map(|c| c.state_kind.as_str()).unwrap_or(""));
+
+        let mut row1: Vec<Span> = vec![
+            Span::styled(bullet, Style::default().fg(bullet_color)),
+            Span::styled(
+                format!("{}  ", item.key),
+                Style::default().fg(IRIS),
+            ),
+            Span::styled(format!("{glyph} "), Style::default().fg(state_color)),
+        ];
+        if !item.state.is_empty() {
             row1.push(Span::styled(
-                state_glyph(cached.map(|c| c.state_kind.as_str()).unwrap_or("")).to_string(),
+                item.state.clone(),
                 Style::default().fg(state_color),
             ));
-            if !item.state.is_empty() {
-                row1.push(Span::styled(
-                    format!(" {}", item.state),
-                    Style::default().fg(state_color),
-                ));
-            }
+        }
+        let mut tail: Vec<String> = Vec::new();
+        if let Some(c) = cached {
+            let age = relative_age(&c.updated_at);
             if !age.is_empty() {
-                row1.push(Span::styled(
-                    format!("  ·  {age}"),
-                    Style::default().fg(MUTED),
-                ));
-            }
-            lines.push(Line::from(row1));
-
-            // Row 2: title (indented)
-            if !item.title.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(item.title.clone(), Style::default().fg(TEXT)),
-                ]));
-            }
-
-            // Row 3: project · sub-issue count · assignee
-            let mut row3: Vec<Span> = vec![Span::raw("    ")];
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(c) = cached {
-                if let Some(p) = &c.project {
-                    parts.push(p.name.clone());
-                }
-                if !c.children.is_empty() {
-                    parts.push(format!(
-                        "{} sub-issue{}",
-                        c.children.len(),
-                        if c.children.len() == 1 { "" } else { "s" },
-                    ));
-                }
+                tail.push(age);
             }
             if let Some(a) = &item.assignee {
-                parts.push(format!("@{a}"));
+                tail.push(format!("@{a}"));
             }
-            if !parts.is_empty() {
-                row3.push(Span::styled(
-                    parts.join("  ·  "),
-                    Style::default().fg(SUBTLE),
+            if !c.children.is_empty() {
+                tail.push(format!(
+                    "{} sub-issue{}",
+                    c.children.len(),
+                    if c.children.len() == 1 { "" } else { "s" }
                 ));
-                lines.push(Line::from(row3));
             }
-            lines.push(Line::raw(""));
+            // Show priority only when it's high (P0/P1).
+            if c.priority == 1 || c.priority == 2 {
+                tail.push(priority_glyph(c.priority).to_string());
+            }
+        } else if let Some(a) = &item.assignee {
+            tail.push(format!("@{a}"));
         }
-        if focused {
-            lines.push(Line::styled(
-                " j/k navigate · Enter detail · o browser",
+        if !tail.is_empty() {
+            row1.push(Span::styled(
+                format!("  ·  {}", tail.join("  ·  ")),
                 Style::default().fg(MUTED),
             ));
         }
+        lines.push(Line::from(row1));
+
+        // Title row
+        if !item.title.is_empty() {
+            lines.push(Line::from(vec![
+                Span::raw("     "),
+                Span::styled(item.title.clone(), Style::default().fg(TEXT)),
+            ]));
+        }
     }
+
+    if focused {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            " j/k navigate · Enter detail · o browser",
+            Style::default().fg(MUTED),
+        ));
+    }
+
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
+
 
 fn render_linear_detail(
     frame: &mut Frame,
