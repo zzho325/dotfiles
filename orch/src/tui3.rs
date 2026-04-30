@@ -917,22 +917,19 @@ struct ListRow {
 
 const AUTO_EXPAND_LIMIT: usize = 6;
 
-/// Build the flat row stream from a task's linear stubs + cache. The
-/// cursored parent (or the parent of a cursored sub-issue) auto-expands
-/// when its child count is in 1..=AUTO_EXPAND_LIMIT. Mega-parents
-/// (7+ children) only expand when pinned. Project headers appear only
-/// when there are 2+ distinct projects.
+/// Build the flat row stream. Sub-issues are ALWAYS expanded inline
+/// — the list never reshapes when the cursor moves. Project headers
+/// appear only when there are 2+ distinct projects.
 fn build_linear_rows(
     stubs: &[LinearStub],
     cache: &crate::cache::LinearCache,
-    cursor_key: &str,
-    pinned: &HashSet<String>,
+    _cursor_key: &str,
+    _pinned: &HashSet<String>,
 ) -> Vec<ListRow> {
     if stubs.is_empty() {
         return Vec::new();
     }
 
-    // Distinct projects across linked stubs.
     let mut projects: Vec<String> = Vec::new();
     for s in stubs {
         let p = cache
@@ -947,25 +944,6 @@ fn build_linear_rows(
     }
     let multi_project = projects.len() > 1;
 
-    // Determine which parent (if any) the cursor lives "in" — either the
-    // parent itself or one of its children.
-    let cursor_parent_key: Option<String> = if cursor_key.is_empty() {
-        None
-    } else if stubs.iter().any(|s| s.key == cursor_key) {
-        Some(cursor_key.to_string())
-    } else {
-        stubs
-            .iter()
-            .find(|s| {
-                cache
-                    .issues
-                    .get(&s.key)
-                    .map(|c| c.children.iter().any(|ch| ch.identifier == cursor_key))
-                    .unwrap_or(false)
-            })
-            .map(|s| s.key.clone())
-    };
-
     let mut rows: Vec<ListRow> = Vec::new();
     let mut prev_project: Option<String> = None;
 
@@ -976,7 +954,6 @@ fn build_linear_rows(
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "(no project)".into());
 
-        // Project header on transition (only when multi-project).
         if multi_project && prev_project.as_ref() != Some(&project_name) {
             rows.push(ListRow {
                 key: format!("__project_{project_name}"),
@@ -992,16 +969,10 @@ fn build_linear_rows(
 
         let is_not_found = cache.not_found.contains(&stub.key);
         let n_children = cached.map(|c| c.children.len()).unwrap_or(0);
-        let is_cursor_anchor = cursor_parent_key.as_deref() == Some(stub.key.as_str());
-        let auto_expand = is_cursor_anchor && (1..=AUTO_EXPAND_LIMIT).contains(&n_children);
-        let is_pinned = pinned.contains(&stub.key);
-        let expanded = auto_expand || is_pinned;
 
-        // Parent row.
-        let collapsed_subs = if expanded { 0 } else { n_children };
         rows.push(ListRow {
             key: stub.key.clone(),
-            kind: RowKind::Parent { collapsed_subs },
+            kind: RowKind::Parent { collapsed_subs: 0 },
             title: cached.map(|c| c.title.clone()).unwrap_or_else(|| stub.title.clone()),
             state_kind: cached.map(|c| c.state_kind.clone()).unwrap_or_default(),
             state_name: cached.map(|c| c.state.clone()).unwrap_or_default(),
@@ -1009,32 +980,17 @@ fn build_linear_rows(
             not_found: is_not_found,
         });
 
-        if expanded && n_children > 0 {
-            let cap = if is_pinned && n_children > AUTO_EXPAND_LIMIT {
-                AUTO_EXPAND_LIMIT
-            } else {
-                n_children
-            };
-            for (i, child) in cached.unwrap().children.iter().take(cap).enumerate() {
-                let is_last = i + 1 == cap && cap == n_children;
+        if n_children > 0 {
+            for (i, child) in cached.unwrap().children.iter().enumerate() {
                 rows.push(ListRow {
                     key: child.identifier.clone(),
-                    kind: RowKind::SubIssue { is_last },
+                    kind: RowKind::SubIssue {
+                        is_last: i + 1 == n_children,
+                    },
                     title: child.title.clone(),
                     state_kind: child.state_kind.clone(),
                     state_name: child.state.clone(),
                     project_for_strip: project_name.clone(),
-                    not_found: false,
-                });
-            }
-            if cap < n_children {
-                rows.push(ListRow {
-                    key: format!("__more_{}", stub.key),
-                    kind: RowKind::MoreMarker,
-                    title: format!("+ {} more", n_children - cap),
-                    state_kind: String::new(),
-                    state_name: String::new(),
-                    project_for_strip: String::new(),
                     not_found: false,
                 });
             }
@@ -1124,18 +1080,13 @@ fn render_linear_list(
                 ]));
                 last_was_header = true;
             }
-            RowKind::Parent { collapsed_subs } => {
+            RowKind::Parent { collapsed_subs: _ } => {
                 let selected = focused && row.key == cursor_key;
                 let cursor_glyph = if selected { " ▸ " } else { "   " };
                 let cursor_color = if selected { LOVE } else { MUTED };
                 let state_color = linear_state_color(&row.state_name);
                 let glyph = state_glyph(&row.state_kind);
                 let title = strip_project_prefix(&row.title, &row.project_for_strip);
-                let trailer = if *collapsed_subs > 0 {
-                    Some(format!("+ {collapsed_subs} sub"))
-                } else {
-                    None
-                };
                 lines.push(compose_row(
                     cursor_glyph,
                     cursor_color,
@@ -1144,7 +1095,7 @@ fn render_linear_list(
                     state_color,
                     &title,
                     if row.not_found { Some(LOVE) } else { None },
-                    trailer.as_deref(),
+                    None,
                     width,
                     selected,
                 ));
@@ -1195,12 +1146,15 @@ fn render_linear_list(
     if focused {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            " j/k move · Enter open · t expand · o browser",
+            " j/k move · Enter open · o browser",
             Style::default().fg(MUTED),
         ));
     }
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    // No wrap on the list — each row is intended to be one line; long
+    // titles are truncated in compose_row. Wrapping shifted alignment
+    // when titles got cut.
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// One-line row composer used by both Parent and SubIssue rows.
@@ -2039,9 +1993,6 @@ fn handle_right_key(app: &mut App, key: KeyEvent) {
         }
         (Tab::Linear, KeyCode::Char('o')) => {
             handle_linear_open_browser(app);
-        }
-        (Tab::Linear, KeyCode::Char('t')) => {
-            handle_linear_toggle_expand(app);
         }
         _ => {}
     }
