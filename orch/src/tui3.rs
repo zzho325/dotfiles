@@ -658,18 +658,12 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             // so the user can navigate back to it.
             let row_bg = if selected { Some(HL_LOW) } else { None };
 
-            let pr_count = task.prs.len();
-            let linear_count = task.linear.len();
-
+            // P/L counts intentionally omitted from the list — the
+            // user only cared about drift state at a glance, and the
+            // detail tabs already surface PR/Linear counts.
             let mut counts = String::new();
             if task.drift {
                 counts.push_str(" ⚠");
-            }
-            if pr_count > 0 {
-                counts.push_str(&format!(" P{pr_count}"));
-            }
-            if linear_count > 0 {
-                counts.push_str(&format!(" L{linear_count}"));
             }
             let badge_text = format!(" {badge}");
             let id_text = task.id.map(|i| format!("#{i} ")).unwrap_or_default();
@@ -1946,6 +1940,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::styled(" Global", Style::default().fg(IRIS)),
         kv_line("  q        ", "quit"),
         kv_line("  Tab      ", "toggle list ↔ right"),
+        kv_line("  [ / ]    ", "previous / next task (any focus)"),
         kv_line("  1 2 3 4  ", "Overview · PRs · Linear · Panes"),
         kv_line("  Esc      ", "right → list; list → quit"),
         kv_line("  PgUp/Dn  ", "scroll log"),
@@ -2153,6 +2148,21 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         (KeyCode::Char('m'), _) => {
             app.message_input = Some(String::new());
+        }
+        // Navigate tasks from any focus — useful for cycling through
+        // tasks while staying in a detail tab (Linear, PRs, etc) without
+        // needing to Tab/Esc back to the list.
+        (KeyCode::Char(']'), _) => {
+            if app.selected + 1 < app.tasks.len() {
+                app.selected += 1;
+                app.panes_selected = 0;
+                reset_linear_cursor_for_new_task(app);
+            }
+        }
+        (KeyCode::Char('['), _) => {
+            app.selected = app.selected.saturating_sub(1);
+            app.panes_selected = 0;
+            reset_linear_cursor_for_new_task(app);
         }
         // Global log controls.
         (KeyCode::PageUp, _) => {
