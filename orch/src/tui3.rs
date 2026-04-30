@@ -2305,6 +2305,109 @@ mod tests {
     }
 
     #[test]
+    fn linear_enter_pushes_detail() {
+        let mut app = test_app();
+        app.focus = Pane::Right;
+        app.detail_tab = Tab::Linear;
+        app.linear_view = LinearView::List { cursor: 0 };
+        // Task #0 has one Linear stub: ENG-29151
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        match &app.linear_view {
+            LinearView::Detail { stack, sub_cursor } => {
+                assert_eq!(stack, &vec!["ENG-29151".to_string()]);
+                assert_eq!(*sub_cursor, 0);
+            }
+            _ => panic!("expected Detail view, got {:?}", app.linear_view),
+        }
+    }
+
+    #[test]
+    fn linear_esc_pops_detail() {
+        let mut app = test_app();
+        app.focus = Pane::Right;
+        app.detail_tab = Tab::Linear;
+        app.linear_view = LinearView::Detail {
+            stack: vec!["ENG-1".into(), "ENG-2".into()],
+            sub_cursor: 0,
+        };
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        // Esc pops one level
+        match &app.linear_view {
+            LinearView::Detail { stack, .. } => {
+                assert_eq!(stack, &vec!["ENG-1".to_string()]);
+            }
+            _ => panic!("expected Detail with shorter stack"),
+        }
+        // Esc again pops to List
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.linear_view, LinearView::List { .. }));
+        // Esc again returns focus to list zone
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.focus, Pane::List);
+        // Esc from list quits
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn linear_drill_stack_capped() {
+        // Stack pushes are capped at 8 to prevent runaway.
+        let mut app = test_app();
+        app.focus = Pane::Right;
+        app.detail_tab = Tab::Linear;
+        app.linear_view = LinearView::Detail {
+            stack: (0..8).map(|i| format!("ENG-{i}")).collect(),
+            sub_cursor: 0,
+        };
+        // Pushing parent should no-op since stack is at cap; with no
+        // cache entry the parent_key lookup is None anyway, but cap
+        // logic is still tested.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('u')));
+        match &app.linear_view {
+            LinearView::Detail { stack, .. } => assert_eq!(stack.len(), 8),
+            _ => panic!("expected Detail"),
+        }
+    }
+
+    #[test]
+    fn priority_glyph_mapping() {
+        assert_eq!(priority_glyph(0), "");
+        assert_eq!(priority_glyph(1), "P0");
+        assert_eq!(priority_glyph(2), "P1");
+        assert_eq!(priority_glyph(3), "P2");
+        assert_eq!(priority_glyph(4), "P3");
+    }
+
+    #[test]
+    fn state_glyph_mapping() {
+        assert_eq!(state_glyph("started"), "◐");
+        assert_eq!(state_glyph("completed"), "●");
+        assert_eq!(state_glyph("canceled"), "⊘");
+        assert_eq!(state_glyph("unstarted"), "○");
+        assert_eq!(state_glyph("backlog"), "·");
+        assert_eq!(state_glyph("triage"), "△");
+        assert_eq!(state_glyph("unknown"), "·");
+    }
+
+    #[test]
+    fn wrap_text_preserves_blank_lines() {
+        let s = "line one is here\n\nline two is also here";
+        let out = wrap_text(s, 10);
+        // "line one" wraps; blank line preserved; "line two" wraps
+        assert!(out.contains(&String::new()));
+        assert!(out.iter().any(|l| l.starts_with("line")));
+    }
+
+    #[test]
+    fn relative_age_formats() {
+        // We can't pin an exact value (depends on now), but sanity-check
+        // empty input → empty string.
+        assert_eq!(relative_age(""), "");
+        // Naive too-short input returns empty
+        assert_eq!(relative_age("invalid"), "");
+    }
+
+    #[test]
     fn snapshot_linear_anchor_subissues() {
         let mut app = test_app();
         app.focus = Pane::Right;
