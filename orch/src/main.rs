@@ -202,6 +202,10 @@ enum LinearAction {
         /// Task name
         task: String,
     },
+    /// Remove keys from all task records that the linear cache has
+    /// flagged as not-found (deleted issues, typos, non-Linear
+    /// patterns like REQ-01).
+    Clean,
 }
 
 #[derive(Subcommand)]
@@ -856,7 +860,9 @@ fn cmd_linear_ls(task: &str) {
 }
 
 /// Scan one task's .md file for `[A-Z]+-\d+` patterns and link any
-/// not already linked. New links use `source=MarkdownScan`.
+/// not already linked. Keys in the linear cache's `not_found` set are
+/// skipped — they were tried and Linear says they don't resolve.
+/// New links use `source=MarkdownScan`.
 fn scan_task_md_for_keys(task: &str, store: &store::Store) -> usize {
     let md = state::tasks_dir().join(format!("{task}.md"));
     let content = match fs::read_to_string(&md) {
@@ -866,11 +872,18 @@ fn scan_task_md_for_keys(task: &str, store: &store::Store) -> usize {
     let Some(mut record) = store.load_record_by_slug(task) else {
         return 0;
     };
+    let not_found: HashSet<String> = cache::read_linear()
+        .not_found
+        .into_iter()
+        .collect();
     let pattern = linear_key_pattern();
     let mut added = 0;
     for m in pattern.find_iter(&content) {
         let key = m.as_str().to_string();
         if record.links.linear_issues.iter().any(|li| li.key == key) {
+            continue;
+        }
+        if not_found.contains(&key) {
             continue;
         }
         record.links.linear_issues.push(store::LinearLink {
@@ -885,6 +898,43 @@ fn scan_task_md_for_keys(task: &str, store: &store::Store) -> usize {
         store.save_record(&record);
     }
     added
+}
+
+fn cmd_linear_clean() {
+    let Some(s) = require_v2_store() else { return };
+    let cache = cache::read_linear();
+    if cache.not_found.is_empty() {
+        eprintln!("[linear] no not-found keys to clean");
+        return;
+    }
+    let bad: HashSet<String> = cache.not_found.iter().cloned().collect();
+    eprintln!("[linear] cleaning {} not-found key(s)", bad.len());
+
+    let registry = match s.load_registry() {
+        Some(r) => r,
+        None => {
+            eprintln!("[linear] no registry");
+            return;
+        }
+    };
+    let mut total_removed = 0;
+    let mut tasks_touched = 0;
+    for id in registry.open_order.iter().chain(registry.closed_order.iter()) {
+        let Some(mut record) = s.load_record(*id) else { continue };
+        let before = record.links.linear_issues.len();
+        record.links.linear_issues.retain(|li| !bad.contains(&li.key));
+        let removed = before - record.links.linear_issues.len();
+        if removed > 0 {
+            record.updated_at = epoch_secs();
+            s.save_record(&record);
+            tasks_touched += 1;
+            total_removed += removed;
+            eprintln!("  {}: removed {removed} key(s)", record.slug);
+        }
+    }
+    eprintln!(
+        "[linear] cleaned {total_removed} link(s) from {tasks_touched} task(s)"
+    );
 }
 
 fn cmd_linear_scan(task: Option<&str>) {
@@ -1317,6 +1367,7 @@ fn main() {
             LinearAction::Rm { task, key } => cmd_linear_rm(&task, &key),
             LinearAction::Scan { task } => cmd_linear_scan(task.as_deref()),
             LinearAction::Ls { task } => cmd_linear_ls(&task),
+            LinearAction::Clean => cmd_linear_clean(),
         },
         Some(Cmd::Pr { action }) => match action {
             PrAction::Add { task, number } => {

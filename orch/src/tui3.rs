@@ -597,6 +597,45 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         render_help_overlay(frame, area);
     }
+    if app.message_input.is_some() {
+        render_message_input(frame, area, app);
+    }
+}
+
+/// Single-line message input modal at the very bottom of the screen.
+/// Shown only when `m` has been pressed (until Esc cancels or Enter
+/// sends). Overdraws whatever was on the bottom row.
+fn render_message_input(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(buf) = app.message_input.as_ref() else {
+        return;
+    };
+    if area.height < 1 {
+        return;
+    }
+    let bar = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(ratatui::widgets::Clear, bar);
+    let prompt = Span::styled(
+        " orch ▸ ",
+        Style::default().fg(LOVE),
+    );
+    let body = Span::styled(buf.clone(), Style::default().fg(TEXT));
+    let cursor = Span::styled(
+        "▌",
+        Style::default().fg(LOVE),
+    );
+    let hint = Span::styled(
+        "  Enter to send · Esc to cancel",
+        Style::default().fg(MUTED),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![prompt, body, cursor, hint])),
+        bar,
+    );
 }
 
 fn render_focus_ruler(frame: &mut Frame, area: Rect, focused: bool) {
@@ -2075,7 +2114,7 @@ fn total_wrapped_rows(lines: &[String], width: usize) -> usize {
 // via global PgUp/PgDn/`<`/`>` regardless of focus. See
 // `docs/tui-nav-redesign.md`.
 
-const UNWIRED_KEYS: &[char] = &['n', 's', 'p', 'R', 'x', 'M', 'J', 'K', 'o', 'W'];
+const UNWIRED_KEYS: &[char] = &['n', 'M', 'J', 'K', 'W'];
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     if app.show_help {
@@ -2233,8 +2272,179 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+        // Lifecycle ops on the selected task — surface success/failure
+        // via toast since the TUI owns the screen.
+        KeyCode::Char('s') => lifecycle_op(app, "spawn", lifecycle_spawn),
+        KeyCode::Char('R') => lifecycle_op(app, "resume", lifecycle_resume),
+        KeyCode::Char('p') => lifecycle_op(app, "pause", lifecycle_pause),
+        KeyCode::Char('x') => lifecycle_op(app, "close", lifecycle_close),
         _ => {}
     }
+}
+
+fn lifecycle_op(
+    app: &mut App,
+    label: &str,
+    f: fn(&str, &str) -> Result<String, String>,
+) {
+    let Some(task) = app.selected_task() else { return };
+    let name = task.name.clone();
+    let session = task.meta.session.clone();
+    match f(&name, &session) {
+        Ok(msg) => app.toast = Some(msg),
+        Err(e) => app.toast = Some(format!("{label} failed: {e}")),
+    }
+    // Re-pull task state so the row badge reflects the change.
+    app.refresh_status();
+}
+
+/// Spawn a worker for the task: create a tmux session in the
+/// worktree and start `claude '/orch:worker <md>'`. Idempotent —
+/// no-ops with a friendly message if the session already exists.
+fn lifecycle_spawn(name: &str, _session: &str) -> Result<String, String> {
+    let session = format!("task-{name}");
+    if find_actual_session(&session).is_some() {
+        return Err(format!("session {session} already exists"));
+    }
+    let mut meta = state::load_task_meta(name);
+    let repo = std::env::var("ORCH_REPO")
+        .map_err(|_| "ORCH_REPO not set".to_string())?;
+    let home = dirs::home_dir().unwrap_or_default();
+    let work_dir = if !meta.worktree.is_empty() {
+        meta.worktree.replace("~", &home.to_string_lossy())
+    } else {
+        format!("{repo}/task-{name}")
+    };
+    let task_file = state::tasks_dir().join(format!("{name}.md"));
+    if !task_file.exists() {
+        return Err(format!("no task file: {}", task_file.display()));
+    }
+    let cmd_str = format!("claude '/orch:worker {}'", task_file.display());
+    let new_ok = Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session, "-c", &work_dir])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !new_ok {
+        return Err("tmux new-session failed".into());
+    }
+    let send_ok = Command::new("tmux")
+        .args(["send-keys", "-t", &session, &cmd_str, "Enter"])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !send_ok {
+        return Err("tmux send-keys failed".into());
+    }
+    meta.session = session.clone();
+    meta.worktree = work_dir;
+    meta.paused = false;
+    state::save_task_meta(name, &meta);
+    Ok(format!("spawned {session}"))
+}
+
+fn lifecycle_resume(name: &str, session: &str) -> Result<String, String> {
+    let mut meta = state::load_task_meta(name);
+    meta.paused = false;
+    state::save_task_meta(name, &meta);
+    let _ = session;
+    lifecycle_spawn(name, "")
+}
+
+fn lifecycle_pause(name: &str, session: &str) -> Result<String, String> {
+    if !session.is_empty() {
+        if let Some(actual) = find_actual_session(session) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &actual])
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let mut meta = state::load_task_meta(name);
+    meta.paused = true;
+    state::save_task_meta(name, &meta);
+    Ok(format!("paused {name}"))
+}
+
+fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
+    let store = crate::store::Store::default();
+    let v2 = store.is_authoritative();
+    let record_id = if v2 {
+        store.load_record_by_slug(name).map(|r| r.id)
+    } else {
+        None
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = state::tasks_dir();
+    let archive_name = record_id
+        .map(|id| format!("{id}-{name}.md"))
+        .unwrap_or_else(|| format!("{name}.md"));
+    let archive_path = dir.join("done").join(&archive_name);
+
+    // 1. v2 FSM transition.
+    if let Some(id) = record_id {
+        if let Some(mut record) = store.load_record(id) {
+            record.desired_state = crate::store::DesiredState::Closed;
+            record.closed_at = Some(now);
+            record.archived_task_file = Some(archive_path.clone());
+            record.updated_at = now;
+            store.save_record(&record);
+        }
+        if let Some(mut registry) = store.load_registry() {
+            registry.open_order.retain(|i| *i != id);
+            if !registry.closed_order.contains(&id) {
+                registry.closed_order.push(id);
+            }
+            store.save_registry(&registry);
+        }
+    }
+
+    // 2. Archive .md — abort on failure.
+    let md = dir.join(format!("{name}.md"));
+    if md.exists() {
+        std::fs::create_dir_all(dir.join("done"))
+            .map_err(|e| format!("create done/: {e}"))?;
+        std::fs::rename(&md, &archive_path)
+            .map_err(|e| format!("archive {name}.md: {e}"))?;
+    }
+
+    // 3. Kill tmux.
+    if !session.is_empty() {
+        if let Some(actual) = find_actual_session(session) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &actual])
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    // 4. Remove worktree.
+    let meta = state::load_task_meta(name);
+    if !meta.worktree.is_empty() {
+        let home = dirs::home_dir().unwrap_or_default();
+        let wt = meta.worktree.replace("~", &home.to_string_lossy());
+        let path = std::path::Path::new(&wt);
+        if path.exists() {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", &wt])
+                .current_dir(format!(
+                    "{}/main",
+                    std::env::var("ORCH_REPO").unwrap_or_default()
+                ))
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    let state_path = dir.join(".state").join(format!("{name}.json"));
+    if state_path.exists() {
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    Ok(format!("closed {name}"))
 }
 
 /// Right-zone key dispatch. j/k always means "move cursor in active
@@ -3213,12 +3423,12 @@ mod tests {
     #[test]
     fn unwired_keys_show_toast() {
         let mut app = test_app();
-        // R is a Phase 4a key, not yet wired
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('R')));
+        // M (modify slug, Phase 4a) still unwired
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('M')));
         assert!(app.toast.is_some());
         let toast = app.toast.as_ref().unwrap();
         assert!(toast.contains("not yet wired"));
-        assert!(toast.contains("R"));
+        assert!(toast.contains("M"));
 
         // Next non-toast key clears the toast
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
