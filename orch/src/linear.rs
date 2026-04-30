@@ -79,6 +79,15 @@ pub fn fetch_issue(api_key: &str, identifier: &str) -> Result<Option<LinearIssue
         .map_err(|e| format!("parse: {e}"))?;
 
     if let Some(errors) = json.get("errors") {
+        // "Entity not found" / INPUT_ERROR means the identifier
+        // doesn't resolve to a real issue (typo, deleted, or the
+        // pattern matched a non-Linear string like REQ-01).
+        // Treat as Ok(None) rather than a hard error so the daemon
+        // can keep going through the rest of the keys.
+        let s = errors.to_string();
+        if s.contains("Entity not found") || s.contains("INPUT_ERROR") {
+            return Ok(None);
+        }
         return Err(format!("graphql: {errors}"));
     }
 

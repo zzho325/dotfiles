@@ -1027,8 +1027,18 @@ fn spawn_linear_loop() {
                 }
             };
 
-            // Collect every distinct linear key across open tasks.
+            // Auto-scan every open task's md file for Linear keys
+            // before fetching, so newly-mentioned keys get linked
+            // without an explicit `orch linear scan`. Idempotent —
+            // scan_task_md_for_keys skips already-linked keys.
             let store = store::Store::default();
+            if store.is_authoritative() {
+                for slug in state::ordered_open_slugs() {
+                    scan_task_md_for_keys(&slug, &store);
+                }
+            }
+
+            // Collect every distinct linear key across open tasks.
             let mut keys: Vec<String> = Vec::new();
             if store.is_authoritative() {
                 for record in store.load_open_records() {
@@ -1044,17 +1054,15 @@ fn spawn_linear_loop() {
                 cache::write_linear(&cache::LinearCache {
                     generated_at: cache::now_epoch(),
                     issues: std::collections::HashMap::new(),
+                    not_found: Vec::new(),
                     disconnected: false,
                 });
                 std::thread::sleep(Duration::from_secs(120));
                 continue;
             }
 
-            // Per-issue fetches: tolerate not-found / individual errors
-            // by skipping the key, only mark disconnected on persistent
-            // failures (auth, network). One issue's 404 doesn't poison
-            // the whole cache.
             let mut cached_issues = std::collections::HashMap::new();
+            let mut not_found = Vec::new();
             let mut hard_failures = 0u32;
             for key in &keys {
                 match linear::fetch_issue(&api_key, key) {
@@ -1065,8 +1073,10 @@ fn spawn_linear_loop() {
                         );
                     }
                     Ok(None) => {
-                        // Not found — skip silently; the link probably
-                        // points at a deleted or misspelled key.
+                        // Linear says this key doesn't resolve — the
+                        // link probably points at a deleted issue or
+                        // a non-Linear pattern (e.g. REQ-01).
+                        not_found.push(key.clone());
                     }
                     Err(e) => {
                         hard_failures += 1;
@@ -1081,6 +1091,7 @@ fn spawn_linear_loop() {
             cache::write_linear(&cache::LinearCache {
                 generated_at: cache::now_epoch(),
                 issues: cached_issues,
+                not_found,
                 disconnected,
             });
 

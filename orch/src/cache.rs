@@ -51,6 +51,12 @@ pub struct LinearCache {
     pub generated_at: u64,
     /// Keyed by issue identifier (e.g. "ENG-29535").
     pub issues: HashMap<String, CachedLinear>,
+    /// Keys that were attempted recently but returned not-found from
+    /// Linear (deleted issue, typo, non-Linear key like REQ-01). The
+    /// TUI renders these as "(not on Linear)" rather than perpetually
+    /// "loading…". Repopulated on each refresh.
+    #[serde(default)]
+    pub not_found: Vec<String>,
     /// True when the most recent refresh failed (e.g. no API key,
     /// network error). The cache content is retained — TUI can render
     /// last-known data with a "stale/disconnected" badge.

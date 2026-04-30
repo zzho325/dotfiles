@@ -469,6 +469,14 @@ fn linear_from_record(
                     },
                     depth: 0,
                 }
+            } else if cache.not_found.contains(&li.key) {
+                LinearStub {
+                    key: li.key.clone(),
+                    title: String::new(),
+                    state: "not on Linear".into(),
+                    assignee: None,
+                    depth: 0,
+                }
             } else {
                 let provenance = match li.source {
                     crate::store::LinkSource::Manual => "manual",
