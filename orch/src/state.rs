@@ -83,6 +83,10 @@ pub enum TaskStatus {
     Idle,
     Attached,
     Paused,
+    /// `Active` desired_state but the worker process is dead inside an
+    /// otherwise-live tmux session. Per redesign.md §2 badge derivation
+    /// matrix; user can `R` resume to re-spawn.
+    Error,
 }
 
 // Combined task view
@@ -346,7 +350,10 @@ pub fn derive_status(
     }
 
     if !session.has_active_process {
-        return TaskStatus::Ready;
+        // Active session present but no claude/node/codex process —
+        // worker_dead per the matrix in redesign.md §2. Distinct from
+        // Ready (which means the worker is alive and idle).
+        return TaskStatus::Error;
     }
 
     // Working iff a fresh busy marker reports a cwd inside this task's
@@ -817,7 +824,10 @@ mod tests {
     }
 
     #[test]
-    fn derive_status_no_active_process_is_ready() {
+    fn derive_status_no_active_process_is_error() {
+        // Active session with no worker process = worker_dead per
+        // redesign.md §2 matrix. Used to be Ready, but Ready meant
+        // "worker alive and idle" — distinct from "worker died".
         let meta = TaskMeta {
             session: "task-foo".into(),
             ..Default::default()
@@ -833,7 +843,7 @@ mod tests {
         );
         assert_eq!(
             derive_status(&meta, &sessions, DEFAULT_BUSY_STALE_SECS),
-            TaskStatus::Ready,
+            TaskStatus::Error,
         );
     }
 

@@ -736,6 +736,7 @@ fn spawn_status_loop() {
                             state::TaskStatus::Idle => "idle",
                             state::TaskStatus::Paused => "paused",
                             state::TaskStatus::Attached => "attached",
+                            state::TaskStatus::Error => "error",
                         }
                         .to_string(),
                         has_active_process: matched

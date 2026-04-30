@@ -150,6 +150,7 @@ impl App {
                             "input" => TaskStatus::Input,
                             "attached" => TaskStatus::Attached,
                             "paused" => TaskStatus::Paused,
+                            "error" => TaskStatus::Error,
                             _ => TaskStatus::Idle,
                         })
                         .unwrap_or(TaskStatus::Idle)
@@ -486,6 +487,7 @@ fn status_str(status: TaskStatus) -> &'static str {
         TaskStatus::Idle => "idle",
         TaskStatus::Paused => "paused",
         TaskStatus::Attached => "·",
+        TaskStatus::Error => "error",
     }
 }
 
@@ -496,6 +498,7 @@ fn status_color(status: TaskStatus) -> Color {
         TaskStatus::Input => GOLD,
         TaskStatus::Paused => IRIS,
         TaskStatus::Idle | TaskStatus::Attached => MUTED,
+        TaskStatus::Error => LOVE,
     }
 }
 
