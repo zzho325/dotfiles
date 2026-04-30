@@ -36,6 +36,7 @@ pub struct StatusCache {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CachedLinear {
+    // Existing.
     pub identifier: String,
     pub title: String,
     /// Workflow state name (e.g. "In Progress", "Done").
@@ -44,6 +45,53 @@ pub struct CachedLinear {
     pub state_kind: String,
     pub assignee: String,
     pub fetched_at: u64,
+
+    // Identity + display (added in deep-view slice).
+    #[serde(default)]
+    pub description: String,
+    /// 0=none, 1=urgent, 2=high, 3=medium, 4=low (Linear's scale).
+    #[serde(default)]
+    pub priority: u8,
+    #[serde(default)]
+    pub priority_label: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub branch_name: String,
+    #[serde(default)]
+    pub updated_at: String,
+
+    // Hierarchy.
+    #[serde(default)]
+    pub parent_key: Option<String>,
+    #[serde(default)]
+    pub parent_title: Option<String>,
+    #[serde(default)]
+    pub children: Vec<CachedChild>,
+
+    // Project / cycle.
+    #[serde(default)]
+    pub project: Option<CachedProject>,
+    #[serde(default)]
+    pub cycle_name: Option<String>,
+    #[serde(default)]
+    pub cycle_ends_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachedChild {
+    pub identifier: String,
+    pub title: String,
+    pub state: String,
+    pub state_kind: String,
+    pub assignee: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachedProject {
+    pub id: String,
+    pub name: String,
+    pub slug_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -139,6 +187,55 @@ impl CachedLinear {
                 .map(|a| a.display_name.clone())
                 .unwrap_or_default(),
             fetched_at: now_epoch(),
+            description: issue.description.clone().unwrap_or_default(),
+            priority: issue.priority.unwrap_or(0),
+            priority_label: issue.priority_label.clone().unwrap_or_default(),
+            url: issue.url.clone().unwrap_or_default(),
+            branch_name: issue.branch_name.clone().unwrap_or_default(),
+            updated_at: issue.updated_at.clone().unwrap_or_default(),
+            parent_key: issue.parent.as_ref().map(|p| p.identifier.clone()),
+            parent_title: issue.parent.as_ref().map(|p| p.title.clone()),
+            children: issue
+                .children
+                .as_ref()
+                .map(|c| {
+                    c.nodes
+                        .iter()
+                        .map(|child| CachedChild {
+                            identifier: child.identifier.clone(),
+                            title: child.title.clone(),
+                            state: child
+                                .state
+                                .as_ref()
+                                .map(|s| s.name.clone())
+                                .unwrap_or_default(),
+                            state_kind: child
+                                .state
+                                .as_ref()
+                                .map(|s| s.kind.clone())
+                                .unwrap_or_default(),
+                            assignee: child
+                                .assignee
+                                .as_ref()
+                                .map(|a| a.display_name.clone())
+                                .unwrap_or_default(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            project: issue.project.as_ref().map(|p| CachedProject {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                slug_id: p.slug_id.clone().unwrap_or_default(),
+            }),
+            cycle_name: issue
+                .cycle
+                .as_ref()
+                .map(|c| c.name.clone().unwrap_or_default()),
+            cycle_ends_at: issue
+                .cycle
+                .as_ref()
+                .and_then(|c| c.ends_at.clone()),
         }
     }
 }

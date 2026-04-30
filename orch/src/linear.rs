@@ -15,14 +15,56 @@ use serde::Deserialize;
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Single GraphQL fragment shared by `fetch_issue` and `fetch_many`.
+/// Children's children deliberately not fetched — drilling into a
+/// sub-issue triggers its own fetch (avoids quadratic payload).
+const ISSUE_FIELDS: &str = "identifier title description priority priorityLabel \
+    state { name type } assignee { displayName } \
+    parent { identifier title } \
+    children { nodes { identifier title state { name type } assignee { displayName } } } \
+    project { id name slugId } \
+    cycle { name endsAt } \
+    branchName url updatedAt";
+
+const ISSUE_QUERY: &str = r#"query($id: String!) {
+    issue(id: $id) {
+        identifier title description priority priorityLabel
+        state { name type }
+        assignee { displayName }
+        parent { identifier title }
+        children { nodes { identifier title state { name type } assignee { displayName } } }
+        project { id name slugId }
+        cycle { name endsAt }
+        branchName url updatedAt
+    }
+}"#;
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LinearIssue {
     pub identifier: String,
     pub title: String,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub priority: Option<u8>,
+    #[serde(default, rename = "priorityLabel")]
+    pub priority_label: Option<String>,
+    #[serde(default)]
     pub state: Option<IssueState>,
     #[serde(default)]
     pub assignee: Option<IssueAssignee>,
+    #[serde(default)]
+    pub parent: Option<IssueParent>,
+    #[serde(default)]
+    pub children: Option<IssueChildren>,
+    #[serde(default)]
+    pub project: Option<IssueProject>,
+    #[serde(default)]
+    pub cycle: Option<IssueCycle>,
+    #[serde(default, rename = "branchName")]
+    pub branch_name: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(default, rename = "updatedAt")]
     pub updated_at: Option<String>,
 }
@@ -42,6 +84,35 @@ pub struct IssueAssignee {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IssueParent {
+    pub identifier: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IssueChildren {
+    #[serde(default)]
+    pub nodes: Vec<LinearIssue>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IssueProject {
+    pub id: String,
+    pub name: String,
+    #[serde(default, rename = "slugId")]
+    pub slug_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IssueCycle {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default, rename = "endsAt")]
+    pub ends_at: Option<String>,
+}
+
 pub fn api_key_from_env() -> Option<String> {
     std::env::var("LINEAR_API_KEY")
         .ok()
@@ -52,15 +123,7 @@ pub fn api_key_from_env() -> Option<String> {
 /// `Ok(None)` if the issue doesn't exist (Linear returns `null`),
 /// `Err` on auth/transport/parse failure.
 pub fn fetch_issue(api_key: &str, identifier: &str) -> Result<Option<LinearIssue>, String> {
-    let query = r#"query($id: String!) {
-        issue(id: $id) {
-            identifier
-            title
-            state { name type }
-            assignee { displayName }
-            updatedAt
-        }
-    }"#;
+    let query = ISSUE_QUERY;
 
     let body = serde_json::json!({
         "query": query,
@@ -114,13 +177,11 @@ pub fn fetch_many(
         return Ok(HashMap::new());
     }
 
-    // Build aliased selection set: `i0: issue(id: "ENG-1") { ... }`.
+    // Build aliased selection set: `i0: issue(id: "ENG-1") { ...fields }`.
     let mut selections = String::new();
     for (i, id) in identifiers.iter().enumerate() {
-        // Keys must be valid GraphQL aliases — strip non-alphanumerics
-        // and prefix to keep them valid.
         selections.push_str(&format!(
-            r#"i{i}: issue(id: "{}") {{ identifier title state {{ name type }} assignee {{ displayName }} updatedAt }} "#,
+            r#"i{i}: issue(id: "{}") {{ {ISSUE_FIELDS} }} "#,
             escape_graphql(id),
         ));
     }
