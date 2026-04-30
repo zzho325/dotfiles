@@ -169,6 +169,10 @@ enum Cmd {
         /// ENG-29535). Implies `--tab linear --focus details`.
         #[arg(long)]
         linear_detail: Option<String>,
+        /// Set the Linear list cursor to this issue key (e.g. ENG-26405).
+        /// Implies `--tab linear --focus details`.
+        #[arg(long)]
+        linear_cursor: Option<String>,
     },
 }
 
@@ -1297,8 +1301,16 @@ fn main() {
         }
         Some(Cmd::Gc) => cmd_gc(),
         Some(Cmd::Close { name }) => cmd_close(&name),
-        Some(Cmd::RenderDebug { width, height, tab, focus, select, linear_detail }) => {
-            tui3::render_debug(width, height, &tab, &focus, select, linear_detail.as_deref())
+        Some(Cmd::RenderDebug { width, height, tab, focus, select, linear_detail, linear_cursor }) => {
+            tui3::render_debug(
+                width,
+                height,
+                &tab,
+                &focus,
+                select,
+                linear_detail.as_deref(),
+                linear_cursor.as_deref(),
+            )
         }
         Some(Cmd::Linear { action }) => match action {
             LinearAction::Add { task, key } => cmd_linear_add(&task, &key),
