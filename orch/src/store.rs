@@ -385,6 +385,268 @@ impl Store {
             .filter_map(|id| self.load_record(*id))
             .collect()
     }
+
+    // Migration. See `docs/redesign.md` §6.
+
+    /// Migrate from legacy `.state/*.json` + `order.json` to the v2
+    /// store. Idempotent: a partial run leaves `store.v2.tmp/` and no
+    /// marker; the next call discards the tmp and starts over.
+    ///
+    /// Steps:
+    /// 1. Discard any leftover `store.v2.tmp/` from a prior crash.
+    /// 2. Build records from `tasks_dir` (legacy `.state/*.json` +
+    ///    `order.json` + task .md files).
+    /// 3. Write into `store.v2.tmp/`.
+    /// 4. fsync the tmp dir.
+    /// 5. Atomic rename `store.v2.tmp` -> `store.v2`.
+    /// 6. fsync `.orch/`.
+    /// 7. Write `store.version=v2`, fsync.
+    ///
+    /// Returns the count of migrated records on success.
+    pub fn migrate_from_legacy(&self, tasks_dir: &Path) -> Result<usize, String> {
+        // Skip if already migrated.
+        if self.is_authoritative() {
+            return Ok(0);
+        }
+
+        // Step 1: discard leftover tmp.
+        let tmp_root = self.store_root_tmp();
+        let _ = fs::remove_dir_all(&tmp_root);
+        // Also discard any half-finished store.v2 from a prior crash —
+        // without the marker it isn't authoritative anyway.
+        let _ = fs::remove_dir_all(self.store_root());
+
+        // Step 2: read legacy state.
+        let names = legacy_task_names(tasks_dir);
+        let order = legacy_order(tasks_dir);
+        let live_sessions = legacy_live_sessions();
+
+        // Step 3: build registry + records, write into tmp.
+        let mut registry = Registry::new();
+        let assignment_order = ordered_names(&order, &names);
+        let tmp_tasks = tmp_root.join("tasks");
+        fs::create_dir_all(&tmp_tasks)
+            .map_err(|e| format!("create tmp/tasks: {e}"))?;
+
+        let now = current_epoch();
+        for slug in &assignment_order {
+            let id = registry.allocate_id();
+            registry.open_order.push(id);
+            let record = build_record_from_legacy(
+                id,
+                slug,
+                tasks_dir,
+                &live_sessions,
+                now,
+            );
+            let path = tmp_tasks.join(format!("{id}.json"));
+            let json = serde_json::to_string_pretty(&record)
+                .map_err(|e| format!("serialize record {id}: {e}"))?;
+            atomic_write(&path, &json);
+            fsync_path(&path).map_err(|e| format!("fsync record {id}: {e}"))?;
+        }
+
+        // Write registry into tmp.
+        let registry_path = tmp_root.join("registry.json");
+        let json = serde_json::to_string_pretty(&registry)
+            .map_err(|e| format!("serialize registry: {e}"))?;
+        atomic_write(&registry_path, &json);
+        fsync_path(&registry_path)
+            .map_err(|e| format!("fsync registry: {e}"))?;
+
+        // Step 4: fsync the tmp dir.
+        fsync_path(&tmp_root)
+            .map_err(|e| format!("fsync tmp dir: {e}"))?;
+
+        // Step 5: atomic rename.
+        fs::rename(&tmp_root, self.store_root())
+            .map_err(|e| format!("rename tmp -> store: {e}"))?;
+
+        // Step 6: fsync .orch/.
+        fsync_path(&self.orch_root)
+            .map_err(|e| format!("fsync .orch/: {e}"))?;
+
+        // Step 7: write marker, fsync.
+        let version_path = self.store_version_path();
+        atomic_write(&version_path, STORE_VERSION);
+        fsync_path(&version_path)
+            .map_err(|e| format!("fsync store.version: {e}"))?;
+        fsync_path(&self.orch_root)
+            .map_err(|e| format!("fsync .orch/ post-marker: {e}"))?;
+
+        Ok(registry.open_order.len())
+    }
+}
+
+fn fsync_path(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+fn current_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Read task names from .md files in tasks_dir (matches state.rs
+/// `load_task_names` behavior; duplicated here to avoid coupling slice
+/// C to state.rs internals).
+fn legacy_task_names(tasks_dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(tasks_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .and_then(|s| s.to_str().map(String::from))
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Read the legacy `order.json` if present.
+fn legacy_order(tasks_dir: &Path) -> Vec<String> {
+    let path = tasks_dir.join(".state").join("order.json");
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Live tmux session names (e.g. `task-foo`, `3-task-foo`).
+fn legacy_live_sessions() -> Vec<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok();
+    let Some(output) = output.filter(|o| o.status.success()) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// ID-assignment order: first task names listed in `order.json`, then
+/// any remaining task names alphabetically.
+fn ordered_names(order: &[String], all: &[String]) -> Vec<String> {
+    let mut result: Vec<String> = order
+        .iter()
+        .filter(|n| all.contains(n))
+        .cloned()
+        .collect();
+    for name in all {
+        if !result.contains(name) {
+            result.push(name.clone());
+        }
+    }
+    result
+}
+
+/// Build a TaskRecord from legacy `.state/<slug>.json` plus tmux
+/// observation. Field mapping per `redesign.md` §6.
+fn build_record_from_legacy(
+    id: TaskId,
+    slug: &str,
+    tasks_dir: &Path,
+    live_sessions: &[String],
+    now: u64,
+) -> TaskRecord {
+    let legacy_path = tasks_dir.join(".state").join(format!("{slug}.json"));
+    let legacy: LegacyMeta = fs::read_to_string(&legacy_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let task_file = tasks_dir.join(format!("{slug}.md"));
+
+    // desired_state: paused>active>new based on legacy fields + live tmux.
+    let has_session_or_wt = !legacy.session.is_empty() || !legacy.worktree.is_empty();
+    let desired_state = if legacy.paused {
+        DesiredState::Paused
+    } else if has_session_or_wt {
+        DesiredState::Active
+    } else {
+        DesiredState::New
+    };
+
+    // Drift if persisted session is not in live tmux (recoverable on resume).
+    let session_missing = !legacy.session.is_empty()
+        && desired_state == DesiredState::Active
+        && !live_sessions.iter().any(|s| session_matches(s, &legacy.session));
+
+    TaskRecord {
+        id,
+        slug: slug.to_string(),
+        title: None,
+        task_file,
+        archived_task_file: None,
+        created_at: now,
+        started_at: if has_session_or_wt { Some(now) } else { None },
+        paused_at: if legacy.paused { Some(now) } else { None },
+        closed_at: None,
+        updated_at: now,
+        desired_state,
+        attention: AttentionInfo {
+            needs_input: legacy.needs_input,
+            last_prompt_from_worker: None,
+        },
+        worktree: WorktreeInfo {
+            path: legacy.worktree,
+            base_ref: String::new(),
+            cleanup_on_close: true,
+        },
+        tmux: TmuxInfo {
+            session_name: legacy.session,
+            ..Default::default()
+        },
+        agent: AgentInfo::default(),
+        links: Links {
+            prs: legacy
+                .prs
+                .into_iter()
+                .map(|number| PrLink {
+                    number,
+                    source: LinkSource::Migration,
+                    ..Default::default()
+                })
+                .collect(),
+            linear_issues: Vec::new(),
+            notes_urls: Vec::new(),
+        },
+        drift: DriftFlags {
+            session_missing,
+            ..Default::default()
+        },
+    }
+}
+
+/// Local copy of the legacy meta layout so migration doesn't depend on
+/// the live shape of `state::TaskMeta` (which evolves in later slices).
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LegacyMeta {
+    #[serde(default)]
+    session: String,
+    #[serde(default)]
+    worktree: String,
+    #[serde(default)]
+    prs: Vec<u32>,
+    #[serde(default)]
+    needs_input: bool,
+    #[serde(default)]
+    paused: bool,
+}
+
+/// Mirror of `state::session_matches` for migration use.
+fn session_matches(actual: &str, expected: &str) -> bool {
+    actual == expected || actual.ends_with(&format!("-{expected}"))
 }
 
 #[cfg(test)]
@@ -599,6 +861,151 @@ mod tests {
         let found = store.load_record_by_slug("find-me").unwrap();
         assert_eq!(found.id, id);
         assert!(store.load_record_by_slug("not-there").is_none());
+    }
+
+    /// Build a fixture `tasks_dir` with legacy `.state/<slug>.json`,
+    /// `order.json`, and task `.md` files. Returns the dir.
+    fn build_legacy_fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("orch-migrate-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".state")).unwrap();
+
+        // 3 tasks, 2 with state files (started/paused), 1 fresh
+        for slug in &["foo", "bar", "baz"] {
+            fs::write(dir.join(format!("{slug}.md")), "# stub").unwrap();
+        }
+
+        fs::write(
+            dir.join(".state").join("foo.json"),
+            r#"{"session":"task-foo","worktree":"/tmp/wt-foo","prs":[100,200],"needs_input":false,"paused":false}"#,
+        ).unwrap();
+        fs::write(
+            dir.join(".state").join("bar.json"),
+            r#"{"session":"task-bar","worktree":"/tmp/wt-bar","prs":[],"needs_input":true,"paused":true}"#,
+        ).unwrap();
+        // baz has no .state/baz.json — it's a fresh task
+
+        // Order: bar, foo (baz appended at the end alphabetically)
+        fs::write(
+            dir.join(".state").join("order.json"),
+            r#"["bar","foo"]"#,
+        ).unwrap();
+
+        dir
+    }
+
+    #[test]
+    fn migrate_writes_marker_and_records() {
+        let store = isolate("migrate-basic");
+        let tasks = build_legacy_fixture("migrate-basic-tasks");
+
+        let count = store.migrate_from_legacy(&tasks).unwrap();
+        assert_eq!(count, 3);
+
+        // Marker present + authoritative
+        assert!(store.is_authoritative());
+
+        // Tmp dir is gone after successful rename
+        assert!(!store.store_root_tmp().exists());
+
+        // Registry has the right ids and order: bar=1, foo=2, baz=3
+        let registry = store.load_registry().unwrap();
+        assert_eq!(registry.next_task_id, 4);
+        assert_eq!(registry.open_order, vec![1, 2, 3]);
+        assert!(registry.closed_order.is_empty());
+
+        let bar = store.load_record(1).unwrap();
+        assert_eq!(bar.slug, "bar");
+        assert_eq!(bar.desired_state, DesiredState::Paused);
+        assert!(bar.attention.needs_input);
+        assert_eq!(bar.tmux.session_name, "task-bar");
+        assert_eq!(bar.worktree.path, "/tmp/wt-bar");
+
+        let foo = store.load_record(2).unwrap();
+        assert_eq!(foo.slug, "foo");
+        assert_eq!(foo.desired_state, DesiredState::Active);
+        assert_eq!(foo.links.prs.len(), 2);
+        assert_eq!(foo.links.prs[0].number, 100);
+        assert_eq!(foo.links.prs[0].source, LinkSource::Migration);
+
+        let baz = store.load_record(3).unwrap();
+        assert_eq!(baz.slug, "baz");
+        assert_eq!(baz.desired_state, DesiredState::New);
+        assert_eq!(baz.tmux.session_name, "");
+
+        let _ = fs::remove_dir_all(&tasks);
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let store = isolate("migrate-idempotent");
+        let tasks = build_legacy_fixture("migrate-idempotent-tasks");
+
+        let first = store.migrate_from_legacy(&tasks).unwrap();
+        assert_eq!(first, 3);
+        assert!(store.is_authoritative());
+
+        // Second call short-circuits because marker is present.
+        let second = store.migrate_from_legacy(&tasks).unwrap();
+        assert_eq!(second, 0);
+
+        let _ = fs::remove_dir_all(&tasks);
+    }
+
+    #[test]
+    fn migrate_recovers_from_partial_tmp() {
+        let store = isolate("migrate-partial");
+        let tasks = build_legacy_fixture("migrate-partial-tasks");
+
+        // Simulate a crashed prior migration: leftover tmp + partial store.
+        fs::create_dir_all(store.store_root_tmp().join("tasks")).unwrap();
+        fs::write(
+            store.store_root_tmp().join("registry.json"),
+            r#"{"version":"v2","next_task_id":99}"#,
+        ).unwrap();
+
+        // No marker yet, so this run should discard the tmp and start fresh.
+        let count = store.migrate_from_legacy(&tasks).unwrap();
+        assert_eq!(count, 3);
+
+        // Fresh ids — leftover registry didn't influence this run.
+        let registry = store.load_registry().unwrap();
+        assert_eq!(registry.next_task_id, 4);
+        assert!(!store.store_root_tmp().exists());
+
+        let _ = fs::remove_dir_all(&tasks);
+    }
+
+    #[test]
+    fn migrate_drops_session_missing_drift_on_legacy_session_not_live() {
+        let store = isolate("migrate-drift");
+        let tasks = build_legacy_fixture("migrate-drift-tasks");
+
+        // foo has session=task-foo in legacy; tmux is empty (no live).
+        store.migrate_from_legacy(&tasks).unwrap();
+        let foo = store.load_record_by_slug("foo").unwrap();
+        assert_eq!(foo.desired_state, DesiredState::Active);
+        // Active + persisted session not live -> session_missing drift.
+        assert!(foo.drift.session_missing);
+
+        let _ = fs::remove_dir_all(&tasks);
+    }
+
+    #[test]
+    fn ordered_names_legacy_first_then_alpha() {
+        let order = vec!["bar".into(), "foo".into()];
+        let all = vec!["baz".into(), "bar".into(), "foo".into(), "qux".into()];
+        let result = ordered_names(&order, &all);
+        assert_eq!(result, vec!["bar", "foo", "baz", "qux"]);
+    }
+
+    #[test]
+    fn ordered_names_skips_stale_order_entries() {
+        // order.json refers to "deleted" which has no .md anymore
+        let order = vec!["deleted".into(), "foo".into()];
+        let all = vec!["foo".into(), "bar".into()];
+        let result = ordered_names(&order, &all);
+        assert_eq!(result, vec!["foo", "bar"]);
     }
 
     #[test]
