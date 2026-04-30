@@ -165,6 +165,10 @@ enum Cmd {
         /// Selected task index (0-based) — defaults to 0
         #[arg(long, default_value = "0")]
         select: usize,
+        /// Push the Linear detail view for this issue key (e.g.
+        /// ENG-29535). Implies `--tab linear --focus details`.
+        #[arg(long)]
+        linear_detail: Option<String>,
     },
 }
 
@@ -1293,8 +1297,8 @@ fn main() {
         }
         Some(Cmd::Gc) => cmd_gc(),
         Some(Cmd::Close { name }) => cmd_close(&name),
-        Some(Cmd::RenderDebug { width, height, tab, focus, select }) => {
-            tui3::render_debug(width, height, &tab, &focus, select)
+        Some(Cmd::RenderDebug { width, height, tab, focus, select, linear_detail }) => {
+            tui3::render_debug(width, height, &tab, &focus, select, linear_detail.as_deref())
         }
         Some(Cmd::Linear { action }) => match action {
             LinearAction::Add { task, key } => cmd_linear_add(&task, &key),

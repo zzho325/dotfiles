@@ -170,6 +170,28 @@ impl Default for LogPane {
     }
 }
 
+/// Linear tab sub-state. The flat list is the default; pressing Enter
+/// pushes a Detail view (one issue, full page). Esc pops back. Stack
+/// supports drill-into-sub-issue → drill-into-sub-issue chains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinearView {
+    List { cursor: usize },
+    Detail {
+        /// Drill stack — `last()` is the currently shown issue.
+        /// `pop()` walks back; empty stack means we're done with detail.
+        stack: Vec<String>,
+        /// Cursor index into the rendered detail-view sub-issue list
+        /// (sub-issues only — parent/project/url use dedicated keys).
+        sub_cursor: usize,
+    },
+}
+
+impl Default for LinearView {
+    fn default() -> Self {
+        LinearView::List { cursor: 0 }
+    }
+}
+
 pub struct App {
     pub tasks: Vec<TaskView>,
     pub selected: usize,
@@ -177,6 +199,8 @@ pub struct App {
     pub detail_tab: Tab,
     /// Pane selected within the Panes tab.
     pub panes_selected: usize,
+    /// Linear tab sub-state.
+    pub linear_view: LinearView,
     pub log: LogPane,
     pub show_help: bool,
     pub daemon_alive: bool,
@@ -205,6 +229,7 @@ impl App {
             focus: Pane::List,
             detail_tab: Tab::Overview,
             panes_selected: 0,
+            linear_view: LinearView::default(),
             log: LogPane::default(),
             show_help: false,
             daemon_alive,
@@ -818,7 +843,31 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn render_tab_linear(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView) {
+fn render_tab_linear(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
+    let cache = crate::cache::read_linear();
+    match &app.linear_view {
+        LinearView::Detail { stack, sub_cursor } if !stack.is_empty() => {
+            render_linear_detail(frame, area, stack, *sub_cursor, &cache, app);
+        }
+        _ => {
+            let cursor = match &app.linear_view {
+                LinearView::List { cursor } => *cursor,
+                _ => 0,
+            };
+            render_linear_list(frame, area, app, task, cursor, &cache);
+        }
+    }
+}
+
+fn render_linear_list(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    task: &TaskView,
+    cursor: usize,
+    cache: &crate::cache::LinearCache,
+) {
+    let focused = app.focus == Pane::Right && app.detail_tab == Tab::Linear;
     let mut lines = vec![Line::raw("")];
     if task.linear.is_empty() {
         lines.push(Line::styled(
@@ -830,39 +879,417 @@ fn render_tab_linear(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView)
             Style::default().fg(MUTED),
         ));
     } else {
-        for item in &task.linear {
-            // Bullet + key (always).
-            let mut line = vec![
-                Span::styled(" • ", Style::default().fg(GOLD)),
+        for (i, item) in task.linear.iter().enumerate() {
+            let selected = i == cursor;
+            let bullet = if selected && focused { "▸ " } else { "  " };
+            let bullet_color = if selected && focused { LOVE } else { GOLD };
+
+            let cached = cache.issues.get(&item.key);
+            let priority_label = cached
+                .map(|c| priority_glyph(c.priority))
+                .unwrap_or("");
+            let age = cached
+                .map(|c| relative_age(&c.updated_at))
+                .unwrap_or_default();
+
+            // Row 1: cursor + key + priority + state-glyph + state + age
+            let mut row1 = vec![
+                Span::styled(bullet, Style::default().fg(bullet_color)),
                 Span::styled(
                     format!("{}  ", item.key),
                     Style::default().fg(IRIS),
                 ),
             ];
-            if !item.title.is_empty() {
-                line.push(Span::styled(item.title.clone(), Style::default().fg(TEXT)));
-            }
-            lines.push(Line::from(line));
-
-            // Second row: state · assignee, indented.
-            let state_color = linear_state_color(&item.state);
-            let mut second = vec![
-                Span::raw("    "),
-                Span::styled(
-                    if item.state.is_empty() { "—" } else { item.state.as_str() }.to_string(),
-                    Style::default().fg(state_color),
-                ),
-            ];
-            if let Some(a) = &item.assignee {
-                second.push(Span::styled(
-                    format!("  ·  {a}"),
-                    Style::default().fg(SUBTLE),
+            if !priority_label.is_empty() {
+                row1.push(Span::styled(
+                    format!("{priority_label}  "),
+                    Style::default().fg(priority_color(cached.map(|c| c.priority).unwrap_or(0))),
                 ));
             }
-            lines.push(Line::from(second));
+            let state_color = linear_state_color(&item.state);
+            row1.push(Span::styled(
+                state_glyph(cached.map(|c| c.state_kind.as_str()).unwrap_or("")).to_string(),
+                Style::default().fg(state_color),
+            ));
+            if !item.state.is_empty() {
+                row1.push(Span::styled(
+                    format!(" {}", item.state),
+                    Style::default().fg(state_color),
+                ));
+            }
+            if !age.is_empty() {
+                row1.push(Span::styled(
+                    format!("  ·  {age}"),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            lines.push(Line::from(row1));
+
+            // Row 2: title (indented)
+            if !item.title.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(item.title.clone(), Style::default().fg(TEXT)),
+                ]));
+            }
+
+            // Row 3: project · sub-issue count · assignee
+            let mut row3: Vec<Span> = vec![Span::raw("    ")];
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(c) = cached {
+                if let Some(p) = &c.project {
+                    parts.push(p.name.clone());
+                }
+                if !c.children.is_empty() {
+                    parts.push(format!(
+                        "{} sub-issue{}",
+                        c.children.len(),
+                        if c.children.len() == 1 { "" } else { "s" },
+                    ));
+                }
+            }
+            if let Some(a) = &item.assignee {
+                parts.push(format!("@{a}"));
+            }
+            if !parts.is_empty() {
+                row3.push(Span::styled(
+                    parts.join("  ·  "),
+                    Style::default().fg(SUBTLE),
+                ));
+                lines.push(Line::from(row3));
+            }
+            lines.push(Line::raw(""));
+        }
+        if focused {
+            lines.push(Line::styled(
+                " j/k navigate · Enter detail · o browser",
+                Style::default().fg(MUTED),
+            ));
         }
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_linear_detail(
+    frame: &mut Frame,
+    area: Rect,
+    stack: &[String],
+    sub_cursor: usize,
+    cache: &crate::cache::LinearCache,
+    app: &App,
+) {
+    let focused = app.focus == Pane::Right && app.detail_tab == Tab::Linear;
+    let key = stack.last().cloned().unwrap_or_default();
+    let cached = cache.issues.get(&key);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let Some(c) = cached else {
+        // Drilled into a key we don't have data for yet.
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!(" {key}  loading…"),
+            Style::default().fg(MUTED),
+        ));
+        if cache.not_found.contains(&key) {
+            lines.push(Line::styled(
+                " not on Linear",
+                Style::default().fg(LOVE),
+            ));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            " Esc back · o browser",
+            Style::default().fg(MUTED),
+        ));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    };
+
+    // Row 1: key · priority · state · age
+    let state_color = linear_state_color(&c.state);
+    let priority_label = priority_glyph(c.priority);
+    let mut id_line = vec![Span::styled(
+        format!(" {}", c.identifier),
+        Style::default().fg(IRIS),
+    )];
+    if !priority_label.is_empty() {
+        id_line.push(Span::styled(
+            format!("  ·  {priority_label}"),
+            Style::default().fg(priority_color(c.priority)),
+        ));
+    }
+    id_line.push(Span::styled(
+        format!("  ·  {} {}", state_glyph(&c.state_kind), c.state),
+        Style::default().fg(state_color),
+    ));
+    let age = relative_age(&c.updated_at);
+    if !age.is_empty() {
+        id_line.push(Span::styled(
+            format!("  ·  {age}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    if stack.len() > 1 {
+        id_line.push(Span::styled(
+            format!("  (depth {})", stack.len() - 1),
+            Style::default().fg(MUTED),
+        ));
+    }
+    lines.push(Line::from(id_line));
+
+    // Row 2: title
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(c.title.clone(), Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::raw(""));
+
+    // Project / parent / cycle / assignee meta block
+    if let Some(p) = &c.project {
+        lines.push(Line::from(vec![
+            Span::styled(" Project   ", Style::default().fg(MUTED)),
+            Span::styled(p.name.clone(), Style::default().fg(TEXT)),
+        ]));
+    }
+    if let Some(parent_key) = &c.parent_key {
+        let title = c.parent_title.clone().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(" Parent    ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{parent_key}  "),
+                Style::default().fg(IRIS),
+            ),
+            Span::styled(title, Style::default().fg(TEXT)),
+        ]));
+    }
+    if let Some(cycle) = &c.cycle_name {
+        if !cycle.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(" Cycle     ", Style::default().fg(MUTED)),
+                Span::styled(cycle.clone(), Style::default().fg(TEXT)),
+            ]));
+        }
+    }
+    if !c.assignee.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" Assignee  ", Style::default().fg(MUTED)),
+            Span::styled(format!("@{}", c.assignee), Style::default().fg(TEXT)),
+        ]));
+    }
+
+    // Description block — wrap, trim to fit remaining space.
+    // Budget: total area minus lines so far minus reserved trailing rows.
+    let used = lines.len();
+    let footer_reserved: usize = 2; // blank + footer line
+    let n_children = c.children.len();
+    let kid_block_reserved: usize = if n_children == 0 {
+        0
+    } else {
+        // blank + "Sub-issues (N)" header + up to 3 rows + optional "and N more"
+        let visible = n_children.min(3);
+        let overflow = if n_children > 3 { 1 } else { 0 };
+        2 + visible + overflow
+    };
+    let desc_budget = (area.height as usize)
+        .saturating_sub(used + footer_reserved + kid_block_reserved);
+    if desc_budget >= 3 && !c.description.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            " Description",
+            Style::default().fg(MUTED),
+        ));
+        let width = (area.width.saturating_sub(2) as usize).max(20);
+        let wrapped = wrap_text(&c.description, width);
+        let body_room = desc_budget - 2;
+        // Reserve one row for "…" if we overflow.
+        let take = if wrapped.len() > body_room {
+            body_room.saturating_sub(1)
+        } else {
+            body_room
+        };
+        for w in wrapped.iter().take(take) {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(w.clone(), Style::default().fg(SUBTLE)),
+            ]));
+        }
+        if wrapped.len() > take {
+            lines.push(Line::styled(
+                " …",
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+
+    // Sub-issues
+    if !c.children.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!(" Sub-issues ({n_children})"),
+            Style::default().fg(MUTED),
+        ));
+        for (i, child) in c.children.iter().take(3).enumerate() {
+            let selected = i == sub_cursor;
+            let cursor = if selected && focused { "▸ " } else { "  " };
+            let cursor_color = if selected && focused { LOVE } else { MUTED };
+            let glyph = state_glyph(&child.state_kind);
+            let glyph_color = linear_state_color(&child.state);
+            let style = if selected && focused {
+                Style::default().fg(TEXT).bg(HL_LOW)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(cursor, Style::default().fg(cursor_color)),
+                Span::styled(
+                    format!("{}  ", child.identifier),
+                    Style::default().fg(IRIS),
+                ),
+                Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+                Span::styled(child.title.clone(), style),
+            ]));
+        }
+        if c.children.len() > 3 {
+            lines.push(Line::styled(
+                format!(" … and {} more", c.children.len() - 3),
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+
+    // Footer
+    lines.push(Line::raw(""));
+    let footer = if c.children.is_empty() {
+        " Esc back · u parent · p project · o browser"
+    } else {
+        " j/k navigate · Enter drill · u parent · p project · o browser · Esc back"
+    };
+    lines.push(Line::styled(footer, Style::default().fg(MUTED)));
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Wrap a text into lines fitting within `width`. Preserves blank lines.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in line.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + word.chars().count() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    out
+}
+
+/// Linear priority glyph: 1=urgent, 2=high, 3=medium, 4=low, 0=none.
+fn priority_glyph(priority: u8) -> &'static str {
+    match priority {
+        1 => "P0",
+        2 => "P1",
+        3 => "P2",
+        4 => "P3",
+        _ => "",
+    }
+}
+
+fn priority_color(priority: u8) -> Color {
+    match priority {
+        1 | 2 => LOVE,
+        3 => GOLD,
+        _ => MUTED,
+    }
+}
+
+/// Glyph for a Linear state-kind category.
+fn state_glyph(kind: &str) -> &'static str {
+    match kind {
+        "started" => "◐",
+        "completed" => "●",
+        "canceled" => "⊘",
+        "unstarted" => "○",
+        "backlog" => "·",
+        "triage" => "△",
+        _ => "·",
+    }
+}
+
+/// "4d ago", "12h ago", "30s ago" from an ISO-8601 timestamp.
+fn relative_age(iso: &str) -> String {
+    if iso.is_empty() {
+        return String::new();
+    }
+    let then = match parse_iso8601(iso) {
+        Some(t) => t,
+        None => return String::new(),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secs = now.saturating_sub(then);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+/// Naive ISO-8601 parse — only the YYYY-MM-DDTHH:MM:SS prefix matters.
+fn parse_iso8601(s: &str) -> Option<u64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let year: u64 = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
+    let month: u64 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
+    let day: u64 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
+    let hour: u64 = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
+    let minute: u64 = std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?;
+    let second: u64 = std::str::from_utf8(&bytes[17..19]).ok()?.parse().ok()?;
+    Some(days_since_epoch(year, month, day) * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Days since Unix epoch for given Y/M/D (Gregorian, naive).
+fn days_since_epoch(year: u64, month: u64, day: u64) -> u64 {
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    let dim = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += dim[(m - 1) as usize] as u64;
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days + day.saturating_sub(1)
+}
+
+fn is_leap(y: u64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
@@ -1147,6 +1574,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         (KeyCode::Esc, _) => {
+            // Layered Esc per docs/tui-nav-redesign.md + linear-deep-design:
+            // 1. modal cancel (handled above by show_help / message_input)
+            // 2. Linear detail → pop stack
+            // 3. focus right → focus list
+            // 4. focus list → quit
+            if app.focus == Pane::Right
+                && app.detail_tab == Tab::Linear
+            {
+                if let LinearView::Detail { stack, .. } = &mut app.linear_view {
+                    stack.pop();
+                    if stack.is_empty() {
+                        app.linear_view = LinearView::List { cursor: 0 };
+                    }
+                    if was_toasted { app.toast = None; }
+                    return;
+                }
+            }
             if app.focus == Pane::Right {
                 app.focus = Pane::List;
             } else {
@@ -1276,8 +1720,164 @@ fn handle_right_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+        // Linear tab — drill state machine.
+        (Tab::Linear, KeyCode::Char('j')) | (Tab::Linear, KeyCode::Down) => {
+            handle_linear_down(app);
+        }
+        (Tab::Linear, KeyCode::Char('k')) | (Tab::Linear, KeyCode::Up) => {
+            handle_linear_up(app);
+        }
+        (Tab::Linear, KeyCode::Enter) => {
+            handle_linear_enter(app);
+        }
+        (Tab::Linear, KeyCode::Char('u')) => {
+            handle_linear_parent(app);
+        }
+        (Tab::Linear, KeyCode::Char('p')) => {
+            handle_linear_open_project(app);
+        }
+        (Tab::Linear, KeyCode::Char('o')) => {
+            handle_linear_open_browser(app);
+        }
         _ => {}
     }
+}
+
+fn handle_linear_down(app: &mut App) {
+    let cache = crate::cache::read_linear();
+    match &mut app.linear_view {
+        LinearView::List { cursor } => {
+            let n = app
+                .tasks
+                .get(app.selected)
+                .map(|t| t.linear.len())
+                .unwrap_or(0);
+            if *cursor + 1 < n {
+                *cursor += 1;
+            }
+        }
+        LinearView::Detail { stack, sub_cursor } => {
+            let n = stack
+                .last()
+                .and_then(|k| cache.issues.get(k))
+                .map(|c| c.children.len().min(3))
+                .unwrap_or(0);
+            if *sub_cursor + 1 < n {
+                *sub_cursor += 1;
+            }
+        }
+    }
+}
+
+fn handle_linear_up(app: &mut App) {
+    match &mut app.linear_view {
+        LinearView::List { cursor } => {
+            *cursor = cursor.saturating_sub(1);
+        }
+        LinearView::Detail { sub_cursor, .. } => {
+            *sub_cursor = sub_cursor.saturating_sub(1);
+        }
+    }
+}
+
+fn handle_linear_enter(app: &mut App) {
+    let cache = crate::cache::read_linear();
+    match &mut app.linear_view {
+        LinearView::List { cursor } => {
+            let key = app
+                .tasks
+                .get(app.selected)
+                .and_then(|t| t.linear.get(*cursor))
+                .map(|stub| stub.key.clone());
+            if let Some(k) = key {
+                app.linear_view = LinearView::Detail {
+                    stack: vec![k],
+                    sub_cursor: 0,
+                };
+            }
+        }
+        LinearView::Detail { stack, sub_cursor } => {
+            // Drill into the cursored sub-issue.
+            let next = stack
+                .last()
+                .and_then(|k| cache.issues.get(k))
+                .and_then(|c| c.children.get(*sub_cursor))
+                .map(|child| child.identifier.clone());
+            if let Some(k) = next {
+                if stack.len() < 8 {
+                    stack.push(k);
+                    *sub_cursor = 0;
+                }
+            }
+        }
+    }
+}
+
+fn handle_linear_parent(app: &mut App) {
+    let cache = crate::cache::read_linear();
+    if let LinearView::Detail { stack, sub_cursor } = &mut app.linear_view {
+        let parent = stack
+            .last()
+            .and_then(|k| cache.issues.get(k))
+            .and_then(|c| c.parent_key.clone());
+        if let Some(p) = parent {
+            if stack.len() < 8 {
+                stack.push(p);
+                *sub_cursor = 0;
+            }
+        }
+    }
+}
+
+fn handle_linear_open_project(app: &mut App) {
+    let cache = crate::cache::read_linear();
+    let project_slug = match &app.linear_view {
+        LinearView::Detail { stack, .. } => stack
+            .last()
+            .and_then(|k| cache.issues.get(k))
+            .and_then(|c| c.project.as_ref())
+            .map(|p| p.slug_id.clone()),
+        LinearView::List { cursor } => app
+            .tasks
+            .get(app.selected)
+            .and_then(|t| t.linear.get(*cursor))
+            .and_then(|stub| cache.issues.get(&stub.key))
+            .and_then(|c| c.project.as_ref())
+            .map(|p| p.slug_id.clone()),
+    };
+    if let Some(slug) = project_slug {
+        if !slug.is_empty() {
+            open_url(&format!("https://linear.app/column-na/project/{slug}"));
+        }
+    }
+}
+
+fn handle_linear_open_browser(app: &mut App) {
+    let cache = crate::cache::read_linear();
+    let url = match &app.linear_view {
+        LinearView::Detail { stack, .. } => stack
+            .last()
+            .and_then(|k| cache.issues.get(k))
+            .map(|c| c.url.clone()),
+        LinearView::List { cursor } => app
+            .tasks
+            .get(app.selected)
+            .and_then(|t| t.linear.get(*cursor))
+            .and_then(|stub| cache.issues.get(&stub.key))
+            .map(|c| c.url.clone()),
+    };
+    if let Some(u) = url {
+        if !u.is_empty() {
+            open_url(&u);
+        }
+    }
+}
+
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("open")
+        .arg(url)
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 fn handle_message_input_key(app: &mut App, key: KeyEvent) {
@@ -1352,7 +1952,14 @@ fn send_message(msg: &str) {
 // Debug rendering — dumps the current TUI to stdout at a fixed size.
 // Useful for diagnosing layout without an interactive terminal.
 
-pub fn render_debug(width: u16, height: u16, tab: &str, focus: &str, select: usize) {
+pub fn render_debug(
+    width: u16,
+    height: u16,
+    tab: &str,
+    focus: &str,
+    select: usize,
+    linear_detail: Option<&str>,
+) {
     use ratatui::backend::TestBackend;
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("debug backend");
@@ -1370,6 +1977,14 @@ pub fn render_debug(width: u16, height: u16, tab: &str, focus: &str, select: usi
     };
     if select < app.tasks.len() {
         app.selected = select;
+    }
+    if let Some(key) = linear_detail {
+        app.detail_tab = Tab::Linear;
+        app.focus = Pane::Right;
+        app.linear_view = LinearView::Detail {
+            stack: vec![key.to_string()],
+            sub_cursor: 0,
+        };
     }
     terminal.draw(|f| render(f, &app)).expect("debug draw");
     let buffer = terminal.backend().buffer().clone();
@@ -1494,6 +2109,7 @@ mod tests {
             focus: Pane::List,
             detail_tab: Tab::Overview,
             panes_selected: 0,
+            linear_view: LinearView::default(),
             log: LogPane {
                 run_id: Some("1234-test".into()),
                 lines: vec![
