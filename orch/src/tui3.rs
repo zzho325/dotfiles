@@ -896,33 +896,28 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
     );
 
     let lines = vec![
-        Line::styled(
-            " key bindings",
-            Style::default().fg(LOVE),
-        ),
-        Line::styled(
-            "─".repeat(w as usize),
-            Style::default().fg(MUTED),
-        ),
+        Line::styled(" key bindings", Style::default().fg(LOVE)),
+        Line::styled("─".repeat(w as usize), Style::default().fg(MUTED)),
         Line::styled(" Global", Style::default().fg(IRIS)),
-        kv_line("   q          ", "quit"),
-        kv_line("   Tab/S-Tab  ", "cycle pane focus"),
+        kv_line("   q / Esc    ", "quit"),
         kv_line("   ?          ", "toggle this overlay"),
-        kv_line("   r          ", "refresh integrations"),
+        kv_line("   Tab/S-Tab  ", "cycle pane focus (List → Details → Log)"),
+        kv_line("   1 2 3 4    ", "jump to tab: Overview · PRs · Linear · Panes"),
         kv_line("   m          ", "message orchestrator"),
         Line::raw(""),
-        Line::styled(" Task list", Style::default().fg(IRIS)),
+        Line::styled(" Task list (focus = list)", Style::default().fg(IRIS)),
         kv_line("   j/k g/G    ", "move · top/bottom"),
-        kv_line("   J/K        ", "reorder open tasks"),
-        kv_line("   Enter      ", "attach to session"),
-        kv_line("   n s p R    ", "new · start · pause · Resume"),
-        kv_line("   M x        ", "Modify slug · close"),
-        kv_line("   o W        ", "open external · stranded"),
+        kv_line("   Enter      ", "attach to selected task's tmux session"),
         Line::raw(""),
-        Line::styled(" Details · Panes · Log", Style::default().fg(IRIS)),
-        kv_line("   h/l        ", "switch tab"),
-        kv_line("   [ ] \\\\      ", "prev / next / last pane"),
-        kv_line("   PgUp PgDn  ", "scroll log"),
+        Line::styled(" Right pane (focus = details)", Style::default().fg(IRIS)),
+        kv_line("   h/l        ", "prev / next tab (or use 1-4)"),
+        kv_line("   j/k        ", "navigate within tab (e.g. select pane)"),
+        kv_line("   Enter      ", "act on cursored item (e.g. attach pane)"),
+        Line::raw(""),
+        Line::styled(" Log (focus = log)", Style::default().fg(IRIS)),
+        kv_line("   j/k        ", "scroll line"),
+        kv_line("   PgUp PgDn  ", "scroll page"),
+        kv_line("   G          ", "follow bottom"),
     ];
 
     let text_area = Rect {
@@ -1041,6 +1036,25 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 Pane::Details => Pane::List,
                 Pane::Log => Pane::Details,
             };
+        }
+        // Number keys jump directly to a detail tab from any focus.
+        // Auto-moves focus to Details so subsequent keys (j/k for pane
+        // selection, etc) act on the tab body without an extra Tab press.
+        (KeyCode::Char('1'), _) => {
+            app.detail_tab = Tab::Overview;
+            app.focus = Pane::Details;
+        }
+        (KeyCode::Char('2'), _) => {
+            app.detail_tab = Tab::Prs;
+            app.focus = Pane::Details;
+        }
+        (KeyCode::Char('3'), _) => {
+            app.detail_tab = Tab::Linear;
+            app.focus = Pane::Details;
+        }
+        (KeyCode::Char('4'), _) => {
+            app.detail_tab = Tab::Panes;
+            app.focus = Pane::Details;
         }
         (KeyCode::Char('m'), _) => {
             app.message_input = Some(String::new());
@@ -1553,7 +1567,8 @@ mod tests {
         assert!(s.contains("key bindings"));
         assert!(s.contains("Tab/S-Tab"));
         assert!(s.contains("cycle pane focus"));
-        assert!(s.contains("Resume"));
+        assert!(s.contains("1 2 3 4"));
+        assert!(s.contains("Overview"));
     }
 
     #[test]
@@ -1618,6 +1633,28 @@ mod tests {
         assert_eq!(app.detail_tab, Tab::Overview); // wrap
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
         assert_eq!(app.detail_tab, Tab::Panes); // wrap back
+    }
+
+    #[test]
+    fn number_keys_jump_to_tab_from_any_focus() {
+        let mut app = test_app();
+        // From List focus
+        app.focus = Pane::List;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('2')));
+        assert_eq!(app.detail_tab, Tab::Prs);
+        assert_eq!(app.focus, Pane::Details);
+
+        // From Log focus
+        app.focus = Pane::Log;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('4')));
+        assert_eq!(app.detail_tab, Tab::Panes);
+        assert_eq!(app.focus, Pane::Details);
+
+        // 1 = Overview, 3 = Linear
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('1')));
+        assert_eq!(app.detail_tab, Tab::Overview);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('3')));
+        assert_eq!(app.detail_tab, Tab::Linear);
     }
 
     #[test]
