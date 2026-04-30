@@ -919,7 +919,10 @@ const AUTO_EXPAND_LIMIT: usize = 6;
 
 /// Build the flat row stream. Sub-issues are ALWAYS expanded inline
 /// — the list never reshapes when the cursor moves. Project headers
-/// appear only when there are 2+ distinct projects.
+/// appear only when there are 2+ distinct projects. Top-level stubs
+/// that are also a child of another linked stub are shown only as
+/// the sub-issue (deduped) so the cursor doesn't have two rows
+/// claiming the same key.
 fn build_linear_rows(
     stubs: &[LinearStub],
     cache: &crate::cache::LinearCache,
@@ -930,8 +933,19 @@ fn build_linear_rows(
         return Vec::new();
     }
 
+    // Collect all keys that appear as a child of another linked stub.
+    // These are skipped at top-level so the cursor sees one row per key.
+    let child_keys: HashSet<String> = stubs
+        .iter()
+        .filter_map(|s| cache.issues.get(&s.key))
+        .flat_map(|c| c.children.iter().map(|ch| ch.identifier.clone()))
+        .collect();
+
     let mut projects: Vec<String> = Vec::new();
     for s in stubs {
+        if child_keys.contains(&s.key) {
+            continue;
+        }
         let p = cache
             .issues
             .get(&s.key)
@@ -948,6 +962,9 @@ fn build_linear_rows(
     let mut prev_project: Option<String> = None;
 
     for stub in stubs {
+        if child_keys.contains(&stub.key) {
+            continue;
+        }
         let cached = cache.issues.get(&stub.key);
         let project_name = cached
             .and_then(|c| c.project.as_ref())
@@ -1103,12 +1120,15 @@ fn render_linear_list(
             }
             RowKind::SubIssue { is_last } => {
                 let selected = focused && row.key == cursor_key;
+                // Sub-issues indented 4 cells deeper than parents so
+                // the hierarchy reads at a glance (parent key column 3,
+                // sub-issue key column 7).
                 let prefix = if selected {
-                    " ▸ "
+                    "     ▸ "
                 } else if *is_last {
-                    " └ "
+                    "     └ "
                 } else {
-                    " │ "
+                    "     │ "
                 };
                 let prefix_color = if selected {
                     LOVE
@@ -1471,16 +1491,20 @@ fn priority_color(priority: u8) -> Color {
     }
 }
 
-/// Glyph for a Linear state-kind category.
+/// Glyph for a Linear state-kind category. All circle-class glyphs
+/// for consistent terminal rendering width — no narrow `·`. Backlog
+/// and unstarted both render as open circles (Linear's UI uses a
+/// dashed circle for backlog, but most terminal fonts don't have a
+/// reliable equivalent — the color carries the difference).
 fn state_glyph(kind: &str) -> &'static str {
     match kind {
         "started" => "◐",
         "completed" => "●",
         "canceled" => "⊘",
         "unstarted" => "○",
-        "backlog" => "·",
-        "triage" => "△",
-        _ => "·",
+        "backlog" => "○",
+        "triage" => "◑",
+        _ => "○",
     }
 }
 
@@ -2736,9 +2760,11 @@ mod tests {
         assert_eq!(state_glyph("completed"), "●");
         assert_eq!(state_glyph("canceled"), "⊘");
         assert_eq!(state_glyph("unstarted"), "○");
-        assert_eq!(state_glyph("backlog"), "·");
-        assert_eq!(state_glyph("triage"), "△");
-        assert_eq!(state_glyph("unknown"), "·");
+        // backlog now uses the same open circle as unstarted — color
+        // carries the distinction. No more narrow `·` to misalign.
+        assert_eq!(state_glyph("backlog"), "○");
+        assert_eq!(state_glyph("triage"), "◑");
+        assert_eq!(state_glyph("unknown"), "○");
     }
 
     #[test]
