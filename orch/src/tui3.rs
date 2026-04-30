@@ -945,9 +945,30 @@ struct ListRow {
 const AUTO_EXPAND_LIMIT: usize = 6;
 
 /// User identifier (Linear displayName) for the assignee filter.
-/// Set via `ORCH_LINEAR_USER` env var; when unset, no filter applies.
-fn linear_me() -> String {
-    std::env::var("ORCH_LINEAR_USER").unwrap_or_default()
+/// First checks `ORCH_LINEAR_USER`; falls back to the most common
+/// assignee in the cache (in a personal tool, that's the user).
+/// Empty string disables filtering.
+fn linear_me(cache: &crate::cache::LinearCache) -> String {
+    if let Ok(s) = std::env::var("ORCH_LINEAR_USER") {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    // Auto-detect: count assignees across cache.issues, pick the
+    // mode. With one user this is the user; the cache is small so
+    // counting per-render is fine.
+    let mut counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for c in cache.issues.values() {
+        if !c.assignee.is_empty() {
+            *counts.entry(c.assignee.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(name, _)| name)
+        .unwrap_or_default()
 }
 
 /// True iff this issue is "mine" — unassigned or assigned to me.
@@ -973,7 +994,7 @@ fn build_linear_rows(
         return Vec::new();
     }
 
-    let me = linear_me();
+    let me = linear_me(cache);
 
     // Collect all keys that appear as a child of another linked stub.
     // These are skipped at top-level so the cursor sees one row per key.
@@ -983,9 +1004,22 @@ fn build_linear_rows(
         .flat_map(|c| c.children.iter().map(|ch| ch.identifier.clone()))
         .collect();
 
+    // Filter "not mine" — issues assigned to someone other than me
+    // (unassigned issues always pass; treated as mine-by-default).
+    let assignee_of = |key: &str| -> String {
+        cache
+            .issues
+            .get(key)
+            .map(|c| c.assignee.clone())
+            .unwrap_or_default()
+    };
+
     let mut projects: Vec<String> = Vec::new();
     for s in stubs {
         if child_keys.contains(&s.key) {
+            continue;
+        }
+        if !is_mine(&assignee_of(&s.key), &me) {
             continue;
         }
         let p = cache
@@ -1005,6 +1039,9 @@ fn build_linear_rows(
 
     for stub in stubs {
         if child_keys.contains(&stub.key) {
+            continue;
+        }
+        if !is_mine(&assignee_of(&stub.key), &me) {
             continue;
         }
         let cached = cache.issues.get(&stub.key);
@@ -1040,11 +1077,19 @@ fn build_linear_rows(
         });
 
         if n_children > 0 {
-            for (i, child) in cached.unwrap().children.iter().enumerate() {
+            // Sub-issues filtered by the same is_mine rule as top-level.
+            let visible_children: Vec<_> = cached
+                .unwrap()
+                .children
+                .iter()
+                .filter(|ch| is_mine(&ch.assignee, &me))
+                .collect();
+            let n_visible = visible_children.len();
+            for (i, child) in visible_children.iter().enumerate() {
                 rows.push(ListRow {
                     key: child.identifier.clone(),
                     kind: RowKind::SubIssue {
-                        is_last: i + 1 == n_children,
+                        is_last: i + 1 == n_visible,
                     },
                     title: child.title.clone(),
                     state_kind: child.state_kind.clone(),
