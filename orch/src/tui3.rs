@@ -145,6 +145,7 @@ pub struct LinearStub {
     pub depth: u8,
 }
 
+#[derive(Clone)]
 pub struct LogPane {
     pub run_id: Option<String>,
     pub lines: Vec<String>,
@@ -175,10 +176,6 @@ impl Default for LogPane {
 /// supports drill-into-sub-issue → drill-into-sub-issue chains.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinearView {
-    /// Flat row stream. Cursor identifies a row by issue key (stable
-    /// across re-render even though row list expands/collapses based
-    /// on which parent is cursored). `pinned` keeps mega-parents
-    /// (7+ subs) visibly expanded; `t` toggles.
     List {
         cursor_key: String,
         pinned: HashSet<String>,
@@ -202,6 +199,7 @@ impl Default for LinearView {
     }
 }
 
+#[derive(Clone)]
 pub struct App {
     pub tasks: Vec<TaskView>,
     pub selected: usize,
@@ -211,6 +209,11 @@ pub struct App {
     pub panes_selected: usize,
     /// Linear tab sub-state.
     pub linear_view: LinearView,
+    /// Row offset at the top of the Linear list viewport. Mutated by
+    /// `render_linear_list` each frame using a sticky-margin scroll
+    /// (same algorithm as `monitor`'s tui). Survives re-render even
+    /// when rows reshape.
+    pub linear_list_offset: usize,
     pub log: LogPane,
     pub show_help: bool,
     pub daemon_alive: bool,
@@ -240,6 +243,7 @@ impl App {
             detail_tab: Tab::Overview,
             panes_selected: 0,
             linear_view: LinearView::default(),
+            linear_list_offset: 0,
             log: LogPane::default(),
             show_help: false,
             daemon_alive,
@@ -558,7 +562,7 @@ fn linear_from_record(
 
 // Rendering.
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     let outer = Layout::default()
@@ -715,7 +719,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_details(frame: &mut Frame, area: Rect, app: &App) {
+fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.tasks.is_empty() {
         let placeholder = Paragraph::new(vec![
             Line::raw(""),
@@ -776,15 +780,15 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let task = match app.selected_task() {
-        Some(t) => t,
+        Some(t) => t.clone(),
         None => return,
     };
 
     match app.detail_tab {
-        Tab::Overview => render_tab_overview(frame, body_area, app, task),
-        Tab::Prs => render_tab_prs(frame, body_area, app, task),
-        Tab::Linear => render_tab_linear(frame, body_area, app, task),
-        Tab::Panes => render_tab_panes(frame, body_area, app, task),
+        Tab::Overview => render_tab_overview(frame, body_area, app, &task),
+        Tab::Prs => render_tab_prs(frame, body_area, app, &task),
+        Tab::Linear => render_tab_linear(frame, body_area, app, &task),
+        Tab::Panes => render_tab_panes(frame, body_area, app, &task),
     }
 }
 
@@ -878,18 +882,41 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn render_tab_linear(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
+fn render_tab_linear(frame: &mut Frame, area: Rect, app: &mut App, task: &TaskView) {
     let cache = crate::cache::read_linear();
+    let focused = app.focus == Pane::Right && app.detail_tab == Tab::Linear;
     match &app.linear_view {
         LinearView::Detail { stack, sub_cursor } if !stack.is_empty() => {
-            render_linear_detail(frame, area, stack, *sub_cursor, &cache, app);
+            let stack = stack.clone();
+            let sub_cursor = *sub_cursor;
+            render_linear_detail(frame, area, &stack, sub_cursor, &cache, focused);
         }
         LinearView::List { cursor_key, pinned } => {
-            render_linear_list(frame, area, app, task, cursor_key, pinned, &cache);
+            let cursor_key = cursor_key.clone();
+            let pinned = pinned.clone();
+            render_linear_list(
+                frame,
+                area,
+                focused,
+                &mut app.linear_list_offset,
+                task,
+                &cursor_key,
+                &pinned,
+                &cache,
+            );
         }
         _ => {
             let empty = HashSet::new();
-            render_linear_list(frame, area, app, task, "", &empty, &cache);
+            render_linear_list(
+                frame,
+                area,
+                focused,
+                &mut app.linear_list_offset,
+                task,
+                "",
+                &empty,
+                &cache,
+            );
         }
     }
 }
@@ -917,12 +944,25 @@ struct ListRow {
 
 const AUTO_EXPAND_LIMIT: usize = 6;
 
+/// User identifier (Linear displayName) for the assignee filter.
+/// Set via `ORCH_LINEAR_USER` env var; when unset, no filter applies.
+fn linear_me() -> String {
+    std::env::var("ORCH_LINEAR_USER").unwrap_or_default()
+}
+
+/// True iff this issue is "mine" — unassigned or assigned to me.
+/// When `me` is empty, every issue passes (filter disabled).
+fn is_mine(assignee: &str, me: &str) -> bool {
+    me.is_empty() || assignee.is_empty() || assignee == me
+}
+
 /// Build the flat row stream. Sub-issues are ALWAYS expanded inline
 /// — the list never reshapes when the cursor moves. Project headers
 /// appear only when there are 2+ distinct projects. Top-level stubs
 /// that are also a child of another linked stub are shown only as
 /// the sub-issue (deduped) so the cursor doesn't have two rows
-/// claiming the same key.
+/// claiming the same key. Issues assigned to someone other than
+/// `linear_me()` are dropped (both top-level and as sub-issues).
 fn build_linear_rows(
     stubs: &[LinearStub],
     cache: &crate::cache::LinearCache,
@@ -932,6 +972,8 @@ fn build_linear_rows(
     if stubs.is_empty() {
         return Vec::new();
     }
+
+    let me = linear_me();
 
     // Collect all keys that appear as a child of another linked stub.
     // These are skipped at top-level so the cursor sees one row per key.
@@ -1055,34 +1097,58 @@ fn first_target_key(rows: &[ListRow]) -> Option<String> {
 fn render_linear_list(
     frame: &mut Frame,
     area: Rect,
-    app: &App,
+    focused: bool,
+    list_offset: &mut usize,
     task: &TaskView,
     cursor_key: &str,
     pinned: &HashSet<String>,
     cache: &crate::cache::LinearCache,
 ) {
-    let focused = app.focus == Pane::Right && app.detail_tab == Tab::Linear;
-    let mut lines: Vec<Line> = Vec::new();
-
     if task.linear.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            " (no linked Linear issues)",
-            Style::default().fg(SUBTLE),
-        ));
-        lines.push(Line::styled(
-            " orch linear add <task> ENG-123  ·  orch linear scan <task>",
-            Style::default().fg(MUTED),
-        ));
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let lines = vec![
+            Line::raw(""),
+            Line::styled(
+                " (no linked Linear issues)",
+                Style::default().fg(SUBTLE),
+            ),
+            Line::styled(
+                " orch linear add <task> ENG-123  ·  orch linear scan <task>",
+                Style::default().fg(MUTED),
+            ),
+        ];
+        frame.render_widget(Paragraph::new(lines), area);
         return;
     }
 
-    let rows = build_linear_rows(&task.linear, cache, cursor_key, pinned);
+    let all_rows = build_linear_rows(&task.linear, cache, cursor_key, pinned);
     let width = area.width as usize;
 
+    // Sticky-margin scroll — same shape as monitor::tui_render::render_list.
+    // Cursor stays at least `margin` rows from each viewport edge, except
+    // at the absolute top/bottom of the list.
+    let footer_reserved = if focused { 2 } else { 0 };
+    let viewport_height = (area.height as usize).saturating_sub(footer_reserved);
+    let cursor_row = all_rows
+        .iter()
+        .position(|r| r.key == cursor_key)
+        .unwrap_or(0);
+    let margin = 3usize.min(viewport_height / 3);
+    let mut offset = *list_offset;
+    if cursor_row < offset + margin {
+        offset = cursor_row.saturating_sub(margin);
+    } else if viewport_height > 0 && cursor_row + margin + 1 > offset + viewport_height {
+        offset = cursor_row + margin + 1 - viewport_height;
+    }
+    offset = offset.min(all_rows.len().saturating_sub(viewport_height));
+    *list_offset = offset;
+    let start = offset;
+    let end = (start + viewport_height).min(all_rows.len());
+    let rows: &[ListRow] = &all_rows[start..end];
+
+    let mut lines: Vec<Line> = Vec::new();
+
     let mut last_was_header = false;
-    for row in &rows {
+    for row in rows {
         match &row.kind {
             RowKind::ProjectHeader => {
                 if !lines.is_empty() {
@@ -1123,9 +1189,10 @@ fn render_linear_list(
                 // Sub-issues indented 4 cells deeper than parents so
                 // the hierarchy reads at a glance (parent key column 3,
                 // sub-issue key column 7).
+                let last = *is_last;
                 let prefix = if selected {
                     "     ▸ "
-                } else if *is_last {
+                } else if last {
                     "     └ "
                 } else {
                     "     │ "
@@ -1248,9 +1315,8 @@ fn render_linear_detail(
     stack: &[String],
     sub_cursor: usize,
     cache: &crate::cache::LinearCache,
-    app: &App,
+    focused: bool,
 ) {
-    let focused = app.focus == Pane::Right && app.detail_tab == Tab::Linear;
     let key = stack.last().cloned().unwrap_or_default();
     let cached = cache.issues.get(&key);
 
@@ -1620,20 +1686,18 @@ fn priority_color(priority: u8) -> Color {
     }
 }
 
-/// Glyph for a Linear state-kind category. All circle-class glyphs
-/// for consistent terminal rendering width — no narrow `·`. Backlog
-/// and unstarted both render as open circles (Linear's UI uses a
-/// dashed circle for backlog, but most terminal fonts don't have a
-/// reliable equivalent — the color carries the difference).
+/// Two-char ASCII label for a Linear state-kind category. Pure ASCII
+/// for guaranteed 1-cell-per-char rendering across all terminals.
+/// Color carries the state-kind distinction.
 fn state_glyph(kind: &str) -> &'static str {
     match kind {
-        "started" => "◐",
-        "completed" => "●",
-        "canceled" => "⊘",
-        "unstarted" => "○",
-        "backlog" => "○",
-        "triage" => "◑",
-        _ => "○",
+        "started" => "ip",
+        "completed" => "dn",
+        "canceled" => "cx",
+        "unstarted" => "td",
+        "backlog" => "bk",
+        "triage" => "tr",
+        _ => "··",
     }
 }
 
@@ -2494,10 +2558,11 @@ pub fn render_debug(
             cursor_key: key.to_string(),
             pinned: HashSet::new(),
         };
+        app.linear_list_offset = 0;
     } else if app.detail_tab == Tab::Linear {
         ensure_linear_cursor(&mut app);
     }
-    terminal.draw(|f| render(f, &app)).expect("debug draw");
+    terminal.draw(|f| render(f, &mut app)).expect("debug draw");
     let buffer = terminal.backend().buffer().clone();
     for y in 0..height {
         for x in 0..width {
@@ -2517,7 +2582,7 @@ pub fn run() -> io::Result<()> {
 
     let res: io::Result<()> = (|| {
         while !app.should_quit {
-            terminal.draw(|f| render(f, &app))?;
+            terminal.draw(|f| render(f, &mut app))?;
 
             if event::poll(Duration::from_millis(200))? {
                 if let Event::Key(key) = event::read()? {
@@ -2621,6 +2686,7 @@ mod tests {
             detail_tab: Tab::Overview,
             panes_selected: 0,
             linear_view: LinearView::default(),
+            linear_list_offset: 0,
             log: LogPane {
                 run_id: Some("1234-test".into()),
                 lines: vec![
@@ -2649,7 +2715,8 @@ mod tests {
     fn render_to_string(app: &App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, app)).unwrap();
+        let mut owned = app.clone();
+        terminal.draw(|f| render(f, &mut owned)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..h {
@@ -2894,15 +2961,14 @@ mod tests {
 
     #[test]
     fn state_glyph_mapping() {
-        assert_eq!(state_glyph("started"), "◐");
-        assert_eq!(state_glyph("completed"), "●");
-        assert_eq!(state_glyph("canceled"), "⊘");
-        assert_eq!(state_glyph("unstarted"), "○");
-        // backlog now uses the same open circle as unstarted — color
-        // carries the distinction. No more narrow `·` to misalign.
-        assert_eq!(state_glyph("backlog"), "○");
-        assert_eq!(state_glyph("triage"), "◑");
-        assert_eq!(state_glyph("unknown"), "○");
+        // Two-char ASCII labels — guaranteed monospace alignment.
+        assert_eq!(state_glyph("started"), "ip");
+        assert_eq!(state_glyph("completed"), "dn");
+        assert_eq!(state_glyph("canceled"), "cx");
+        assert_eq!(state_glyph("unstarted"), "td");
+        assert_eq!(state_glyph("backlog"), "bk");
+        assert_eq!(state_glyph("triage"), "tr");
+        assert_eq!(state_glyph("unknown"), "··");
     }
 
     #[test]
