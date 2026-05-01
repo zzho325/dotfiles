@@ -2421,21 +2421,48 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
         }
     }
 
-    // 4. Remove worktree.
+    // 4. Remove worktree. Capture failures so the toast can surface
+    //    them — a silent close that leaves the worktree behind is
+    //    exactly the orphan-worktree pain point we set out to fix.
+    let mut warning: Option<String> = None;
     let meta = state::load_task_meta(name);
     if !meta.worktree.is_empty() {
         let home = dirs::home_dir().unwrap_or_default();
         let wt = meta.worktree.replace("~", &home.to_string_lossy());
         let path = std::path::Path::new(&wt);
         if path.exists() {
-            let _ = Command::new("git")
+            let repo = std::env::var("ORCH_REPO").unwrap_or_default();
+            let main = format!("{repo}/main");
+            let output = Command::new("git")
                 .args(["worktree", "remove", &wt])
-                .current_dir(format!(
-                    "{}/main",
-                    std::env::var("ORCH_REPO").unwrap_or_default()
-                ))
-                .stderr(Stdio::null())
-                .status();
+                .current_dir(&main)
+                .stderr(Stdio::piped())
+                .output();
+            let removed = match output {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    // Disowned dir (no .git inside) — fall back to rm -rf,
+                    // mirroring the behavior of `orch gc`.
+                    if stderr.contains("is not a working tree")
+                        && !path.join(".git").exists()
+                        && !path.join(".jj").exists()
+                    {
+                        std::fs::remove_dir_all(path).is_ok()
+                    } else {
+                        warning = Some(format!(
+                            "worktree {wt} not removed: {}",
+                            stderr.trim().replace('\n', " ")
+                        ));
+                        false
+                    }
+                }
+                Err(e) => {
+                    warning = Some(format!("git worktree remove: {e}"));
+                    false
+                }
+            };
+            let _ = removed;
         }
     }
 
@@ -2444,7 +2471,10 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
         let _ = std::fs::remove_file(&state_path);
     }
 
-    Ok(format!("closed {name}"))
+    Ok(match warning {
+        None => format!("closed {name}"),
+        Some(w) => format!("closed {name} (WARN: {w})"),
+    })
 }
 
 /// Right-zone key dispatch. j/k always means "move cursor in active
