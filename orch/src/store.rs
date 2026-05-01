@@ -1,6 +1,4 @@
-//! New persistence model — the v2 store.
-//!
-//! See `docs/redesign.md` §1 (Data Model) and §6 (Migration Path).
+//! v2 persistence model — the authoritative store.
 //!
 //! Layout:
 //!
@@ -8,17 +6,11 @@
 //! ~/tasks/.orch/
 //! ├── runs/                   # untouched by migration
 //! ├── store.v2.tmp/           # staging area, deleted on crash recovery
-//! ├── store.v2/               # post-cutover authoritative store
+//! ├── store.v2/               # authoritative store
 //! │   ├── registry.json
 //! │   └── tasks/<id>.json
-//! └── store.version           # one-line pointer: "v2"; absence = legacy mode
+//! └── store.version           # one-line pointer: "v2"
 //! ```
-//!
-//! Slice A scope: data structs, `Store` handle with injectable root,
-//! basic load/save. No migration, no read-path integration yet — those
-//! are slices B and C.
-
-#![allow(dead_code)] // Wired in slices B-F.
 
 use std::{
     fs,
@@ -27,13 +19,33 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{atomic_write, tasks_dir};
+use crate::state::{
+    atomic_write, load_task_names, session_matches, tasks_dir,
+};
 
 pub type TaskId = u64;
 
-pub const STORE_VERSION: &str = "v2";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreVersion {
+    V2,
+}
 
-// Lifecycle FSM state (persisted intent, distinct from runtime badge).
+impl StoreVersion {
+    pub const CURRENT: Self = Self::V2;
+
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::V2 => "v2",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "v2" => Some(Self::V2),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -255,7 +267,7 @@ fn default_next_id() -> TaskId {
 impl Registry {
     pub fn new() -> Self {
         Self {
-            version: STORE_VERSION.to_string(),
+            version: StoreVersion::CURRENT.marker().to_string(),
             next_task_id: 1,
             open_order: Vec::new(),
             closed_order: Vec::new(),
@@ -292,11 +304,13 @@ impl Store {
     }
 
     pub fn store_root(&self) -> PathBuf {
-        self.orch_root.join(format!("store.{STORE_VERSION}"))
+        self.orch_root
+            .join(format!("store.{}", StoreVersion::CURRENT.marker()))
     }
 
     pub fn store_root_tmp(&self) -> PathBuf {
-        self.orch_root.join(format!("store.{STORE_VERSION}.tmp"))
+        self.orch_root
+            .join(format!("store.{}.tmp", StoreVersion::CURRENT.marker()))
     }
 
     pub fn store_version_path(&self) -> PathBuf {
@@ -316,8 +330,9 @@ impl Store {
     /// legacy `.state/*.json` reader.
     pub fn is_authoritative(&self) -> bool {
         fs::read_to_string(self.store_version_path())
-            .map(|s| s.trim() == STORE_VERSION)
-            .unwrap_or(false)
+            .ok()
+            .and_then(|s| StoreVersion::parse(&s))
+            .is_some()
     }
 
     pub fn load_registry(&self) -> Option<Registry> {
@@ -374,6 +389,19 @@ impl Store {
         None
     }
 
+    /// Load the record for `slug`, run `f` to mutate it, and save it
+    /// back. Returns `true` if the record existed and was saved.
+    pub fn update_record_by_slug<F>(&self, slug: &str, mut f: F) -> bool
+    where
+        F: FnMut(&mut TaskRecord),
+    {
+        let Some(mut record) = self.load_record_by_slug(slug) else {
+            return false;
+        };
+        f(&mut record);
+        self.save_record(&record)
+    }
+
     /// Iterate all records in `open_order` order (closed records excluded).
     pub fn load_open_records(&self) -> Vec<TaskRecord> {
         let Some(registry) = self.load_registry() else {
@@ -417,7 +445,7 @@ impl Store {
         let _ = fs::remove_dir_all(self.store_root());
 
         // Step 2: read legacy state.
-        let names = legacy_task_names(tasks_dir);
+        let names = load_task_names(tasks_dir);
         let order = legacy_order(tasks_dir);
         let live_sessions = legacy_live_sessions();
 
@@ -428,7 +456,7 @@ impl Store {
         fs::create_dir_all(&tmp_tasks)
             .map_err(|e| format!("create tmp/tasks: {e}"))?;
 
-        let now = current_epoch();
+        let now = crate::cache::now_epoch();
         for slug in &assignment_order {
             let id = registry.allocate_id();
             registry.open_order.push(id);
@@ -470,7 +498,7 @@ impl Store {
 
         // Step 7: write marker, fsync.
         let version_path = self.store_version_path();
-        atomic_write(&version_path, STORE_VERSION);
+        atomic_write(&version_path, StoreVersion::CURRENT.marker());
         fsync_path(&version_path)
             .map_err(|e| format!("fsync store.version: {e}"))?;
         fsync_path(&self.orch_root)
@@ -482,33 +510,6 @@ impl Store {
 
 fn fsync_path(path: &Path) -> std::io::Result<()> {
     fs::File::open(path)?.sync_all()
-}
-
-fn current_epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Read task names from .md files in tasks_dir (matches state.rs
-/// `load_task_names` behavior; duplicated here to avoid coupling slice
-/// C to state.rs internals).
-fn legacy_task_names(tasks_dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(tasks_dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<_> = entries
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-        .filter_map(|e| {
-            e.path()
-                .file_stem()
-                .and_then(|s| s.to_str().map(String::from))
-        })
-        .collect();
-    names.sort();
-    names
 }
 
 /// Read the legacy `order.json` if present.
@@ -644,11 +645,6 @@ struct LegacyMeta {
     needs_input: bool,
     #[serde(default)]
     paused: bool,
-}
-
-/// Mirror of `state::session_matches` for migration use.
-fn session_matches(actual: &str, expected: &str) -> bool {
-    actual == expected || actual.ends_with(&format!("-{expected}"))
 }
 
 #[cfg(test)]

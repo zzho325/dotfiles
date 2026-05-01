@@ -66,7 +66,6 @@ mod linear;
 mod runs;
 mod state;
 mod store;
-mod tui;
 mod tui3;
 
 use std::{
@@ -146,6 +145,15 @@ enum Cmd {
         /// Task name (e.g. foo for ~/tasks/foo.md)
         name: String,
     },
+    /// Internal — Claude Code hook entry points for busy-marker writes.
+    /// `orch busy start` (called from UserPromptSubmit) reads
+    /// `{session_id, cwd}` JSON on stdin and writes a marker file.
+    /// `orch busy stop` (called from Stop / SessionEnd) removes it.
+    /// Writes are atomic so `is_worktree_busy` never sees partial JSON.
+    Busy {
+        #[command(subcommand)]
+        action: BusyAction,
+    },
     /// Render the new TUI to stdout for debugging (no raw mode).
     /// Useful for capturing what the layout looks like with live data
     /// without needing an interactive terminal.
@@ -206,6 +214,14 @@ enum LinearAction {
     /// flagged as not-found (deleted issues, typos, non-Linear
     /// patterns like REQ-01).
     Clean,
+}
+
+#[derive(Subcommand)]
+enum BusyAction {
+    /// Write busy marker for the current Claude turn.
+    Start,
+    /// Remove the busy marker.
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -515,13 +531,15 @@ fn cmd_spawn(name: &str) {
         return;
     }
 
-    let mut meta = state::load_task_meta(name);
-    let work_dir = if !meta.worktree.is_empty() {
-        meta.worktree
-            .replace(
-                "~",
-                &dirs::home_dir().unwrap_or_default().to_string_lossy(),
-            )
+    state::ensure_state_files();
+    let store = store::Store::default();
+    let Some(record) = store.load_record_by_slug(name) else {
+        eprintln!("[spawn] no task '{name}' (create ~/tasks/{name}.md first)");
+        return;
+    };
+
+    let work_dir = if !record.worktree.path.is_empty() {
+        state::expand_home(&record.worktree.path)
     } else {
         format!("{}/task-{name}", repo_dir())
     };
@@ -546,28 +564,40 @@ fn cmd_spawn(name: &str) {
         return;
     }
 
-    // Persist session, worktree, and clear paused flag
-    meta.session = session.clone();
-    meta.worktree = work_dir;
-    meta.paused = false;
-    state::save_task_meta(name, &meta);
+    let now = epoch_secs();
+    store.update_record_by_slug(name, |r| {
+        r.tmux.session_name = session.clone();
+        r.worktree.path = work_dir.clone();
+        r.desired_state = store::DesiredState::Active;
+        if r.started_at.is_none() {
+            r.started_at = Some(now);
+        }
+        r.updated_at = now;
+    });
 
     eprintln!("[spawn] {session} started");
 }
 
 fn cmd_pause(name: &str) {
-    let mut meta = state::load_task_meta(name);
-    if !meta.session.is_empty() {
-        // Find actual tmux name (may be N-task-<name>) and kill it
-        if let Some(actual) = find_actual_session(&meta.session) {
+    let store = store::Store::default();
+    let session_name = store
+        .load_record_by_slug(name)
+        .map(|r| r.tmux.session_name)
+        .unwrap_or_default();
+    if !session_name.is_empty() {
+        if let Some(actual) = find_actual_session(&session_name) {
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &actual])
                 .stderr(Stdio::null())
                 .status();
         }
     }
-    meta.paused = true;
-    state::save_task_meta(name, &meta);
+    let now = epoch_secs();
+    store.update_record_by_slug(name, |r| {
+        r.desired_state = store::DesiredState::Paused;
+        r.paused_at = Some(now);
+        r.updated_at = now;
+    });
     eprintln!("[pause] {name} paused");
 }
 
@@ -589,9 +619,12 @@ fn find_actual_session(expected: &str) -> Option<String> {
 }
 
 fn cmd_resume(name: &str) {
-    let mut meta = state::load_task_meta(name);
-    meta.paused = false;
-    state::save_task_meta(name, &meta);
+    let store = store::Store::default();
+    let now = epoch_secs();
+    store.update_record_by_slug(name, |r| {
+        r.desired_state = store::DesiredState::Active;
+        r.updated_at = now;
+    });
     cmd_spawn(name);
 }
 
@@ -672,51 +705,42 @@ fn remove_worktree(path: &Path) -> Result<(), String> {
     Err(msg)
 }
 
-/// Close a task. v2-aware: persists `desired_state=Closed` and moves
-/// the id from `Registry.open_order` to `closed_order` first, then runs
-/// destructive cleanup (tmux kill, .md archive, worktree remove).
+/// Close a task. Persists `desired_state=Closed` and moves the id from
+/// `Registry.open_order` to `closed_order` first, then runs destructive
+/// cleanup (tmux kill, .md archive, worktree remove).
 ///
 /// Archive failure aborts the cleanup — the only durable handle to the
-/// task's history is its markdown file; if we can't archive it,
-/// removing the worktree would lose context. tmux/worktree failures
-/// warn but don't roll back the FSM (drift flags surface those cases).
+/// task's history is its markdown file. tmux/worktree failures warn but
+/// don't roll back the FSM (drift flags surface those cases).
 fn cmd_close(name: &str) {
     let store = store::Store::default();
-    let v2_authoritative = store.is_authoritative();
-    let meta = state::load_task_meta(name);
-
-    let record_id = if v2_authoritative {
-        store.load_record_by_slug(name).map(|r| r.id)
-    } else {
-        None
+    let Some(record) = store.load_record_by_slug(name) else {
+        eprintln!("[close] no task '{name}'");
+        return;
     };
 
-    // 1. v2 FSM transition first. If v2 isn't authoritative, this is
-    //    a no-op and we fall back to legacy semantics.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let archive_path = state::tasks_dir().join("done").join(
-        record_id
-            .map(|id| format!("{id}-{name}.md"))
-            .unwrap_or_else(|| format!("{name}.md")),
-    );
-    if let Some(id) = record_id {
-        if let Some(mut record) = store.load_record(id) {
-            record.desired_state = store::DesiredState::Closed;
-            record.closed_at = Some(now);
-            record.archived_task_file = Some(archive_path.clone());
-            record.updated_at = now;
-            store.save_record(&record);
+    let session_name = record.tmux.session_name.clone();
+    let worktree_path = record.worktree.path.clone();
+    let cleanup_on_close = record.worktree.cleanup_on_close;
+    let id = record.id;
+    let now = epoch_secs();
+    let archive_path = state::tasks_dir()
+        .join("done")
+        .join(format!("{id}-{name}.md"));
+
+    // 1. FSM transition.
+    store.update_record_by_slug(name, |r| {
+        r.desired_state = store::DesiredState::Closed;
+        r.closed_at = Some(now);
+        r.archived_task_file = Some(archive_path.clone());
+        r.updated_at = now;
+    });
+    if let Some(mut registry) = store.load_registry() {
+        registry.open_order.retain(|i| *i != id);
+        if !registry.closed_order.contains(&id) {
+            registry.closed_order.push(id);
         }
-        if let Some(mut registry) = store.load_registry() {
-            registry.open_order.retain(|i| *i != id);
-            if !registry.closed_order.contains(&id) {
-                registry.closed_order.push(id);
-            }
-            store.save_registry(&registry);
-        }
+        store.save_registry(&registry);
     }
 
     // 2. Archive .md to done/. ABORT on failure — the rest of cleanup
@@ -737,11 +761,9 @@ fn cmd_close(name: &str) {
         eprintln!("[close] archived {} -> {}", md.display(), archive_path.display());
     }
 
-    // 3. Kill tmux. Failure warns but does not roll back the FSM —
-    //    the cleanup_pending drift flag is the right place for this
-    //    once F-1F lands.
-    if !meta.session.is_empty() {
-        if let Some(actual) = find_actual_session(&meta.session) {
+    // 3. Kill tmux.
+    if !session_name.is_empty() {
+        if let Some(actual) = find_actual_session(&session_name) {
             let killed = Command::new("tmux")
                 .args(["kill-session", "-t", &actual])
                 .stderr(Stdio::null())
@@ -756,13 +778,8 @@ fn cmd_close(name: &str) {
     }
 
     // 4. Remove worktree if cleanup_on_close is true (default).
-    let cleanup_on_close = record_id
-        .and_then(|id| store.load_record(id))
-        .map(|r| r.worktree.cleanup_on_close)
-        .unwrap_or(true);
-    if cleanup_on_close && !meta.worktree.is_empty() {
-        let home = dirs::home_dir().unwrap_or_default();
-        let wt = meta.worktree.replace("~", &home.to_string_lossy());
+    if cleanup_on_close && !worktree_path.is_empty() {
+        let wt = state::expand_home(&worktree_path);
         let path = Path::new(&wt);
         if path.exists() {
             match remove_worktree(path) {
@@ -774,35 +791,91 @@ fn cmd_close(name: &str) {
         }
     }
 
-    // 5. Drop legacy state file. Keep the v2 record for closed-history.
-    let state_path = dir.join(".state").join(format!("{name}.json"));
-    if state_path.exists() {
-        let _ = fs::remove_file(&state_path);
-    }
-
     eprintln!("[close] {name} closed");
 }
 
-// Linear ticket linkage. v2-aware writes only — when the v2 store is
-// not authoritative we refuse to silently no-op since the legacy
-// TaskMeta has no field for Linear keys.
+// Busy-marker hooks. Called from Claude Code's UserPromptSubmit / Stop
+// hooks via `orch busy {start,stop}`. Reads `{session_id, cwd}` JSON on
+// stdin and writes/removes a marker at $XDG_RUNTIME_DIR/orch/busy/<sid>.
+// `is_worktree_busy` reads these markers to derive TaskStatus::Working.
+//
+// Failures here are silent: the hook fires on every prompt and partial
+// stdin / missing fields shouldn't surface to the user. ORCH_HOOK_DEBUG
+// in the environment routes diagnostics to stderr.
+
+fn parse_busy_input(json: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let session_id = v["session_id"].as_str()?.to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+    let cwd = v["cwd"].as_str().unwrap_or("").to_string();
+    Some((session_id, cwd))
+}
+
+fn write_busy_marker(busy_dir: &Path, session_id: &str, cwd: &str) -> bool {
+    let path = busy_dir.join(session_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // started_at is informational only; staleness is computed from
+    // the marker file's mtime, not this field.
+    let payload = serde_json::json!({
+        "cwd": cwd,
+        "started_at": epoch_secs(),
+        "pid": std::process::id(),
+    });
+    state::atomic_write(&path, &payload.to_string())
+}
+
+fn busy_debug() -> bool {
+    std::env::var_os("ORCH_HOOK_DEBUG").is_some()
+}
+
+fn read_stdin_to_string() -> String {
+    use std::io::Read;
+    let mut buf = String::new();
+    let _ = io::stdin().read_to_string(&mut buf);
+    buf
+}
+
+fn cmd_busy_start() {
+    let json = read_stdin_to_string();
+    let Some((session_id, cwd)) = parse_busy_input(&json) else {
+        if busy_debug() {
+            eprintln!("[orch busy start] missing session_id or bad JSON");
+        }
+        return;
+    };
+    let dir = state::busy_dir();
+    if !write_busy_marker(&dir, &session_id, &cwd) && busy_debug() {
+        eprintln!(
+            "[orch busy start] atomic_write failed: {}",
+            dir.join(&session_id).display(),
+        );
+    }
+}
+
+fn cmd_busy_stop() {
+    let json = read_stdin_to_string();
+    let Some((session_id, _cwd)) = parse_busy_input(&json) else {
+        if busy_debug() {
+            eprintln!("[orch busy stop] missing session_id or bad JSON");
+        }
+        return;
+    };
+    let _ = fs::remove_file(state::busy_dir().join(&session_id));
+}
+
+// Linear ticket linkage.
 
 fn linear_key_pattern() -> regex::Regex {
     // PROJ-N or PROJ-NN... — Linear's ticket format
     regex::Regex::new(r"\b[A-Z][A-Z0-9_]+-\d+\b").expect("valid regex")
 }
 
-fn require_v2_store() -> Option<store::Store> {
-    let s = store::Store::default();
-    if !s.is_authoritative() {
-        eprintln!("[linear] v2 store not authoritative — restart `orch daemon` to migrate");
-        return None;
-    }
-    Some(s)
-}
-
 fn cmd_linear_add(task: &str, key: &str) {
-    let Some(s) = require_v2_store() else { return };
+    let s = store::Store::default();
     let Some(mut record) = s.load_record_by_slug(task) else {
         eprintln!("[linear] no task: {task}");
         return;
@@ -822,7 +895,7 @@ fn cmd_linear_add(task: &str, key: &str) {
 }
 
 fn cmd_linear_rm(task: &str, key: &str) {
-    let Some(s) = require_v2_store() else { return };
+    let s = store::Store::default();
     let Some(mut record) = s.load_record_by_slug(task) else {
         eprintln!("[linear] no task: {task}");
         return;
@@ -839,7 +912,7 @@ fn cmd_linear_rm(task: &str, key: &str) {
 }
 
 fn cmd_linear_ls(task: &str) {
-    let Some(s) = require_v2_store() else { return };
+    let s = store::Store::default();
     let Some(record) = s.load_record_by_slug(task) else {
         eprintln!("[linear] no task: {task}");
         return;
@@ -901,7 +974,7 @@ fn scan_task_md_for_keys(task: &str, store: &store::Store) -> usize {
 }
 
 fn cmd_linear_clean() {
-    let Some(s) = require_v2_store() else { return };
+    let s = store::Store::default();
     let cache = cache::read_linear();
     if cache.not_found.is_empty() {
         eprintln!("[linear] no not-found keys to clean");
@@ -938,7 +1011,7 @@ fn cmd_linear_clean() {
 }
 
 fn cmd_linear_scan(task: Option<&str>) {
-    let Some(s) = require_v2_store() else { return };
+    let s = store::Store::default();
     let tasks: Vec<String> = match task {
         Some(t) => vec![t.to_string()],
         None => state::ordered_open_slugs(),
@@ -1009,19 +1082,12 @@ fn spawn_status_loop() {
 
         loop {
             state::ensure_state_files();
-            let order = state::load_order();
             let sessions = state::load_tmux_sessions();
-            // Note: auto_pause_orphaned removed from the poll path —
-            // it mutated lifecycle from runtime observation, breaking
-            // the "persisted intent / observed runtime" split. Missing
-            // sessions now surface via drift flags + Detached badge,
-            // not by silently flipping desired_state.
-            let tasks =
-                state::load_tasks(&order, &sessions, stale_secs);
+            let tasks = state::load_tasks(&sessions, stale_secs);
 
             let mut cached_tasks = HashMap::new();
             for task in &tasks {
-                let session = &task.meta.session;
+                let session = &task.record.tmux.session_name;
                 let matched = sessions.values().find(|s| {
                     state::session_matches(&s.name, session)
                 });
@@ -1090,20 +1156,17 @@ fn spawn_linear_loop() {
             // without an explicit `orch linear scan`. Idempotent —
             // scan_task_md_for_keys skips already-linked keys.
             let store = store::Store::default();
-            if store.is_authoritative() {
-                for slug in state::ordered_open_slugs() {
-                    scan_task_md_for_keys(&slug, &store);
-                }
+            let records = store.load_open_records();
+            for record in &records {
+                scan_task_md_for_keys(&record.slug, &store);
             }
 
             // Collect every distinct linear key across open tasks.
             let mut keys: Vec<String> = Vec::new();
-            if store.is_authoritative() {
-                for record in store.load_open_records() {
-                    for li in &record.links.linear_issues {
-                        if !keys.contains(&li.key) {
-                            keys.push(li.key.clone());
-                        }
+            for record in &records {
+                for li in &record.links.linear_issues {
+                    if !keys.contains(&li.key) {
+                        keys.push(li.key.clone());
                     }
                 }
             }
@@ -1123,26 +1186,50 @@ fn spawn_linear_loop() {
             let mut not_found = Vec::new();
             let mut hard_failures = 0u32;
             for key in &keys {
-                match linear::fetch_issue(&api_key, key) {
-                    Ok(Some(issue)) => {
-                        cached_issues.insert(
-                            key.clone(),
-                            cache::CachedLinear::from_issue(&issue),
-                        );
-                    }
-                    Ok(None) => {
-                        // Linear says this key doesn't resolve — the
-                        // link probably points at a deleted issue or
-                        // a non-Linear pattern (e.g. REQ-01).
-                        not_found.push(key.clone());
-                    }
-                    Err(e) => {
-                        hard_failures += 1;
-                        if hard_failures <= 1 {
-                            eprintln!("[orch] linear fetch {key} failed: {e}");
-                        }
-                    }
+                fetch_into_cache(
+                    &api_key,
+                    key,
+                    &mut cached_issues,
+                    &mut not_found,
+                    &mut hard_failures,
+                );
+            }
+            // Fetch each sub-issue as a top-level entry so previews and
+            // drill views see the full record (description, project, age).
+            // BFS through depth — a fetched sub-issue may itself have
+            // children we want (linked issue → child epic → grandchild).
+            // Bounded at depth 5 to keep cycles fast on deeply-nested
+            // hierarchies.
+            let mut depth = 0u32;
+            loop {
+                let candidates: Vec<String> = cached_issues
+                    .values()
+                    .flat_map(|c: &cache::CachedLinear| {
+                        c.children.iter().map(|ch| ch.identifier.clone())
+                    })
+                    .filter(|k| {
+                        !cached_issues.contains_key(k)
+                            && !not_found.contains(k)
+                    })
+                    .collect();
+                if candidates.is_empty() || depth >= 5 {
+                    break;
                 }
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for key in &candidates {
+                    if !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    fetch_into_cache(
+                        &api_key,
+                        key,
+                        &mut cached_issues,
+                        &mut not_found,
+                        &mut hard_failures,
+                    );
+                }
+                depth += 1;
             }
             let disconnected = hard_failures > 0
                 && cached_issues.is_empty();
@@ -1158,6 +1245,51 @@ fn spawn_linear_loop() {
     });
 }
 
+/// Fetch one Linear key into the cache. Updates `cached_issues`,
+/// `not_found`, or `hard_failures` based on the API response. The
+/// rate-limit budget for the linear loop is one call per non-cached
+/// key per refresh cycle (every 120s).
+fn fetch_into_cache(
+    api_key: &str,
+    key: &str,
+    cached_issues: &mut std::collections::HashMap<String, cache::CachedLinear>,
+    not_found: &mut Vec<String>,
+    hard_failures: &mut u32,
+) {
+    // Linear's GraphQL endpoint occasionally 502s — single retry with
+    // a short delay rescues most transient failures. Without this, the
+    // first failure of a cycle silently dropped subsequent issues from
+    // the cache (silent because `hard_failures > 1` muted the logs).
+    let mut last_err: Option<String> = None;
+    for attempt in 0..2 {
+        match linear::fetch_issue(api_key, key) {
+            Ok(Some(issue)) => {
+                cached_issues.insert(
+                    key.to_string(),
+                    cache::CachedLinear::from_issue(&issue),
+                );
+                return;
+            }
+            Ok(None) => {
+                if !not_found.contains(&key.to_string()) {
+                    not_found.push(key.to_string());
+                }
+                return;
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                if attempt == 0 {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+    }
+    *hard_failures += 1;
+    if let Some(e) = last_err {
+        eprintln!("[orch] linear fetch {key} failed (after retry): {e}");
+    }
+}
+
 /// Background thread: reconciles PRs and fetches PR data every 30s.
 fn spawn_pr_loop() {
     use std::thread;
@@ -1168,11 +1300,17 @@ fn spawn_pr_loop() {
             state::reconcile_prs();
 
             // Fetch PR data for all tracked PRs
-            let dir = state::tasks_dir();
-            let names = state::load_task_names(&dir);
-            let all_prs: Vec<u32> = names
-                .iter()
-                .flat_map(|n| state::load_task_meta(n).prs)
+            let store = store::Store::default();
+            let all_prs: Vec<u32> = store
+                .load_open_records()
+                .into_iter()
+                .flat_map(|r| {
+                    r.links
+                        .prs
+                        .into_iter()
+                        .map(|p| p.number)
+                        .collect::<Vec<_>>()
+                })
                 .collect();
 
             pr_cache.refresh(all_prs.clone());
@@ -1209,12 +1347,16 @@ fn cmd_daemon() {
 
     // v2 store migration. Runs at most once per environment — once
     // store.version=v2 exists, this short-circuits. Crashed prior runs
-    // leave a tmp dir that gets discarded and retried.
+    // leave a tmp dir that gets discarded and retried. Failure here
+    // exits the daemon; v2 is the only authoritative store.
     let store = store::Store::default();
     match store.migrate_from_legacy(&state::tasks_dir()) {
-        Ok(0) => {} // already migrated, no-op
+        Ok(0) => {}
         Ok(n) => eprintln!("[orch] migrated {n} tasks to v2 store"),
-        Err(e) => eprintln!("[orch] WARNING: v2 migration failed: {e}"),
+        Err(e) => {
+            eprintln!("[orch] FATAL: v2 migration failed: {e}");
+            std::process::exit(1);
+        }
     }
 
     state::ensure_state_files();
@@ -1311,13 +1453,7 @@ fn cmd_daemon() {
 }
 
 fn run_tui() {
-    let use_legacy =
-        std::env::var("ORCH_TUI").is_ok_and(|v| v == "legacy");
-    if use_legacy {
-        tui::run().expect("TUI failed");
-    } else {
-        tui3::run().expect("TUI failed");
-    }
+    tui3::run().expect("TUI failed");
 }
 
 fn main() {
@@ -1351,6 +1487,10 @@ fn main() {
         }
         Some(Cmd::Gc) => cmd_gc(),
         Some(Cmd::Close { name }) => cmd_close(&name),
+        Some(Cmd::Busy { action }) => match action {
+            BusyAction::Start => cmd_busy_start(),
+            BusyAction::Stop => cmd_busy_stop(),
+        },
         Some(Cmd::RenderDebug { width, height, tab, focus, select, linear_detail, linear_cursor }) => {
             tui3::render_debug(
                 width,
@@ -1371,21 +1511,101 @@ fn main() {
         },
         Some(Cmd::Pr { action }) => match action {
             PrAction::Add { task, number } => {
-                let mut meta = state::load_task_meta(&task);
-                if !meta.prs.contains(&number) {
-                    meta.prs.push(number);
-                    state::save_task_meta(&task, &meta);
+                let store = store::Store::default();
+                let already = store
+                    .load_record_by_slug(&task)
+                    .map(|r| r.links.prs.iter().any(|p| p.number == number))
+                    .unwrap_or(false);
+                if already {
+                    eprintln!("[orch] PR #{number} already in {task}");
+                    return;
+                }
+                let now = epoch_secs();
+                let updated = store.update_record_by_slug(&task, |r| {
+                    r.links.prs.push(store::PrLink {
+                        number,
+                        source: store::LinkSource::Manual,
+                        ..Default::default()
+                    });
+                    r.updated_at = now;
+                });
+                if updated {
                     eprintln!("[orch] added PR #{number} to {task}");
                 } else {
-                    eprintln!("[orch] PR #{number} already in {task}");
+                    eprintln!("[orch] no task '{task}'");
                 }
             }
             PrAction::Rm { task, number } => {
-                let mut meta = state::load_task_meta(&task);
-                meta.prs.retain(|&n| n != number);
-                state::save_task_meta(&task, &meta);
-                eprintln!("[orch] removed PR #{number} from {task}");
+                let store = store::Store::default();
+                let now = epoch_secs();
+                let updated = store.update_record_by_slug(&task, |r| {
+                    r.links.prs.retain(|p| p.number != number);
+                    r.updated_at = now;
+                });
+                if updated {
+                    eprintln!("[orch] removed PR #{number} from {task}");
+                } else {
+                    eprintln!("[orch] no task '{task}'");
+                }
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_busy_input_extracts_session_and_cwd() {
+        let json = r#"{"session_id":"abc-123","cwd":"/tmp/wt"}"#;
+        let (sid, cwd) = parse_busy_input(json).unwrap();
+        assert_eq!(sid, "abc-123");
+        assert_eq!(cwd, "/tmp/wt");
+    }
+
+    #[test]
+    fn parse_busy_input_allows_missing_cwd() {
+        let json = r#"{"session_id":"abc-123"}"#;
+        let (sid, cwd) = parse_busy_input(json).unwrap();
+        assert_eq!(sid, "abc-123");
+        assert_eq!(cwd, "");
+    }
+
+    #[test]
+    fn parse_busy_input_rejects_bad_json() {
+        assert!(parse_busy_input("not json").is_none());
+        assert!(parse_busy_input("").is_none());
+    }
+
+    #[test]
+    fn parse_busy_input_rejects_missing_session_id() {
+        assert!(parse_busy_input(r#"{"cwd":"/tmp"}"#).is_none());
+        assert!(parse_busy_input(r#"{"session_id":""}"#).is_none());
+    }
+
+    #[test]
+    fn write_and_remove_busy_marker_round_trip() {
+        let dir = std::env::temp_dir().join("orch-busy-marker-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        assert!(write_busy_marker(&dir, "sid-1", "/tmp/wt"));
+        let path = dir.join("sid-1");
+        assert!(path.exists());
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["cwd"], "/tmp/wt");
+        assert!(v["started_at"].is_number());
+
+        // No leftover .tmp file
+        assert!(!dir.join("sid-1.tmp").exists());
+
+        // Removal: rebuild path then remove
+        let _ = fs::remove_file(&path);
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

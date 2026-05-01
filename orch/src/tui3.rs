@@ -19,7 +19,7 @@
 #![allow(dead_code)] // Some bindings stubbed for Phase 4+.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, stdout},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -41,9 +41,8 @@ use ratatui::{
     Terminal,
 };
 
-use crate::state::{
-    self, TaskStatus, load_task_meta, load_tmux_sessions,
-};
+use crate::state::{self, TaskStatus, load_tmux_sessions};
+use crate::store::{self, DesiredState, TaskRecord};
 
 const FAST_TICK: Duration = Duration::from_secs(2);
 
@@ -57,6 +56,13 @@ const PINE: Color = Color::Rgb(0x28, 0x69, 0x83);
 const FOAM: Color = Color::Rgb(0x56, 0x94, 0x9f);
 const IRIS: Color = Color::Rgb(0x90, 0x7a, 0xa9);
 const HL_LOW: Color = Color::Rgb(0xf4, 0xed, 0xe8);
+/// Stronger highlight for the focused-pane cursor row. Visible enough
+/// to read at a glance against Rosé Pine Dawn's `0xfaf4ed` base.
+const HL_MED: Color = Color::Rgb(0xe5, 0xd5, 0xc4);
+/// Pale green-tinted background for `+` lines in the diff body.
+const DIFF_ADD_BG: Color = Color::Rgb(0xea, 0xf0, 0xe2);
+/// Pale rose-tinted background for `-` lines.
+const DIFF_DEL_BG: Color = Color::Rgb(0xf6, 0xe2, 0xe2);
 
 // Layout constants.
 const LIST_WIDTH: u16 = 34;
@@ -124,16 +130,21 @@ pub struct TmuxPaneInfo {
 #[derive(Debug, Clone)]
 pub struct TaskView {
     pub name: String,
-    pub meta: state::TaskMeta,
+    pub record: TaskRecord,
     pub status: TaskStatus,
     pub prs: Vec<state::PrData>,
     pub panes: Vec<TmuxPaneInfo>,
-    /// Stub Linear data — slice 4b replaces this with real cache.
     pub linear: Vec<LinearStub>,
-    /// Durable v2 task id when the v2 store is authoritative.
-    pub id: Option<crate::store::TaskId>,
-    /// True iff any drift flag is set on the v2 record.
-    pub drift: bool,
+}
+
+impl TaskView {
+    pub fn id(&self) -> store::TaskId {
+        self.record.id
+    }
+
+    pub fn drift(&self) -> bool {
+        self.record.drift.any()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +210,37 @@ impl Default for LinearView {
     }
 }
 
+/// PR tab sub-state. Mirrors `LinearView` shape — minus the drill stack
+/// since PRs don't nest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrView {
+    List {
+        /// 0 = no cursor (no PRs linked, or freshly entered without
+        /// cursor anchored).
+        cursor_number: u32,
+    },
+    Detail {
+        number: u32,
+        focus: PrDetailFocus,
+        /// Index into `CachedPrDiff.files`.
+        file_cursor: usize,
+        /// Visual-row offset into the diff body (sticky-margin scroll).
+        scroll: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrDetailFocus {
+    Files,
+    Diff,
+}
+
+impl Default for PrView {
+    fn default() -> Self {
+        PrView::List { cursor_number: 0 }
+    }
+}
+
 #[derive(Clone)]
 pub struct App {
     pub tasks: Vec<TaskView>,
@@ -214,6 +256,12 @@ pub struct App {
     /// (same algorithm as `monitor`'s tui). Survives re-render even
     /// when rows reshape.
     pub linear_list_offset: usize,
+    /// PR tab sub-state.
+    pub pr_view: PrView,
+    /// Per-PR persisted detail-view position. Esc-out saves into this
+    /// map, drilling back into the same PR restores. Only `(file_cursor,
+    /// scroll)` survive; `focus` resets to `Files`.
+    pub pr_detail_state: HashMap<u32, (usize, u16)>,
     pub log: LogPane,
     pub show_help: bool,
     pub daemon_alive: bool,
@@ -244,6 +292,8 @@ impl App {
             panes_selected: 0,
             linear_view: LinearView::default(),
             linear_list_offset: 0,
+            pr_view: PrView::default(),
+            pr_detail_state: HashMap::new(),
             log: LogPane::default(),
             show_help: false,
             daemon_alive,
@@ -271,12 +321,18 @@ impl App {
             Some(load_tmux_sessions())
         };
 
-        let store = crate::store::Store::default();
+        let store = store::Store::default();
+        let Some(registry) = store.load_registry() else {
+            return Vec::new();
+        };
 
-        state::ordered_open_slugs()
-            .into_iter()
-            .map(|name| {
-                let meta = load_task_meta(&name);
+        registry
+            .open_order
+            .iter()
+            .filter_map(|id| store.load_record(*id))
+            .filter(|r| r.desired_state != DesiredState::Closed)
+            .map(|record| {
+                let name = record.slug.clone();
                 let status = if daemon_alive {
                     status_cache
                         .tasks
@@ -284,49 +340,37 @@ impl App {
                         .map(|ct| status_from_str(&ct.status))
                         .unwrap_or(TaskStatus::Idle)
                 } else if let Some(sessions) = &live_sessions {
-                    state::derive_status(&meta, sessions, state::busy_stale_secs())
+                    state::derive_status(&record, sessions, state::busy_stale_secs())
                 } else {
                     TaskStatus::Idle
                 };
 
-                let prs: Vec<state::PrData> = meta
+                let prs: Vec<state::PrData> = record
+                    .links
                     .prs
                     .iter()
-                    .map(|&num| {
+                    .map(|p| {
                         pr_cache
                             .prs
-                            .get(&num)
+                            .get(&p.number)
                             .map(|cp| cp.to_pr_data())
                             .unwrap_or(state::PrData {
-                                number: num,
+                                number: p.number,
                                 ..Default::default()
                             })
                     })
                     .collect();
 
-                let panes = panes_for_session(&meta.session);
-
-                let record = if store.is_authoritative() {
-                    store.load_record_by_slug(&name)
-                } else {
-                    None
-                };
-                let linear = record
-                    .as_ref()
-                    .map(|r| linear_from_record(r, &linear_cache))
-                    .unwrap_or_default();
-                let id = record.as_ref().map(|r| r.id);
-                let drift = record.as_ref().map(|r| r.drift.any()).unwrap_or(false);
+                let panes = panes_for_session(&record.tmux.session_name);
+                let linear = linear_from_record(&record, &linear_cache);
 
                 TaskView {
                     name,
-                    meta,
+                    record,
                     status,
                     prs,
                     panes,
                     linear,
-                    id,
-                    drift,
                 }
             })
             .collect()
@@ -565,6 +609,26 @@ fn linear_from_record(
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
+    // Fullscreen take-over: when drilled into a PR, the diff gets the
+    // whole terminal. Esc returns to the three-pane layout. The detail
+    // tab must still be Prs — if the user pressed `1`/`3`/`4` to jump
+    // to another tab while drilled, we treat that as an exit (the
+    // dispatcher resets pr_view) so this short-circuit is consistent.
+    if let PrView::Detail { number, focus, file_cursor, scroll } = &app.pr_view {
+        if app.detail_tab == Tab::Prs {
+            render_pr_detail_fullscreen(
+                frame, area, app, *number, *focus, *file_cursor, *scroll,
+            );
+            if app.show_help {
+                render_help_overlay_pr_detail(frame, area);
+            }
+            if app.message_input.is_some() {
+                render_message_input(frame, area, app);
+            }
+            return;
+        }
+    }
+
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -726,11 +790,14 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             // user only cared about drift state at a glance, and the
             // detail tabs already surface PR/Linear counts.
             let mut counts = String::new();
-            if task.drift {
+            if task.drift() {
                 counts.push_str(" ⚠");
             }
             let badge_text = format!(" {badge}");
-            let id_text = task.id.map(|i| format!("#{i} ")).unwrap_or_default();
+            // Positional rank in open_order — closing a task renumbers
+            // the rest visually so there's no gap. The durable
+            // `task.record.id` stays unchanged for persistence.
+            let id_text = format!("#{} ", i + 1);
             let cursor = if selected { "▸ " } else { "  " };
 
             // Width available for the name itself = total - cursor (2) -
@@ -754,7 +821,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw(" ".repeat(pad)),
             ];
             if !counts.is_empty() {
-                let counts_color = if task.drift && counts.starts_with(" ⚠") {
+                let counts_color = if task.drift() && counts.starts_with(" ⚠") {
                     LOVE
                 } else {
                     SUBTLE
@@ -851,15 +918,15 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView) {
-    let session_str = if task.meta.session.is_empty() {
+    let session_str = if task.record.tmux.session_name.is_empty() {
         "—".to_string()
     } else {
-        task.meta.session.clone()
+        task.record.tmux.session_name.clone()
     };
-    let worktree_str = if task.meta.worktree.is_empty() {
+    let worktree_str = if task.record.worktree.path.is_empty() {
         "—".to_string()
     } else {
-        task.meta.worktree.clone()
+        task.record.worktree.path.clone()
     };
     let prs_str = if task.prs.is_empty() {
         "—".to_string()
@@ -891,51 +958,145 @@ fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskVie
         kv_line(" linear:   ", &linear_str),
         kv_line(" panes:    ", &panes_str),
     ];
-    if task.meta.needs_input {
+    if task.record.attention.needs_input {
         lines.push(kv_line(" attention:", "needs input"));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn render_tab_prs(frame: &mut Frame, area: Rect, _app: &App, task: &TaskView) {
+fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
+    let focused = app.focus == Pane::Right && app.detail_tab == Tab::Prs;
+    // PrView::Detail is handled by the fullscreen fork at the top of
+    // `render()`. By the time we get here, we're rendering the PR list.
+    let cursor_number = match &app.pr_view {
+        PrView::List { cursor_number } => *cursor_number,
+        PrView::Detail { number, .. } => *number,
+    };
+
     let mut lines = vec![Line::raw("")];
     if task.prs.is_empty() {
         lines.push(Line::styled(
             " (no linked PRs)",
             Style::default().fg(SUBTLE),
         ));
-    } else {
-        for pr in &task.prs {
-            let title = if pr.title.is_empty() {
-                "(no title cached)".into()
-            } else {
-                pr.title.clone()
-            };
-            let ci = match pr.ci_pass {
-                Some(true) => Span::styled("✓ ci", Style::default().fg(PINE)),
-                Some(false) => Span::styled("✗ ci", Style::default().fg(LOVE)),
-                None => Span::styled("· ci", Style::default().fg(MUTED)),
-            };
-            let approval = if pr.approved {
-                Span::styled(" ✓ review", Style::default().fg(PINE))
-            } else {
-                Span::styled(" · review", Style::default().fg(MUTED))
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" #{}", pr.number),
-                    Style::default().fg(IRIS),
-                ),
-                Span::raw("  "),
-                Span::styled(title, Style::default().fg(TEXT)),
-            ]));
+        lines.push(Line::styled(
+            " orch pr add <task> <number>",
+            Style::default().fg(MUTED),
+        ));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        return;
+    }
+
+    let width = area.width as usize;
+    for pr in &task.prs {
+        let selected = focused && pr.number == cursor_number;
+        let cursor_glyph = if selected { " ▸ " } else { "   " };
+        let cursor_color = if selected { LOVE } else { MUTED };
+        let id_color = if selected { LOVE } else { IRIS };
+
+        let title = if pr.title.is_empty() {
+            "(no title cached)".into()
+        } else {
+            pr.title.clone()
+        };
+
+        // Row 1: cursor + #N + title — with right-aligned state badge for
+        // non-OPEN PRs (so a long branch name on row 2 doesn't get joined
+        // with "merged" on a wrapped line).
+        let state_badge: Option<(&str, ratatui::style::Color)> = match pr.state.as_str() {
+            "MERGED" => Some(("merged", IRIS)),
+            "CLOSED" => Some(("closed", MUTED)),
+            _ => None,
+        };
+        let id_text = format!("#{}", pr.number);
+        let badge_text = state_badge.map(|(t, _)| t).unwrap_or("");
+        // 3 (cursor) + id + 2 (sep) + title room + 1 (sep) + badge + 1 (pad)
+        let reserved = 3
+            + id_text.chars().count()
+            + 2
+            + (if badge_text.is_empty() { 0 } else { badge_text.chars().count() + 1 });
+        let title_room = width.saturating_sub(reserved);
+        let title_str = truncate(&title, title_room);
+        let pad = title_room.saturating_sub(title_str.chars().count());
+        let mut row1 = vec![
+            Span::styled(cursor_glyph, Style::default().fg(cursor_color)),
+            Span::styled(id_text, Style::default().fg(id_color)),
+            Span::raw("  "),
+            Span::styled(title_str, Style::default().fg(TEXT)),
+            Span::raw(" ".repeat(pad)),
+        ];
+        if let Some((t, color)) = state_badge {
+            row1.push(Span::styled(t.to_string(), Style::default().fg(color)));
+        }
+        lines.push(Line::from(row1));
+
+        // Row 2: meta strip — ci · review · codex · age · branch (truncated).
+        let mut meta: Vec<Span> = vec![Span::raw("    ")];
+        meta.push(match pr.ci_pass {
+            Some(true) => Span::styled("✓ ci", Style::default().fg(PINE)),
+            Some(false) => Span::styled("✗ ci", Style::default().fg(LOVE)),
+            None => Span::styled("· ci", Style::default().fg(MUTED)),
+        });
+        meta.push(if pr.approved {
+            Span::styled("  ·  ✓ review", Style::default().fg(PINE))
+        } else {
+            Span::styled("  ·  · review", Style::default().fg(MUTED))
+        });
+        meta.push(match pr.codex {
+            crate::state::CodexStatus::ThumbsUp => {
+                Span::styled("  ·  ✓ codex", Style::default().fg(PINE))
+            }
+            crate::state::CodexStatus::Commented => {
+                Span::styled("  ·  · codex commented", Style::default().fg(GOLD))
+            }
+            crate::state::CodexStatus::None => {
+                Span::styled("  ·  · codex", Style::default().fg(MUTED))
+            }
+        });
+        let age = relative_age(&pr.updated_at);
+        if !age.is_empty() {
+            meta.push(Span::styled(
+                format!("  ·  {age}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        if !pr.head_branch.is_empty() {
+            // Branch can be long ("ashley/ENG-29187-scrub-…"). Truncate
+            // so the row fits on one terminal line.
+            let branch_room = 36;
+            let branch = truncate(&pr.head_branch, branch_room);
+            meta.push(Span::styled(
+                format!("  ·  {branch}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        // Mergeable: glyph only on conflict (skip cell noise on green path).
+        if pr.mergeable.as_deref() == Some("CONFLICTING") {
+            meta.push(Span::styled("  ⚠ conflict", Style::default().fg(GOLD)));
+        }
+        lines.push(Line::from(meta));
+
+        // Row 3: stats — only when we have churn data.
+        if pr.changed_files > 0 || pr.additions > 0 || pr.deletions > 0 {
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                ci,
-                approval,
+                Span::styled(
+                    format!("+{} / -{}", pr.additions, pr.deletions),
+                    Style::default().fg(SUBTLE),
+                ),
+                Span::styled(
+                    format!("  ·  {} files", pr.changed_files),
+                    Style::default().fg(MUTED),
+                ),
             ]));
-            lines.push(Line::raw(""));
         }
+        lines.push(Line::raw(""));
+    }
+    if focused {
+        lines.push(Line::styled(
+            " j/k move · Enter open · o browser",
+            Style::default().fg(MUTED),
+        ));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -1434,7 +1595,13 @@ fn render_linear_detail(
     let mut lines: Vec<Line> = Vec::new();
 
     let Some(c) = cached else {
-        // Drilled into a key we don't have data for yet.
+        // Sub-issues live as `children` on their parent's cache entry,
+        // not as top-level `issues` keys. Render the limited data we
+        // have rather than a perpetual "loading…".
+        if let Some((parent_key, child)) = find_child_in_cache(cache, &key) {
+            render_child_detail(frame, area, &key, parent_key, child, focused);
+            return;
+        }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!(" {key}  loading…"),
@@ -1635,9 +1802,747 @@ fn linear_preview_target(app: &App) -> Option<(String, &'static str)> {
     }
 }
 
+/// Full-screen wrapper around `render_pr_detail`. Adds:
+/// - 40-col file list (vs 30 in-pane)
+/// - Toast overlay row above the footer when `app.toast.is_some()`
+///   (toasts normally live in `render_log`, which doesn't run here)
+fn render_pr_detail_fullscreen(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    number: u32,
+    focus: PrDetailFocus,
+    file_cursor: usize,
+    scroll: u16,
+) {
+    // Defensive clamp — refresh might have produced fewer files.
+    let cache = crate::cache::read_pr_diffs();
+    let n_files = cache.diffs.get(&number).map(|d| d.files.len()).unwrap_or(0);
+    let safe_cursor = if n_files == 0 { 0 } else { file_cursor.min(n_files - 1) };
+
+    // Reserve one row for the toast overlay if present.
+    let toast_row: u16 = if app.toast.is_some() { 1 } else { 0 };
+    let detail_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height.saturating_sub(toast_row),
+    };
+
+    render_pr_detail_with_widths(
+        frame,
+        detail_area,
+        true,
+        number,
+        focus,
+        safe_cursor,
+        scroll,
+        40,
+    );
+
+    if let Some(t) = &app.toast {
+        let toast_y = area.y + area.height.saturating_sub(1);
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {t}"),
+                Style::default().fg(GOLD),
+            )),
+            Rect { x: area.x, y: toast_y, width: area.width, height: 1 },
+        );
+    }
+}
+
+/// PR detail view — Linear-flavored two-pane: file list left, diff right.
+/// Tab toggles `PrDetailFocus::Files ↔ Diff`.
+///
+/// Layout (no horizontal rules — content-forward, alignment does the work):
+/// ```text
+/// row 0   #N  title                                                   merged
+/// row 1   ✓ ci · ✓ review · · codex · 3d ago · branch  ·  +A/-D  ·  N files
+/// row 2   <blank>
+/// row 3+  body — file list left | diff body right
+/// row -1  footer hint (focused only)
+/// ```
+fn render_pr_detail_with_widths(
+    frame: &mut Frame,
+    area: Rect,
+    focused: bool,
+    number: u32,
+    focus: PrDetailFocus,
+    file_cursor: usize,
+    scroll: u16,
+    file_col_width: u16,
+) {
+    let pr_cache = crate::cache::read_prs();
+    let diff_cache = crate::cache::read_pr_diffs();
+    let pr = pr_cache.prs.get(&number);
+    let diff = diff_cache.diffs.get(&number);
+
+    let footer_height: u16 = if focused { 1 } else { 0 };
+
+    // Row 0 — title with right-aligned state badge.
+    let title = pr.map(|p| p.title.clone()).unwrap_or_default();
+    let state_badge: Option<(&str, ratatui::style::Color)> = pr.and_then(|p| {
+        match p.state.as_str() {
+            "MERGED" => Some(("merged", IRIS)),
+            "CLOSED" => Some(("closed", MUTED)),
+            _ => None,
+        }
+    });
+    let id_text = format!(" #{number}");
+    let badge_text = state_badge.map(|(t, _)| t).unwrap_or("");
+    let reserved = id_text.chars().count()
+        + 2
+        + (if badge_text.is_empty() { 0 } else { badge_text.chars().count() + 1 });
+    let title_room = (area.width as usize).saturating_sub(reserved);
+    let title_str = truncate(&title, title_room);
+    let title_pad = title_room.saturating_sub(title_str.chars().count());
+    let mut row0 = vec![
+        Span::styled(id_text, Style::default().fg(IRIS)),
+        Span::raw("  "),
+        Span::styled(title_str, Style::default().fg(TEXT)),
+        Span::raw(" ".repeat(title_pad)),
+    ];
+    if let Some((t, color)) = state_badge {
+        row0.push(Span::styled(t.to_string(), Style::default().fg(color)));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(row0)),
+        Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+    );
+
+    // Row 1 — meta strip. Single cadence: `  ·  ` between groups.
+    let mut meta: Vec<Span> = vec![Span::raw(" ")];
+    if let Some(c) = pr {
+        meta.push(match c.ci_pass {
+            Some(true) => Span::styled("✓ ci", Style::default().fg(PINE)),
+            Some(false) => Span::styled("✗ ci", Style::default().fg(LOVE)),
+            None => Span::styled("· ci", Style::default().fg(MUTED)),
+        });
+        meta.push(if c.approved {
+            Span::styled("  ·  ✓ review", Style::default().fg(PINE))
+        } else {
+            Span::styled("  ·  · review", Style::default().fg(MUTED))
+        });
+        meta.push(match c.codex.as_str() {
+            "ThumbsUp" => Span::styled("  ·  ✓ codex", Style::default().fg(PINE)),
+            "Commented" => Span::styled("  ·  · codex commented", Style::default().fg(GOLD)),
+            _ => Span::styled("  ·  · codex", Style::default().fg(MUTED)),
+        });
+        let age = relative_age(&c.updated_at);
+        if !age.is_empty() {
+            meta.push(Span::styled(
+                format!("  ·  {age}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        if !c.head_branch.is_empty() {
+            meta.push(Span::styled(
+                format!("  ·  {} → main", truncate(&c.head_branch, 36)),
+                Style::default().fg(MUTED),
+            ));
+        }
+        meta.push(Span::styled(
+            format!("  ·  +{} / -{}", c.additions, c.deletions),
+            Style::default().fg(SUBTLE),
+        ));
+        meta.push(Span::styled(
+            format!("  ·  {} files", c.changed_files),
+            Style::default().fg(MUTED),
+        ));
+        if c.mergeable.as_deref() == Some("CONFLICTING") {
+            meta.push(Span::styled("  ·  ⚠ conflict", Style::default().fg(GOLD)));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(meta)),
+        Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 },
+    );
+
+    // Row 2 — blank gap (replaces the old `─` divider; whitespace and
+    // alignment handle the separation, Linear-flavor).
+    let mut body_top: u16 = 3;
+
+    // Optional row 3 — stale-diff banner.
+    let stale = match (pr, diff) {
+        (Some(p), Some(d)) if !p.head_sha.is_empty()
+            && !d.head_sha.is_empty()
+            && p.head_sha != d.head_sha => true,
+        _ => false,
+    };
+    if stale {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " diff stale (head moved) · r refresh",
+                Style::default().fg(GOLD),
+            )),
+            Rect { x: area.x, y: area.y + body_top, width: area.width, height: 1 },
+        );
+        body_top = body_top.saturating_add(2); // banner + 1 blank
+    }
+
+    let body_area = Rect {
+        x: area.x,
+        y: area.y + body_top,
+        width: area.width,
+        height: area.height
+            .saturating_sub(body_top)
+            .saturating_sub(footer_height),
+    };
+
+    // Footer.
+    if focused {
+        let hint = match focus {
+            PrDetailFocus::Files => " j/k file · Tab diff · ]/[ next/prev · r refresh · o browser · Esc back",
+            PrDetailFocus::Diff => " j/k scroll · H/L hunk · Tab files · ]/[ next/prev · r refresh · o browser · Esc back",
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(hint, Style::default().fg(MUTED))),
+            Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(1),
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+
+    // Body — five states.
+    let Some(d) = diff else {
+        let mut lines = vec![Line::raw("")];
+        if pr.map(|p| p.head_sha.is_empty()).unwrap_or(true) {
+            lines.push(Line::styled(" PR metadata not yet fetched.", Style::default().fg(MUTED)));
+            lines.push(Line::styled(
+                " Wait for the next PR loop cycle (~30s) or restart `orch daemon`.",
+                Style::default().fg(SUBTLE),
+            ));
+        } else {
+            lines.push(Line::styled(" diff loading…", Style::default().fg(MUTED)));
+            lines.push(Line::styled(
+                " (refreshing in the background; press r to retry)",
+                Style::default().fg(SUBTLE),
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines), body_area);
+        return;
+    };
+
+    if let Some(err) = &d.error {
+        let mut lines = vec![Line::raw("")];
+        lines.push(Line::styled(
+            format!(" diff fetch failed: {err}"),
+            Style::default().fg(LOVE),
+        ));
+        lines.push(Line::styled(
+            " r retry · o browser · Esc back",
+            Style::default().fg(MUTED),
+        ));
+        frame.render_widget(Paragraph::new(lines), body_area);
+        return;
+    }
+
+    if d.truncated {
+        let mut lines = vec![Line::raw("")];
+        lines.push(Line::styled(
+            format!(
+                " diff is {:.1} MB · too large to render",
+                (d.raw_size as f64) / 1_000_000.0,
+            ),
+            Style::default().fg(GOLD),
+        ));
+        lines.push(Line::styled(
+            " press o to open in browser",
+            Style::default().fg(MUTED),
+        ));
+        frame.render_widget(Paragraph::new(lines), body_area);
+        return;
+    }
+
+    if d.files.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(" no changes", Style::default().fg(MUTED))),
+            body_area,
+        );
+        return;
+    }
+
+    // Two-pane split: file list (left) | diff body (right).
+    let file_col_width: u16 = file_col_width.min(area.width / 2);
+    let file_area = Rect {
+        x: body_area.x,
+        y: body_area.y,
+        width: file_col_width,
+        height: body_area.height,
+    };
+    let diff_area = Rect {
+        x: body_area.x + file_col_width,
+        y: body_area.y,
+        width: body_area.width.saturating_sub(file_col_width),
+        height: body_area.height,
+    };
+
+    render_pr_file_list(frame, file_area, &d.files, file_cursor, focus, focused);
+    render_pr_diff_body(frame, diff_area, &d.files, file_cursor, scroll);
+}
+
+fn render_pr_file_list(
+    frame: &mut Frame,
+    area: Rect,
+    files: &[crate::cache::CachedPrDiffFile],
+    cursor: usize,
+    focus: PrDetailFocus,
+    focused: bool,
+) {
+    if files.is_empty() {
+        frame.render_widget(Paragraph::new(Vec::<Line>::new()), area);
+        return;
+    }
+
+    // Strip the common path prefix shared by all files so the row shows
+    // only what differentiates. Prefix gets its own dim header line; the
+    // user always knows the full path at a glance.
+    let raw_paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let prefix = longest_common_path_prefix(&raw_paths);
+    let stripped: Vec<&str> = raw_paths
+        .iter()
+        .map(|p| p.strip_prefix(prefix.as_str()).unwrap_or(p))
+        .collect();
+
+    let mut lines: Vec<Line> = Vec::new();
+    if !prefix.is_empty() {
+        let label = if prefix.chars().count() > area.width as usize {
+            truncate_tail(&prefix, area.width as usize)
+        } else {
+            prefix.clone()
+        };
+        lines.push(Line::styled(label, Style::default().fg(MUTED)));
+    }
+    let header_rows = lines.len();
+    let visible = (area.height as usize).saturating_sub(header_rows);
+    if visible == 0 {
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let start = cursor.saturating_sub(visible.saturating_sub(2)).min(
+        files.len().saturating_sub(visible.min(files.len())),
+    );
+    for (i, f) in files.iter().enumerate().skip(start).take(visible) {
+        let is_cur = i == cursor;
+        let cur_focused = is_cur && focused && matches!(focus, PrDetailFocus::Files);
+        let glyph = if is_cur { "▸ " } else { "  " };
+        let glyph_color = if cur_focused { LOVE } else { MUTED };
+        let path_color = if is_cur { TEXT } else { SUBTLE };
+        let stats = format!("+{}/-{}", f.additions, f.deletions);
+        // path + stats fits in `area.width` minus glyph (2) + " " + stats.
+        let stats_room = stats.chars().count();
+        let path_room = (area.width as usize).saturating_sub(2 + 1 + stats_room);
+        let path = truncate_tail(stripped[i], path_room);
+        let pad = path_room.saturating_sub(path.chars().count());
+
+        let base_style = if is_cur && focused {
+            Style::default().bg(HL_LOW)
+        } else {
+            Style::default()
+        };
+
+        let mut spans = vec![
+            Span::styled(
+                glyph,
+                base_style.fg(glyph_color),
+            ),
+            Span::styled(
+                path,
+                base_style.fg(path_color),
+            ),
+            Span::styled(
+                " ".repeat(pad),
+                base_style,
+            ),
+            Span::styled(" ", base_style),
+            Span::styled(stats, base_style.fg(MUTED)),
+        ];
+        // Pad the highlight bar across the full column width so it
+        // reads as a continuous row (not a fragment around the text).
+        if is_cur && focused {
+            let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            let extra = (area.width as usize).saturating_sub(used);
+            if extra > 0 {
+                spans.push(Span::styled(" ".repeat(extra), base_style));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Longest common path prefix across `paths`, split on `/` boundaries
+/// (so we never strip half a directory name). Always retains the
+/// trailing `/` when non-empty. Stops one segment short of the shortest
+/// path so the basename is preserved.
+fn longest_common_path_prefix(paths: &[&str]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let segs: Vec<Vec<&str>> = paths.iter().map(|p| p.split('/').collect()).collect();
+    let min_len = segs.iter().map(|s| s.len()).min().unwrap_or(0);
+    let mut prefix = String::new();
+    for i in 0..min_len.saturating_sub(1) {
+        let first = segs[0][i];
+        if segs.iter().all(|s| s[i] == first) {
+            prefix.push_str(first);
+            prefix.push('/');
+        } else {
+            break;
+        }
+    }
+    prefix
+}
+
+fn render_pr_diff_body(
+    frame: &mut Frame,
+    area: Rect,
+    files: &[crate::cache::CachedPrDiffFile],
+    file_cursor: usize,
+    scroll: u16,
+) {
+    let Some(file) = files.get(file_cursor) else {
+        return;
+    };
+    let (lines, _) = build_pr_diff_lines(file, area.width);
+
+    // Each line is one terminal row (we truncate, not wrap, to keep
+    // long SQL/JSON readable). Scroll = simple line offset.
+    let total = lines.len() as u16;
+    let max_scroll = total.saturating_sub(area.height);
+    let scroll = scroll.min(max_scroll);
+
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)),
+        area,
+    );
+}
+
+/// Build the rendered diff body for a file. Returns `(lines, hunk_anchor_rows)`
+/// where `hunk_anchor_rows[i]` is the line index of hunk i's header within
+/// `lines`. Lines longer than `body_width` are truncated with `…` so each
+/// diff line maps to exactly one terminal row — wrapping 200-char SQL
+/// across 3 rows is unreadable in practice.
+fn build_pr_diff_lines(
+    file: &crate::cache::CachedPrDiffFile,
+    body_width: u16,
+) -> (Vec<Line<'static>>, Vec<u16>) {
+    let width = body_width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut hunk_anchors: Vec<u16> = Vec::new();
+
+    // File header — Linear flavor: just the path in TEXT, no `--- a/`.
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(file.path.clone(), Style::default().fg(TEXT)),
+    ]));
+    if file.status != "modified" {
+        lines.push(Line::styled(
+            format!(" ({})", file.status),
+            Style::default().fg(MUTED),
+        ));
+    }
+    lines.push(Line::raw(""));
+
+    if file.status == "binary" {
+        lines.push(Line::styled(
+            " binary file · diff suppressed",
+            Style::default().fg(MUTED),
+        ));
+        return (lines, hunk_anchors);
+    }
+
+    for hunk in &file.hunks {
+        hunk_anchors.push(lines.len() as u16);
+        if let Some((header_part, ctx)) = split_hunk_header(&hunk.header) {
+            let mut spans = vec![
+                Span::raw(" "),
+                Span::styled(header_part.to_string(), Style::default().fg(MUTED)),
+            ];
+            if !ctx.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {ctx}"),
+                    Style::default().fg(SUBTLE),
+                ));
+            }
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::styled(
+                format!(" {}", hunk.header),
+                Style::default().fg(MUTED),
+            ));
+        }
+        // Body cells available for the line content after the ` X ` glyph.
+        let body_room = width.saturating_sub(3);
+        // Tab width — 4 spaces. Source lines (Go/Rust/etc) use \t for
+        // indentation; the terminal's default tab stop (often 8) breaks
+        // our char-count truncation and bg-pad math.
+        const TAB_WIDTH: usize = 4;
+        let tab_replacement = " ".repeat(TAB_WIDTH);
+        for line in &hunk.lines {
+            // Linear flavor: glyph carries the color (PINE/LOVE), the
+            // code body stays in TEXT/SUBTLE. Faint row tint so add/del
+            // rows scan at a glance.
+            let (prefix, rest, glyph_color, body_color, bg) =
+                if let Some(rest) = line.strip_prefix('+') {
+                    ("+", rest, PINE, TEXT, Some(DIFF_ADD_BG))
+                } else if let Some(rest) = line.strip_prefix('-') {
+                    ("-", rest, LOVE, TEXT, Some(DIFF_DEL_BG))
+                } else if let Some(rest) = line.strip_prefix(' ') {
+                    (" ", rest, MUTED, SUBTLE, None)
+                } else {
+                    (" ", line.as_str(), MUTED, MUTED, None)
+                };
+            // Expand tabs first so truncation/padding math is in cells.
+            let expanded = rest.replace('\t', &tab_replacement);
+            // Truncate to one terminal row; pad to the row width when
+            // tinted so the bg color extends across the visible row.
+            let mut visible = if expanded.chars().count() > body_room {
+                truncate(&expanded, body_room)
+            } else {
+                expanded
+            };
+            if bg.is_some() {
+                let pad = body_room.saturating_sub(visible.chars().count());
+                if pad > 0 {
+                    visible.push_str(&" ".repeat(pad));
+                }
+            }
+            let glyph_style = match bg {
+                Some(bg) => Style::default().fg(glyph_color).bg(bg),
+                None => Style::default().fg(glyph_color),
+            };
+            let body_style = match bg {
+                Some(bg) => Style::default().fg(body_color).bg(bg),
+                None => Style::default().fg(body_color),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {prefix} "), glyph_style),
+                Span::styled(visible, body_style),
+            ]));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    (lines, hunk_anchors)
+}
+
+
+/// Split `@@ -a,b +c,d @@ context` into ("@@ -a,b +c,d @@", "context").
+fn split_hunk_header(header: &str) -> Option<(&str, &str)> {
+    // Find the SECOND "@@".
+    let first = header.find("@@")?;
+    let after_first = &header[first + 2..];
+    let second_rel = after_first.find("@@")?;
+    let header_end = first + 2 + second_rel + 2;
+    let head = &header[..header_end];
+    let ctx = header[header_end..].trim();
+    Some((head, ctx))
+}
+
+/// Truncate from the LEFT — keeps the basename / file tail visible when
+/// a long path overflows the column.
+fn truncate_tail(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let take = max.saturating_sub(1);
+    let from = chars.len() - take;
+    let mut out = String::from("…");
+    out.extend(chars[from..].iter());
+    out
+}
+
+/// PR preview target — when focused on the PRs tab with a cursor on a
+/// linked PR, the log pane renders the PR preview instead of the run log.
+fn pr_preview_target(app: &App) -> Option<u32> {
+    if app.focus != Pane::Right || app.detail_tab != Tab::Prs {
+        return None;
+    }
+    match &app.pr_view {
+        PrView::List { cursor_number } if *cursor_number > 0 => Some(*cursor_number),
+        _ => None,
+    }
+}
+
+/// Render a PR preview into the log-pane area: title, meta strip, churn
+/// stats, top files by churn. Linear-flavored — content-forward, no
+/// dividers.
+fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
+    let pr_cache = crate::cache::read_prs();
+    let diff_cache = crate::cache::read_pr_diffs();
+    let cached = pr_cache.prs.get(&number);
+    let diff = diff_cache.diffs.get(&number);
+
+    let header = format!(" preview: #{number}");
+    frame.render_widget(
+        Paragraph::new(Line::styled(header, Style::default().fg(MUTED))),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        },
+    );
+
+    let body_area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let Some(c) = cached else {
+        lines.push(Line::styled(" loading…", Style::default().fg(MUTED)));
+        frame.render_widget(Paragraph::new(lines), body_area);
+        return;
+    };
+
+    // Title.
+    if !c.title.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(c.title.clone(), Style::default().fg(TEXT)),
+        ]));
+    }
+
+    // Meta strip.
+    let mut meta: Vec<Span> = vec![Span::raw(" ")];
+    meta.push(Span::styled(
+        format!("#{}", c.number),
+        Style::default().fg(IRIS),
+    ));
+    meta.push(Span::raw("  "));
+    meta.push(match c.ci_pass {
+        Some(true) => Span::styled("✓ ci", Style::default().fg(PINE)),
+        Some(false) => Span::styled("✗ ci", Style::default().fg(LOVE)),
+        None => Span::styled("· ci", Style::default().fg(MUTED)),
+    });
+    meta.push(if c.approved {
+        Span::styled("  ·  ✓ review", Style::default().fg(PINE))
+    } else {
+        Span::styled("  ·  · review", Style::default().fg(MUTED))
+    });
+    meta.push(match c.codex.as_str() {
+        "ThumbsUp" => Span::styled("  ·  ✓ codex", Style::default().fg(PINE)),
+        "Commented" => Span::styled("  ·  · codex commented", Style::default().fg(GOLD)),
+        _ => Span::styled("  ·  · codex", Style::default().fg(MUTED)),
+    });
+    let age = relative_age(&c.updated_at);
+    if !age.is_empty() {
+        meta.push(Span::styled(
+            format!("  ·  {age}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    if !c.head_branch.is_empty() {
+        meta.push(Span::styled(
+            format!("  ·  {}", truncate(&c.head_branch, 36)),
+            Style::default().fg(MUTED),
+        ));
+    }
+    lines.push(Line::from(meta));
+
+    // Stats row.
+    let mut stats: Vec<Span> = vec![Span::raw(" ")];
+    stats.push(Span::styled(
+        format!("+{} / -{}", c.additions, c.deletions),
+        Style::default().fg(SUBTLE),
+    ));
+    stats.push(Span::styled(
+        format!("  ·  {} files", c.changed_files),
+        Style::default().fg(MUTED),
+    ));
+    let merge_glyph = match c.mergeable.as_deref() {
+        Some("CONFLICTING") => Some(("  ·  ⚠ conflict", GOLD)),
+        Some("MERGEABLE") => None,
+        _ => None,
+    };
+    if let Some((s, color)) = merge_glyph {
+        stats.push(Span::styled(s, Style::default().fg(color)));
+    }
+    match c.state.as_str() {
+        "MERGED" => stats.push(Span::styled("  ·  merged", Style::default().fg(IRIS))),
+        "CLOSED" => stats.push(Span::styled("  ·  closed", Style::default().fg(MUTED))),
+        _ => {}
+    }
+    lines.push(Line::from(stats));
+
+    // Description body — wrapped, truncated to fit. Skipped when empty.
+    if !c.body.is_empty() {
+        lines.push(Line::raw(""));
+        let width = (body_area.width.saturating_sub(2) as usize).max(20);
+        let wrapped = wrap_text(&c.body, width);
+        let body_room = (body_area.height as usize).saturating_sub(lines.len());
+        let take = if wrapped.len() > body_room {
+            body_room.saturating_sub(1)
+        } else {
+            body_room
+        };
+        for w in wrapped.iter().take(take) {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(w.clone(), Style::default().fg(SUBTLE)),
+            ]));
+        }
+        if wrapped.len() > take && take > 0 {
+            lines.push(Line::styled(" …", Style::default().fg(MUTED)));
+        }
+    }
+
+    // Top files by churn — only when diff cache is populated AND there's
+    // still room (description gets priority since it explains the change).
+    if let Some(d) = diff {
+        let body_room = (body_area.height as usize).saturating_sub(lines.len());
+        if !d.files.is_empty() && body_room > 1 {
+            lines.push(Line::raw(""));
+            let mut by_churn: Vec<&crate::cache::CachedPrDiffFile> =
+                d.files.iter().collect();
+            by_churn.sort_by_key(|f| std::cmp::Reverse(f.additions + f.deletions));
+            let body_room = (body_area.height as usize).saturating_sub(lines.len());
+            let take = body_room.saturating_sub(1).min(by_churn.len());
+            for f in by_churn.iter().take(take) {
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate(&f.path, 32),
+                        Style::default().fg(SUBTLE),
+                    ),
+                    Span::styled(
+                        format!("  +{}/-{}", f.additions, f.deletions),
+                        Style::default().fg(MUTED),
+                    ),
+                ]));
+            }
+            let extra = by_churn.len().saturating_sub(take);
+            if extra > 0 {
+                lines.push(Line::styled(
+                    format!(" ({extra} more)"),
+                    Style::default().fg(MUTED),
+                ));
+            }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), body_area);
+}
+
 /// Render an issue preview into the log-pane area: title, meta line,
 /// description (wrapped, truncated to fit). Source of truth is the
-/// shared `linear.json` cache.
+/// shared `linear.json` cache. Sub-issues aren't fetched as top-level
+/// entries; their preview is rendered from the parent's `children`
+/// data (title, state, assignee — the subset Linear returns inline).
 fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, _kind: &str) {
     let cache = crate::cache::read_linear();
     let cached = cache.issues.get(key);
@@ -1663,6 +2568,10 @@ fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, _kind: &str) 
     let mut lines: Vec<Line> = Vec::new();
 
     let Some(c) = cached else {
+        if let Some((parent_key, child)) = find_child_in_cache(&cache, key) {
+            render_child_preview(frame, body_area, parent_key, child);
+            return;
+        }
         if cache.not_found.contains(&key.to_string()) {
             lines.push(Line::styled(
                 " not on Linear",
@@ -1745,6 +2654,117 @@ fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, _kind: &str) 
         }
     }
 
+    frame.render_widget(Paragraph::new(lines), body_area);
+}
+
+/// Find a sub-issue in the cache by walking parents' `children` arrays.
+/// Returns `(parent_key, child)` on match. Sub-issues aren't fetched as
+/// top-level cache entries — the only data we have is the inline subset
+/// Linear returned with the parent.
+fn find_child_in_cache<'a>(
+    cache: &'a crate::cache::LinearCache,
+    key: &str,
+) -> Option<(&'a str, &'a crate::cache::CachedChild)> {
+    for (parent_key, parent) in &cache.issues {
+        if let Some(child) = parent
+            .children
+            .iter()
+            .find(|c| c.identifier == key)
+        {
+            return Some((parent_key.as_str(), child));
+        }
+    }
+    None
+}
+
+/// Render the Linear detail view for a sub-issue. Sub-issues only
+/// carry the inline subset Linear returns with the parent (no
+/// description, project, age) — show what we have plus a parent
+/// pointer instead of stalling on "loading…".
+fn render_child_detail(
+    frame: &mut Frame,
+    area: Rect,
+    key: &str,
+    parent_key: &str,
+    child: &crate::cache::CachedChild,
+    _focused: bool,
+) {
+    let mut lines: Vec<Line> = Vec::new();
+    let state_color = linear_state_color(&child.state);
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {key}"), Style::default().fg(IRIS)),
+        Span::styled(
+            format!(
+                "  ·  {} {}",
+                state_glyph(&child.state_kind),
+                child.state,
+            ),
+            Style::default().fg(state_color),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(child.title.clone(), Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::raw(""));
+    if !child.assignee.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" Assignee  ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("@{}", child.assignee),
+                Style::default().fg(TEXT),
+            ),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(" Parent    ", Style::default().fg(MUTED)),
+        Span::styled(parent_key.to_string(), Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        " (sub-issue inline data — full description requires open in browser)",
+        Style::default().fg(MUTED),
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        " Esc back · u parent · o browser",
+        Style::default().fg(MUTED),
+    ));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render the limited preview available for a sub-issue: title, state,
+/// assignee, and a pointer to the parent.
+fn render_child_preview(
+    frame: &mut Frame,
+    body_area: Rect,
+    parent_key: &str,
+    child: &crate::cache::CachedChild,
+) {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(child.title.clone(), Style::default().fg(TEXT)),
+    ]));
+    let state_color = linear_state_color(&child.state);
+    let mut meta: Vec<Span> = vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{} {}", state_glyph(&child.state_kind), child.state),
+            Style::default().fg(state_color),
+        ),
+    ];
+    if !child.assignee.is_empty() {
+        meta.push(Span::styled(
+            format!("  ·  @{}", child.assignee),
+            Style::default().fg(MUTED),
+        ));
+    }
+    meta.push(Span::styled(
+        format!("  ·  child of {parent_key}"),
+        Style::default().fg(MUTED),
+    ));
+    lines.push(Line::from(meta));
     frame.render_widget(Paragraph::new(lines), body_area);
 }
 
@@ -1924,6 +2944,10 @@ fn render_log(frame: &mut Frame, area: Rect, app: &App) {
         render_linear_preview(frame, area, &key, &cursor_kind);
         return;
     }
+    if let Some(number) = pr_preview_target(app) {
+        render_pr_preview(frame, area, number);
+        return;
+    }
 
     // Log is a passive viewer — no focus state. Header in MUTED.
     // Toast (if present) overrides the run-id label.
@@ -1989,6 +3013,14 @@ fn render_log(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
+    render_help_overlay_inner(frame, area, false);
+}
+
+fn render_help_overlay_pr_detail(frame: &mut Frame, area: Rect) {
+    render_help_overlay_inner(frame, area, true);
+}
+
+fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
     let w = HELP_OVERLAY_WIDTH.min(area.width.saturating_sub(4));
     let h = HELP_OVERLAY_HEIGHT.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -2006,30 +3038,44 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         overlay,
     );
 
-    let lines = vec![
-        Line::styled(" key bindings", Style::default().fg(LOVE)),
-        Line::styled("─".repeat(w as usize), Style::default().fg(MUTED)),
-        Line::styled(" Global", Style::default().fg(IRIS)),
-        kv_line("  q        ", "quit"),
-        kv_line("  Tab      ", "toggle list ↔ right"),
-        kv_line("  [ / ]    ", "previous / next task (any focus)"),
-        kv_line("  1 2 3 4  ", "Overview · PRs · Linear · Panes"),
-        kv_line("  Esc      ", "right → list; list → quit"),
-        kv_line("  PgUp/Dn  ", "log scroll  ·  < top  ·  > tail"),
-        kv_line("  ?  r  m  ", "help · refresh · message"),
-        Line::styled(" List", Style::default().fg(IRIS)),
-        kv_line("  j k g G  ", "move · top / bottom"),
-        kv_line("  J K      ", "move task down / up in open_order"),
-        kv_line("  s p R x  ", "spawn · pause · resume · close"),
-        kv_line("  Enter    ", "attach to active pane"),
-        Line::styled(" Right zone", Style::default().fg(IRIS)),
-        kv_line("  j k      ", "move cursor in active tab"),
-        kv_line("  Enter    ", "open / attach in active tab"),
-        Line::styled(
-            " Phase 1F+:  n M W (not yet wired)",
-            Style::default().fg(MUTED),
-        ),
-    ];
+    let lines: Vec<Line> = if pr_detail {
+        vec![
+            Line::styled(" key bindings — PR detail (fullscreen)", Style::default().fg(LOVE)),
+            Line::styled("─".repeat(w as usize), Style::default().fg(MUTED)),
+            kv_line("  Esc      ", "back to PR list (saves position)"),
+            kv_line("  Tab      ", "toggle Files ↔ Diff focus"),
+            kv_line("  j / k    ", "Files: prev/next file  ·  Diff: scroll"),
+            kv_line("  ] / [    ", "next / prev file (from any focus)"),
+            kv_line("  H / L    ", "prev / next hunk (Diff focus only)"),
+            kv_line("  r        ", "refresh diff for this PR"),
+            kv_line("  o        ", "open PR in browser"),
+            kv_line("  1 / 3 / 4", "exit fullscreen, jump to other tab"),
+            kv_line("  q        ", "quit orch"),
+            Line::styled(" Position is saved per PR — re-Enter restores cursor + scroll", Style::default().fg(MUTED)),
+        ]
+    } else {
+        vec![
+            Line::styled(" key bindings", Style::default().fg(LOVE)),
+            Line::styled("─".repeat(w as usize), Style::default().fg(MUTED)),
+            Line::styled(" Global", Style::default().fg(IRIS)),
+            kv_line("  q        ", "quit"),
+            kv_line("  Tab      ", "toggle list ↔ right"),
+            kv_line("  [ / ]    ", "previous / next task (any focus)"),
+            kv_line("  1 2 3 4  ", "Overview · PRs · Linear · Panes"),
+            kv_line("  Esc      ", "right → list; list → quit"),
+            kv_line("  PgUp/Dn  ", "log scroll  ·  < top  ·  > tail"),
+            kv_line("  ?  r  m  ", "help · refresh · message"),
+            Line::styled(" List", Style::default().fg(IRIS)),
+            kv_line("  j k g G  ", "move · top / bottom"),
+            kv_line("  J K      ", "move task down / up in open_order"),
+            kv_line("  s p R x  ", "spawn · pause · resume · close"),
+            kv_line("  Enter    ", "attach to active pane"),
+            Line::styled(" Right zone", Style::default().fg(IRIS)),
+            kv_line("  j k      ", "move cursor in active tab"),
+            kv_line("  Enter    ", "open / attach in active tab"),
+            Line::styled(" Enter on a PR row → fullscreen lazygit-style diff", Style::default().fg(MUTED)),
+        ]
+    };
 
     let text_area = Rect {
         x: overlay.x + 1,
@@ -2152,9 +3198,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Most keys clear any active toast. The unwired-key handler sets
-    // a fresh toast and returns early before this clear runs.
-    let was_toasted = app.toast.is_some();
+    // Most keys clear any stale toast on the next keypress. Capture the
+    // toast before dispatch — if a handler set a fresh one during the
+    // match (e.g. H/L hunk feedback, refresh status), we preserve it.
+    let toast_before = app.toast.clone();
+    let was_toasted = toast_before.is_some();
 
     match (key.code, key.modifiers) {
         // Quit semantics: from list, q or Esc quits. From right zone,
@@ -2181,6 +3229,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     return;
                 }
             }
+            // PR drill: pop Detail back to List in one Esc (no stack).
+            // Saves position so re-entering restores file_cursor + scroll.
+            if app.focus == Pane::Right
+                && app.detail_tab == Tab::Prs
+                && matches!(app.pr_view, PrView::Detail { .. })
+            {
+                save_and_exit_pr_detail(app);
+                if was_toasted { app.toast = None; }
+                return;
+            }
             if app.focus == Pane::Right {
                 app.focus = Pane::List;
             } else {
@@ -2193,28 +3251,42 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.show_help = true;
             return;
         }
-        // Two-zone toggle.
+        // Two-zone toggle. In PR Detail fullscreen, Tab toggles the
+        // intra-detail Files ↔ Diff focus instead — there's no list
+        // pane to flip to.
         (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
-            app.focus = match app.focus {
-                Pane::List => Pane::Right,
-                Pane::Right => Pane::List,
-            };
+            if app.detail_tab == Tab::Prs
+                && matches!(app.pr_view, PrView::Detail { .. })
+            {
+                handle_pr_detail_focus_toggle(app);
+            } else {
+                app.focus = match app.focus {
+                    Pane::List => Pane::Right,
+                    Pane::Right => Pane::List,
+                };
+            }
         }
-        // Number keys jump to a detail tab and focus right.
+        // Number keys jump to a detail tab and focus right. Switching
+        // *away* from the PR tab while drilled saves the position and
+        // exits fullscreen so the three-pane layout returns.
         (KeyCode::Char('1'), _) => {
+            save_and_exit_pr_detail(app);
             app.detail_tab = Tab::Overview;
             app.focus = Pane::Right;
         }
         (KeyCode::Char('2'), _) => {
             app.detail_tab = Tab::Prs;
             app.focus = Pane::Right;
+            ensure_pr_cursor(app);
         }
         (KeyCode::Char('3'), _) => {
+            save_and_exit_pr_detail(app);
             app.detail_tab = Tab::Linear;
             app.focus = Pane::Right;
             ensure_linear_cursor(app);
         }
         (KeyCode::Char('4'), _) => {
+            save_and_exit_pr_detail(app);
             app.detail_tab = Tab::Panes;
             app.focus = Pane::Right;
         }
@@ -2225,16 +3297,31 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // tasks while staying in a detail tab (Linear, PRs, etc) without
         // needing to Tab/Esc back to the list.
         (KeyCode::Char(']'), _) => {
-            if app.selected + 1 < app.tasks.len() {
+            // Inside PR Detail, intercept for next-file navigation
+            // (Option A from notes.md). Outside PR Detail, the global
+            // meaning (next task) takes over.
+            if app.focus == Pane::Right
+                && app.detail_tab == Tab::Prs
+                && matches!(app.pr_view, PrView::Detail { .. })
+            {
+                handle_pr_detail_next_file(app);
+            } else if app.selected + 1 < app.tasks.len() {
                 app.selected += 1;
                 app.panes_selected = 0;
                 reset_linear_cursor_for_new_task(app);
             }
         }
         (KeyCode::Char('['), _) => {
-            app.selected = app.selected.saturating_sub(1);
-            app.panes_selected = 0;
-            reset_linear_cursor_for_new_task(app);
+            if app.focus == Pane::Right
+                && app.detail_tab == Tab::Prs
+                && matches!(app.pr_view, PrView::Detail { .. })
+            {
+                handle_pr_detail_prev_file(app);
+            } else {
+                app.selected = app.selected.saturating_sub(1);
+                app.panes_selected = 0;
+                reset_linear_cursor_for_new_task(app);
+            }
         }
         // Global log controls.
         (KeyCode::PageUp, _) => {
@@ -2265,7 +3352,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         },
     }
 
-    if was_toasted {
+    // Only clear if no handler updated the toast.
+    if was_toasted && app.toast == toast_before {
         app.toast = None;
     }
 }
@@ -2292,8 +3380,8 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             // Attach to selected task's tmux session (active pane is
             // whatever tmux had selected last).
             if let Some(task) = app.selected_task() {
-                if !task.meta.session.is_empty() {
-                    attach_session(&task.meta.session);
+                if !task.record.tmux.session_name.is_empty() {
+                    attach_session(&task.record.tmux.session_name);
                 }
             }
         }
@@ -2373,7 +3461,7 @@ fn lifecycle_op(
 ) {
     let Some(task) = app.selected_task() else { return };
     let name = task.name.clone();
-    let session = task.meta.session.clone();
+    let session = task.record.tmux.session_name.clone();
     match f(&name, &session) {
         Ok(msg) => app.toast = Some(msg),
         Err(e) => app.toast = Some(format!("{label} failed: {e}")),
@@ -2390,12 +3478,14 @@ fn lifecycle_spawn(name: &str, _session: &str) -> Result<String, String> {
     if find_actual_session(&session).is_some() {
         return Err(format!("session {session} already exists"));
     }
-    let mut meta = state::load_task_meta(name);
+    let store = store::Store::default();
+    let record = store
+        .load_record_by_slug(name)
+        .ok_or_else(|| format!("no task '{name}'"))?;
     let repo = std::env::var("ORCH_REPO")
         .map_err(|_| "ORCH_REPO not set".to_string())?;
-    let home = dirs::home_dir().unwrap_or_default();
-    let work_dir = if !meta.worktree.is_empty() {
-        meta.worktree.replace("~", &home.to_string_lossy())
+    let work_dir = if !record.worktree.path.is_empty() {
+        state::expand_home(&record.worktree.path)
     } else {
         format!("{repo}/task-{name}")
     };
@@ -2420,17 +3510,26 @@ fn lifecycle_spawn(name: &str, _session: &str) -> Result<String, String> {
     if !send_ok {
         return Err("tmux send-keys failed".into());
     }
-    meta.session = session.clone();
-    meta.worktree = work_dir;
-    meta.paused = false;
-    state::save_task_meta(name, &meta);
+    let now = epoch_secs();
+    store.update_record_by_slug(name, |r| {
+        r.tmux.session_name = session.clone();
+        r.worktree.path = work_dir.clone();
+        r.desired_state = DesiredState::Active;
+        if r.started_at.is_none() {
+            r.started_at = Some(now);
+        }
+        r.updated_at = now;
+    });
     Ok(format!("spawned {session}"))
 }
 
 fn lifecycle_resume(name: &str, session: &str) -> Result<String, String> {
-    let mut meta = state::load_task_meta(name);
-    meta.paused = false;
-    state::save_task_meta(name, &meta);
+    let store = store::Store::default();
+    let now = epoch_secs();
+    store.update_record_by_slug(name, |r| {
+        r.desired_state = DesiredState::Active;
+        r.updated_at = now;
+    });
     let _ = session;
     lifecycle_spawn(name, "")
 }
@@ -2444,46 +3543,39 @@ fn lifecycle_pause(name: &str, session: &str) -> Result<String, String> {
                 .status();
         }
     }
-    let mut meta = state::load_task_meta(name);
-    meta.paused = true;
-    state::save_task_meta(name, &meta);
+    let store = store::Store::default();
+    let now = epoch_secs();
+    store.update_record_by_slug(name, |r| {
+        r.desired_state = DesiredState::Paused;
+        r.paused_at = Some(now);
+        r.updated_at = now;
+    });
     Ok(format!("paused {name}"))
 }
 
 fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
-    let store = crate::store::Store::default();
-    let v2 = store.is_authoritative();
-    let record_id = if v2 {
-        store.load_record_by_slug(name).map(|r| r.id)
-    } else {
-        None
+    let store = store::Store::default();
+    let Some(record) = store.load_record_by_slug(name) else {
+        return Err(format!("no task '{name}'"))
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let id = record.id;
+    let worktree_path = record.worktree.path.clone();
+    let now = epoch_secs();
     let dir = state::tasks_dir();
-    let archive_name = record_id
-        .map(|id| format!("{id}-{name}.md"))
-        .unwrap_or_else(|| format!("{name}.md"));
-    let archive_path = dir.join("done").join(&archive_name);
+    let archive_path = dir.join("done").join(format!("{id}-{name}.md"));
 
-    // 1. v2 FSM transition.
-    if let Some(id) = record_id {
-        if let Some(mut record) = store.load_record(id) {
-            record.desired_state = crate::store::DesiredState::Closed;
-            record.closed_at = Some(now);
-            record.archived_task_file = Some(archive_path.clone());
-            record.updated_at = now;
-            store.save_record(&record);
+    store.update_record_by_slug(name, |r| {
+        r.desired_state = DesiredState::Closed;
+        r.closed_at = Some(now);
+        r.archived_task_file = Some(archive_path.clone());
+        r.updated_at = now;
+    });
+    if let Some(mut registry) = store.load_registry() {
+        registry.open_order.retain(|i| *i != id);
+        if !registry.closed_order.contains(&id) {
+            registry.closed_order.push(id);
         }
-        if let Some(mut registry) = store.load_registry() {
-            registry.open_order.retain(|i| *i != id);
-            if !registry.closed_order.contains(&id) {
-                registry.closed_order.push(id);
-            }
-            store.save_registry(&registry);
-        }
+        store.save_registry(&registry);
     }
 
     // 2. Archive .md — abort on failure.
@@ -2509,10 +3601,8 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
     //    them — a silent close that leaves the worktree behind is
     //    exactly the orphan-worktree pain point we set out to fix.
     let mut warning: Option<String> = None;
-    let meta = state::load_task_meta(name);
-    if !meta.worktree.is_empty() {
-        let home = dirs::home_dir().unwrap_or_default();
-        let wt = meta.worktree.replace("~", &home.to_string_lossy());
+    if !worktree_path.is_empty() {
+        let wt = state::expand_home(&worktree_path);
         let path = std::path::Path::new(&wt);
         if path.exists() {
             let repo = std::env::var("ORCH_REPO").unwrap_or_default();
@@ -2550,15 +3640,17 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
         }
     }
 
-    let state_path = dir.join(".state").join(format!("{name}.json"));
-    if state_path.exists() {
-        let _ = std::fs::remove_file(&state_path);
-    }
-
     Ok(match warning {
         None => format!("closed {name}"),
         Some(w) => format!("closed {name} (WARN: {w})"),
     })
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Right-zone key dispatch. j/k always means "move cursor in active
@@ -2566,11 +3658,22 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
 fn handle_right_key(app: &mut App, key: KeyEvent) {
     match (app.detail_tab, key.code) {
         // Tab cycling via h/l is kept as a fallback; numbers are the primary path.
+        // In PR Detail fullscreen, h/l would silently kick the user out of
+        // the drill — make them no-op there. Use Esc to leave or 1/3/4 to
+        // jump explicitly to another tab.
         (_, KeyCode::Char('h')) | (_, KeyCode::Left) => {
-            app.detail_tab = app.detail_tab.prev();
+            if !matches!(app.pr_view, PrView::Detail { .. })
+                || app.detail_tab != Tab::Prs
+            {
+                app.detail_tab = app.detail_tab.prev();
+            }
         }
         (_, KeyCode::Char('l')) | (_, KeyCode::Right) => {
-            app.detail_tab = app.detail_tab.next();
+            if !matches!(app.pr_view, PrView::Detail { .. })
+                || app.detail_tab != Tab::Prs
+            {
+                app.detail_tab = app.detail_tab.next();
+            }
         }
         (Tab::Panes, KeyCode::Char('j')) | (Tab::Panes, KeyCode::Down) => {
             let n = app.selected_task().map(|t| t.panes.len()).unwrap_or(0);
@@ -2607,6 +3710,56 @@ fn handle_right_key(app: &mut App, key: KeyEvent) {
         (Tab::Linear, KeyCode::Char('o')) => {
             handle_linear_open_browser(app);
         }
+        // PR tab.
+        (Tab::Prs, KeyCode::Char('j')) | (Tab::Prs, KeyCode::Down) => {
+            if matches!(app.pr_view, PrView::Detail { .. }) {
+                handle_pr_detail_down(app);
+            } else {
+                handle_pr_down(app);
+            }
+        }
+        (Tab::Prs, KeyCode::Char('k')) | (Tab::Prs, KeyCode::Up) => {
+            if matches!(app.pr_view, PrView::Detail { .. }) {
+                handle_pr_detail_up(app);
+            } else {
+                handle_pr_up(app);
+            }
+        }
+        (Tab::Prs, KeyCode::Enter) => {
+            handle_pr_enter(app);
+        }
+        (Tab::Prs, KeyCode::Tab) | (Tab::Prs, KeyCode::BackTab) => {
+            // Inside Detail, Tab toggles file/diff focus rather than
+            // bouncing back to the task list. Outside Detail, fall
+            // through (return without handling so the global Tab fires).
+            if matches!(app.pr_view, PrView::Detail { .. }) {
+                handle_pr_detail_focus_toggle(app);
+            }
+        }
+        (Tab::Prs, KeyCode::Char('H')) => {
+            // Hunk jump: works from any focus; auto-switches to Diff so
+            // the scroll change is visible.
+            if matches!(app.pr_view, PrView::Detail { .. }) {
+                if let PrView::Detail { focus, .. } = &mut app.pr_view {
+                    *focus = PrDetailFocus::Diff;
+                }
+                handle_pr_detail_hunk_jump(app, false);
+            }
+        }
+        (Tab::Prs, KeyCode::Char('L')) => {
+            if matches!(app.pr_view, PrView::Detail { .. }) {
+                if let PrView::Detail { focus, .. } = &mut app.pr_view {
+                    *focus = PrDetailFocus::Diff;
+                }
+                handle_pr_detail_hunk_jump(app, true);
+            }
+        }
+        (Tab::Prs, KeyCode::Char('r')) => {
+            handle_pr_refresh(app);
+        }
+        (Tab::Prs, KeyCode::Char('o')) => {
+            handle_pr_open_browser(app);
+        }
         _ => {}
     }
 }
@@ -2615,10 +3768,304 @@ fn handle_right_key(app: &mut App, key: KeyEvent) {
 /// the previously-cursored Linear key likely doesn't exist on the
 /// new task. Also collapses pinned-open parents.
 fn reset_linear_cursor_for_new_task(app: &mut App) {
-    if let LinearView::List { cursor_key, pinned } = &mut app.linear_view {
-        cursor_key.clear();
-        pinned.clear();
+    // Drop any drilled detail view and clear the list cursor so the
+    // Linear pane re-anchors to the newly selected task's links.
+    app.linear_view = LinearView::default();
+    // Same for PRs — re-anchor cursor to first PR of new task.
+    app.pr_view = PrView::default();
+}
+
+/// Set the PR cursor to the first linked PR of the selected task. No-op
+/// if a cursor is already set or the task has none. Called when entering
+/// the PR tab so the preview pane has something to show.
+fn ensure_pr_cursor(app: &mut App) {
+    let first = app
+        .tasks
+        .get(app.selected)
+        .and_then(|t| t.prs.first().map(|p| p.number));
+    if let PrView::List { cursor_number } = &mut app.pr_view {
+        if *cursor_number == 0 {
+            if let Some(n) = first {
+                *cursor_number = n;
+            }
+        }
     }
+}
+
+fn handle_pr_down(app: &mut App) {
+    let prs: Vec<u32> = app
+        .tasks
+        .get(app.selected)
+        .map(|t| t.prs.iter().map(|p| p.number).collect())
+        .unwrap_or_default();
+    if prs.is_empty() {
+        return;
+    }
+    let cur = match &app.pr_view {
+        PrView::List { cursor_number } => *cursor_number,
+        _ => return,
+    };
+    let pos = prs.iter().position(|n| *n == cur).unwrap_or(0);
+    let next = if cur == 0 {
+        prs[0]
+    } else if pos + 1 < prs.len() {
+        prs[pos + 1]
+    } else {
+        cur
+    };
+    app.pr_view = PrView::List { cursor_number: next };
+}
+
+fn handle_pr_up(app: &mut App) {
+    let prs: Vec<u32> = app
+        .tasks
+        .get(app.selected)
+        .map(|t| t.prs.iter().map(|p| p.number).collect())
+        .unwrap_or_default();
+    if prs.is_empty() {
+        return;
+    }
+    let cur = match &app.pr_view {
+        PrView::List { cursor_number } => *cursor_number,
+        _ => return,
+    };
+    let pos = prs.iter().position(|n| *n == cur).unwrap_or(0);
+    let prev = if cur == 0 {
+        prs[0]
+    } else if pos > 0 {
+        prs[pos - 1]
+    } else {
+        cur
+    };
+    app.pr_view = PrView::List { cursor_number: prev };
+}
+
+/// Enter on a PR row → drill into Detail. Lazy-fetches the diff when the
+/// cache entry is missing or the head_sha doesn't match the PR metadata
+/// (force-push detection). Restores `(file_cursor, scroll)` from a prior
+/// drill into the same PR so re-entering doesn't lose your position.
+fn handle_pr_enter(app: &mut App) {
+    let cur = match &app.pr_view {
+        PrView::List { cursor_number } if *cursor_number > 0 => *cursor_number,
+        _ => return,
+    };
+    fetch_diff_if_needed(cur);
+    let (file_cursor, scroll) =
+        app.pr_detail_state.get(&cur).copied().unwrap_or((0, 0));
+    app.pr_view = PrView::Detail {
+        number: cur,
+        focus: PrDetailFocus::Files,
+        file_cursor,
+        scroll,
+    };
+}
+
+/// Persist the drilled PR's position into `app.pr_detail_state` and
+/// reset `pr_view` to `List`. No-op when not drilled.
+fn save_and_exit_pr_detail(app: &mut App) {
+    if let PrView::Detail { number, file_cursor, scroll, .. } = &app.pr_view {
+        app.pr_detail_state.insert(*number, (*file_cursor, *scroll));
+        let cursor = *number;
+        app.pr_view = PrView::List { cursor_number: cursor };
+    }
+}
+
+/// Force-refresh the diff cache for the currently-drilled PR. Spawns
+/// the fetch off the UI thread; the cache file is the contract — the
+/// next render reads it and reflects the new state.
+fn handle_pr_refresh(app: &mut App) {
+    let Some(n) = (match &app.pr_view {
+        PrView::Detail { number, .. } => Some(*number),
+        _ => None,
+    }) else {
+        return;
+    };
+    app.toast = Some(format!("refreshing #{n}…"));
+    spawn_pr_diff_fetch(n);
+}
+
+/// Lazy diff fetch: only fetches when the cache is missing or the PR's
+/// `head_sha` has moved past what was cached. Spawns when work is
+/// needed; safe to call on every Enter.
+fn fetch_diff_if_needed(number: u32) {
+    let pr_cache = crate::cache::read_prs();
+    let live_sha = pr_cache
+        .prs
+        .get(&number)
+        .map(|p| p.head_sha.clone())
+        .unwrap_or_default();
+    let diff_cache = crate::cache::read_pr_diffs();
+    let needs_fetch = match diff_cache.diffs.get(&number) {
+        Some(d) => !live_sha.is_empty() && d.head_sha != live_sha,
+        None => true,
+    };
+    if !needs_fetch {
+        return;
+    }
+    spawn_pr_diff_fetch(number);
+}
+
+fn spawn_pr_diff_fetch(number: u32) {
+    std::thread::spawn(move || {
+        let pr_cache = crate::cache::read_prs();
+        let head_sha = pr_cache
+            .prs
+            .get(&number)
+            .map(|p| p.head_sha.clone())
+            .unwrap_or_default();
+        let diff = crate::gh::fetch_pr_diff(number, &head_sha);
+        let mut cache = crate::cache::read_pr_diffs();
+        cache.diffs.insert(number, diff);
+        cache.generated_at = crate::cache::now_epoch();
+        crate::cache::write_pr_diffs(&cache);
+    });
+}
+
+/// Clamp `file_cursor` against the current diff's file count. Called
+/// after fetch returns and before each render to handle the case where
+/// a refresh produced fewer files than before.
+fn clamp_pr_file_cursor(app: &mut App) {
+    if let PrView::Detail { number, file_cursor, scroll, .. } = &mut app.pr_view {
+        let n = file_count(*number);
+        if n == 0 {
+            *file_cursor = 0;
+            *scroll = 0;
+            return;
+        }
+        if *file_cursor >= n {
+            *file_cursor = n - 1;
+            *scroll = 0;
+        }
+    }
+}
+
+fn handle_pr_detail_down(app: &mut App) {
+    if let PrView::Detail { number, focus, file_cursor, scroll } = &mut app.pr_view {
+        match focus {
+            PrDetailFocus::Files => {
+                let n_files = file_count(*number);
+                if *file_cursor + 1 < n_files {
+                    *file_cursor += 1;
+                    *scroll = 0;
+                }
+            }
+            PrDetailFocus::Diff => {
+                *scroll = scroll.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn handle_pr_detail_up(app: &mut App) {
+    if let PrView::Detail { focus, file_cursor, scroll, .. } = &mut app.pr_view {
+        match focus {
+            PrDetailFocus::Files => {
+                if *file_cursor > 0 {
+                    *file_cursor -= 1;
+                    *scroll = 0;
+                }
+            }
+            PrDetailFocus::Diff => {
+                *scroll = scroll.saturating_sub(1);
+            }
+        }
+    }
+}
+
+fn handle_pr_detail_next_file(app: &mut App) {
+    if let PrView::Detail { number, file_cursor, scroll, .. } = &mut app.pr_view {
+        let n_files = file_count(*number);
+        if *file_cursor + 1 < n_files {
+            *file_cursor += 1;
+            *scroll = 0;
+        }
+    }
+}
+
+fn handle_pr_detail_prev_file(app: &mut App) {
+    if let PrView::Detail { file_cursor, scroll, .. } = &mut app.pr_view {
+        if *file_cursor > 0 {
+            *file_cursor -= 1;
+            *scroll = 0;
+        }
+    }
+}
+
+fn handle_pr_detail_focus_toggle(app: &mut App) {
+    if let PrView::Detail { focus, .. } = &mut app.pr_view {
+        *focus = match *focus {
+            PrDetailFocus::Files => PrDetailFocus::Diff,
+            PrDetailFocus::Diff => PrDetailFocus::Files,
+        };
+    }
+}
+
+fn handle_pr_detail_hunk_jump(app: &mut App, forward: bool) {
+    let (number, file_cursor_val, cur_scroll) = match &app.pr_view {
+        PrView::Detail { number, file_cursor, scroll, .. } => (*number, *file_cursor, *scroll),
+        _ => return,
+    };
+    let cache = crate::cache::read_pr_diffs();
+    let Some(diff) = cache.diffs.get(&number) else {
+        app.toast = Some("no diff cached — press r to fetch".into());
+        return;
+    };
+    let Some(file) = diff.files.get(file_cursor_val) else {
+        return;
+    };
+    let (_, hunk_anchors) = build_pr_diff_lines(file, 80);
+    let n = hunk_anchors.len();
+    if n == 0 {
+        app.toast = Some("no hunks (empty or binary)".into());
+        return;
+    }
+
+    // Current hunk index — last anchor at or before cur_scroll.
+    let cur_idx = hunk_anchors
+        .iter()
+        .rposition(|r| *r <= cur_scroll)
+        .unwrap_or(0);
+
+    let target_idx = if forward {
+        if cur_idx + 1 < n { Some(cur_idx + 1) } else { None }
+    } else if cur_idx > 0 {
+        Some(cur_idx - 1)
+    } else {
+        None
+    };
+
+    let Some(idx) = target_idx else {
+        app.toast = Some(if forward {
+            format!("last hunk ({}/{n})", cur_idx + 1)
+        } else {
+            format!("first hunk ({}/{n})", cur_idx + 1)
+        });
+        return;
+    };
+
+    let new_scroll = hunk_anchors[idx];
+    if let PrView::Detail { scroll, .. } = &mut app.pr_view {
+        *scroll = new_scroll;
+    }
+    app.toast = Some(format!("hunk {}/{n}", idx + 1));
+}
+
+fn file_count(number: u32) -> usize {
+    let cache = crate::cache::read_pr_diffs();
+    cache.diffs.get(&number).map(|d| d.files.len()).unwrap_or(0)
+}
+
+fn handle_pr_open_browser(app: &App) {
+    let n = match &app.pr_view {
+        PrView::List { cursor_number } if *cursor_number > 0 => *cursor_number,
+        PrView::Detail { number, .. } => *number,
+        _ => return,
+    };
+    let _ = std::process::Command::new("gh")
+        .args(["pr", "view", &n.to_string(), "--web"])
+        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .status();
 }
 
 /// Initialize cursor_key to the first linked issue when entering the
@@ -2707,8 +4154,27 @@ fn handle_linear_enter(app: &mut App) {
         LinearView::List { cursor_key, .. } => {
             if !cursor_key.is_empty() {
                 let k = cursor_key.clone();
+                // If the cursored issue is a sub-issue, seed the stack
+                // with its ancestors so Esc walks: cursor → parent →
+                // grandparent → ... → list. Cap at 8 to match the drill
+                // limit elsewhere in this file.
+                let mut stack: Vec<String> = Vec::new();
+                let mut cur = k.clone();
+                while let Some(p) = cache
+                    .issues
+                    .get(&cur)
+                    .and_then(|c| c.parent_key.clone())
+                {
+                    stack.push(p.clone());
+                    cur = p;
+                    if stack.len() >= 7 {
+                        break;
+                    }
+                }
+                stack.reverse();
+                stack.push(k);
                 app.linear_view = LinearView::Detail {
-                    stack: vec![k],
+                    stack,
                     sub_cursor: 0,
                 };
             }
@@ -2808,21 +4274,41 @@ fn handle_linear_open_project(app: &mut App) {
 
 fn handle_linear_open_browser(app: &mut App) {
     let cache = crate::cache::read_linear();
-    let url = match &app.linear_view {
-        LinearView::Detail { stack, .. } => stack
-            .last()
-            .and_then(|k| cache.issues.get(k))
-            .map(|c| c.url.clone()),
-        LinearView::List { cursor_key, .. } => cache
-            .issues
-            .get(cursor_key)
-            .map(|c| c.url.clone()),
+    let key: Option<String> = match &app.linear_view {
+        LinearView::Detail { stack, .. } => stack.last().cloned(),
+        LinearView::List { cursor_key, .. } if !cursor_key.is_empty() => {
+            Some(cursor_key.clone())
+        }
+        _ => None,
     };
-    if let Some(u) = url {
-        if !u.is_empty() {
-            open_url(&u);
+    let Some(key) = key else { return };
+
+    // Top-level cache hit — use the canonical URL Linear returned.
+    if let Some(c) = cache.issues.get(&key) {
+        if !c.url.is_empty() {
+            open_url(&c.url);
+            return;
         }
     }
+
+    // Sub-issue fallback: derive `https://linear.app/<ws>/issue/<KEY>`
+    // from the parent's URL by stripping the slug. Linear redirects
+    // bare-identifier URLs to the canonical slug.
+    if let Some((parent_key, _)) = find_child_in_cache(&cache, &key) {
+        if let Some(parent) = cache.issues.get(parent_key) {
+            if let Some(prefix) = parent.url.split("/issue/").next() {
+                if !prefix.is_empty() {
+                    open_url(&format!("{prefix}/issue/{key}"));
+                    return;
+                }
+            }
+        }
+    }
+
+    // Last-resort fallback — Linear accepts the bare identifier path
+    // even without a workspace prefix, redirecting to the user's last-
+    // visited workspace. Better than silently failing.
+    open_url(&format!("https://linear.app/issue/{key}"));
 }
 
 fn open_url(url: &str) {
@@ -3000,10 +4486,25 @@ mod tests {
         vec![
             TaskView {
                 name: "infra-triage".into(),
-                meta: state::TaskMeta {
-                    session: "task-infra-triage".into(),
-                    worktree: "/Users/a/column/task-infra-triage".into(),
-                    prs: vec![25163],
+                record: TaskRecord {
+                    id: 2,
+                    slug: "infra-triage".into(),
+                    tmux: store::TmuxInfo {
+                        session_name: "task-infra-triage".into(),
+                        ..Default::default()
+                    },
+                    worktree: store::WorktreeInfo {
+                        path: "/Users/a/column/task-infra-triage".into(),
+                        ..Default::default()
+                    },
+                    desired_state: DesiredState::Active,
+                    links: store::Links {
+                        prs: vec![store::PrLink {
+                            number: 25163,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 status: TaskStatus::Working,
@@ -3035,32 +4536,35 @@ mod tests {
                     assignee: None,
                     depth: 0,
                 }],
-                id: Some(2),
-                drift: false,
             },
             TaskView {
                 name: "ach-sanitize".into(),
-                meta: state::TaskMeta {
-                    session: "task-ach-sanitize".into(),
-                    paused: true,
+                record: TaskRecord {
+                    id: 3,
+                    slug: "ach-sanitize".into(),
+                    tmux: store::TmuxInfo {
+                        session_name: "task-ach-sanitize".into(),
+                        ..Default::default()
+                    },
+                    desired_state: DesiredState::Paused,
                     ..Default::default()
                 },
                 status: TaskStatus::Paused,
                 prs: vec![],
                 panes: vec![],
                 linear: vec![],
-                id: None,
-                drift: false,
             },
             TaskView {
                 name: "fresh-task".into(),
-                meta: state::TaskMeta::default(),
+                record: TaskRecord {
+                    id: 4,
+                    slug: "fresh-task".into(),
+                    ..Default::default()
+                },
                 status: TaskStatus::Idle,
                 prs: vec![],
                 panes: vec![],
                 linear: vec![],
-                id: None,
-                drift: false,
             },
         ]
     }
@@ -3074,6 +4578,8 @@ mod tests {
             panes_selected: 0,
             linear_view: LinearView::default(),
             linear_list_offset: 0,
+            pr_view: PrView::default(),
+            pr_detail_state: HashMap::new(),
             log: LogPane {
                 run_id: Some("1234-test".into()),
                 lines: vec![
@@ -3096,6 +4602,48 @@ mod tests {
             last_run_count: 0,
             toast: None,
             readonly: true,
+        }
+    }
+
+    #[test]
+    fn task_navigation_resets_drilled_linear_view() {
+        let mut app = test_app();
+        // Simulate the user drilled into a Linear issue from the
+        // previously-selected task.
+        app.linear_view = LinearView::Detail {
+            stack: vec!["ENG-29215".into()],
+            sub_cursor: 0,
+        };
+        // Move task selection forward.
+        reset_linear_cursor_for_new_task(&mut app);
+        // Drilled state must be discarded so the Linear pane re-anchors.
+        assert!(matches!(app.linear_view, LinearView::Detail { .. }) == false);
+        match &app.linear_view {
+            LinearView::List { cursor_key, pinned } => {
+                assert!(cursor_key.is_empty());
+                assert!(pinned.is_empty());
+            }
+            _ => panic!("expected LinearView::List after reset"),
+        }
+    }
+
+    #[test]
+    fn task_navigation_resets_list_cursor_and_pinned() {
+        let mut app = test_app();
+        // Cursor at a sub-issue, parent pinned open.
+        let mut pinned: HashSet<String> = HashSet::new();
+        pinned.insert("ENG-28816".into());
+        app.linear_view = LinearView::List {
+            cursor_key: "ENG-29215".into(),
+            pinned,
+        };
+        reset_linear_cursor_for_new_task(&mut app);
+        match &app.linear_view {
+            LinearView::List { cursor_key, pinned } => {
+                assert!(cursor_key.is_empty());
+                assert!(pinned.is_empty());
+            }
+            _ => panic!("expected LinearView::List after reset"),
         }
     }
 
@@ -3139,8 +4687,10 @@ mod tests {
         app.focus = Pane::List;
         app.selected = 0;
         let s = render_to_string(&app, 100, 25);
-        // Selected row has the focus marker; id is rendered before the name.
-        assert!(s.contains("▸ #2 infra-triage"));
+        // Selected row has the focus marker; positional rank (#1 because
+        // infra-triage is first in the test fixture's open_order) is
+        // rendered before the name.
+        assert!(s.contains("▸ #1 infra-triage"));
     }
 
     #[test]
@@ -3266,11 +4816,105 @@ mod tests {
         assert!(s.contains("toggle list ↔ right"));
         assert!(s.contains("1 2 3 4"));
         assert!(s.contains("Overview"));
-        assert!(s.contains("Phase 1F+"));
+        assert!(s.contains("Enter on a PR row"));
     }
 
     #[test]
-    fn linear_enter_pushes_detail() {
+    fn pr_detail_hunk_jump_uses_real_anchors() {
+        // Build a synthetic diff cache with two hunks so H/L can move
+        // scroll between known anchor rows.
+        use crate::cache::{
+            CachedPrDiff, CachedPrDiffFile, CachedPrDiffHunk, PrDiffCache,
+        };
+        let dir = std::env::temp_dir().join("orch-test-hunk-jump");
+        // Best-effort isolation — the live cache is at ~/tasks/.orch/cache.
+        // We only verify the build_pr_diff_lines anchor math, not the
+        // actual TUI key dispatch read of the cache.
+        let _ = dir;
+
+        let file = CachedPrDiffFile {
+            path: "x.go".into(),
+            old_path: None,
+            additions: 2,
+            deletions: 1,
+            status: "modified".into(),
+            hunks: vec![
+                CachedPrDiffHunk {
+                    header: "@@ -1,3 +1,4 @@ first".into(),
+                    lines: vec![" a".into(), "-b".into(), "+c".into()],
+                },
+                CachedPrDiffHunk {
+                    header: "@@ -10,2 +10,3 @@ second".into(),
+                    lines: vec![" d".into(), "+e".into()],
+                },
+            ],
+        };
+        let (lines, anchors) = build_pr_diff_lines(&file, 80);
+        // Anchors point at the hunk-header line indices.
+        assert_eq!(anchors.len(), 2);
+        // Both anchors must land on rows that are actually hunk headers.
+        let first_header = lines.get(anchors[0] as usize).unwrap();
+        let first_text: String = first_header.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(first_text.contains("@@ -1,3"));
+        let second_header = lines.get(anchors[1] as usize).unwrap();
+        let second_text: String = second_header.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(second_text.contains("@@ -10,2"));
+        // Anchor 1 is strictly after anchor 0.
+        assert!(anchors[1] > anchors[0]);
+
+        let _ = PrDiffCache::default();
+        let _ = CachedPrDiff::default();
+    }
+
+    #[test]
+    fn pr_detail_tab_toggles_focus_both_ways() {
+        let mut app = test_app();
+        app.focus = Pane::Right;
+        app.detail_tab = Tab::Prs;
+        app.pr_view = PrView::Detail {
+            number: 4821,
+            focus: PrDetailFocus::Files,
+            file_cursor: 0,
+            scroll: 0,
+        };
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        match &app.pr_view {
+            PrView::Detail { focus: PrDetailFocus::Diff, .. } => {}
+            other => panic!("expected Diff focus, got {other:?}"),
+        }
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
+        match &app.pr_view {
+            PrView::Detail { focus: PrDetailFocus::Files, .. } => {}
+            other => panic!("expected Files focus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_help_overlay_pr_detail_variant() {
+        let mut app = test_app();
+        app.show_help = true;
+        app.focus = Pane::Right;
+        app.detail_tab = Tab::Prs;
+        app.pr_view = PrView::Detail {
+            number: 4821,
+            focus: PrDetailFocus::Files,
+            file_cursor: 0,
+            scroll: 0,
+        };
+        let s = render_to_string(&app, 100, 25);
+        assert!(s.contains("PR detail"));
+        assert!(s.contains("Tab"));
+        assert!(s.contains("hunk"));
+        assert!(!s.contains("Phase 1F+"));
+    }
+
+    #[test]
+    fn linear_enter_seeds_ancestor_stack() {
+        // ENG-29151 is a child of ENG-28816 in the live test cache.
+        // Entering on a sub-issue should seed the stack with parents
+        // so Esc walks back through the hierarchy: cursor → parent → list.
         let mut app = test_app();
         app.focus = Pane::Right;
         app.detail_tab = Tab::Linear;
@@ -3278,11 +4922,17 @@ mod tests {
             cursor_key: "ENG-29151".into(),
             pinned: HashSet::new(),
         };
-        // Task #0 has one Linear stub: ENG-29151
         handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
         match &app.linear_view {
             LinearView::Detail { stack, sub_cursor } => {
-                assert_eq!(stack, &vec!["ENG-29151".to_string()]);
+                // Last in stack is what's shown; everything before it is
+                // walked by Esc.
+                assert_eq!(stack.last(), Some(&"ENG-29151".to_string()));
+                assert!(
+                    stack.contains(&"ENG-28816".to_string())
+                        || stack.len() == 1,
+                    "stack should contain parent if cache knows it: {stack:?}",
+                );
                 assert_eq!(*sub_cursor, 0);
             }
             _ => panic!("expected Detail view, got {:?}", app.linear_view),

@@ -120,6 +120,33 @@ pub struct CachedPr {
     pub approved: bool,
     pub codex: String,
     pub fetched_at: u64,
+
+    // Extended metadata (PR redesign — preview + drill).
+    /// `OPEN | CLOSED | MERGED`. Empty when never fetched.
+    #[serde(default)]
+    pub state: String,
+    /// `MERGEABLE | CONFLICTING | UNKNOWN`. None when never fetched.
+    #[serde(default)]
+    pub mergeable: Option<String>,
+    /// Head branch name (e.g. `feat/foo`).
+    #[serde(default)]
+    pub head_branch: String,
+    /// Head commit SHA — used to invalidate the diff cache when the branch
+    /// is force-pushed or new commits land.
+    #[serde(default)]
+    pub head_sha: String,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+    #[serde(default)]
+    pub changed_files: u32,
+    /// GitHub `updatedAt` ISO 8601. Drives the "3d ago" age display.
+    #[serde(default)]
+    pub updated_at: String,
+    /// PR description / body (markdown). Rendered in the preview pane.
+    #[serde(default)]
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -127,6 +154,70 @@ pub struct PrCache {
     pub generated_at: u64,
     pub prs: HashMap<u32, CachedPr>,
 }
+
+// Diff cache — separate from PrCache so the metadata read-path stays cheap
+// (status/preview don't need parsed hunks). Lazy-fetched on first Enter.
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachedPrDiff {
+    pub number: u32,
+    pub fetched_at: u64,
+    /// Head SHA of the diff at fetch time. If the live PR's head_sha
+    /// differs, the diff is stale and should be refreshed on next Enter.
+    #[serde(default)]
+    pub head_sha: String,
+    /// Raw `gh pr diff` byte size. Above PR_DIFF_RAW_BUDGET → `truncated`.
+    #[serde(default)]
+    pub raw_size: u64,
+    /// True when `raw_size > PR_DIFF_RAW_BUDGET`. Files/hunks are dropped.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Set when `gh pr diff` failed (auth, deleted branch, network).
+    /// `files` is empty in this case; the detail view renders the
+    /// message instead of "loading…".
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub files: Vec<CachedPrDiffFile>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachedPrDiffFile {
+    pub path: String,
+    /// Pre-rename path; same as `path` when not a rename.
+    #[serde(default)]
+    pub old_path: Option<String>,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+    /// `added | modified | deleted | renamed | binary`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub hunks: Vec<CachedPrDiffHunk>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachedPrDiffHunk {
+    /// Raw `@@ -a,b +c,d @@ context` header.
+    pub header: String,
+    /// Raw lines, each prefixed by ` `, `+`, or `-`.
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrDiffCache {
+    pub generated_at: u64,
+    pub diffs: HashMap<u32, CachedPrDiff>,
+}
+
+/// 1.5 MB raw `gh pr diff` byte budget. Above this, the cache stores
+/// `truncated: true` and the detail view shows a "diff too large" banner.
+pub const PR_DIFF_RAW_BUDGET: u64 = 1_500_000;
+/// Per-hunk truncation. Hunks larger than this drop their tail with a
+/// `(… N more lines)` marker — same pattern lazygit uses on huge files.
+pub const PR_DIFF_LINES_PER_HUNK: usize = 2_000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Lease {
@@ -148,6 +239,22 @@ pub fn read_prs() -> PrCache {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+pub fn read_pr_diffs() -> PrDiffCache {
+    let path = cache_dir().join("pr_diffs.json");
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_pr_diffs(cache: &PrDiffCache) {
+    let dir = cache_dir();
+    fs::create_dir_all(&dir).ok();
+    if let Ok(json) = serde_json::to_string_pretty(cache) {
+        state::atomic_write(&dir.join("pr_diffs.json"), &json);
+    }
 }
 
 pub fn read_linear() -> LinearCache {
@@ -295,6 +402,15 @@ impl CachedPr {
             ci_pass: self.ci_pass,
             approved: self.approved,
             codex,
+            state: self.state.clone(),
+            mergeable: self.mergeable.clone(),
+            head_branch: self.head_branch.clone(),
+            head_sha: self.head_sha.clone(),
+            additions: self.additions,
+            deletions: self.deletions,
+            changed_files: self.changed_files,
+            updated_at: self.updated_at.clone(),
+            body: self.body.clone(),
         }
     }
 
@@ -311,6 +427,15 @@ impl CachedPr {
             approved: pr.approved,
             codex: codex.to_string(),
             fetched_at: now_epoch(),
+            state: pr.state.clone(),
+            mergeable: pr.mergeable.clone(),
+            head_branch: pr.head_branch.clone(),
+            head_sha: pr.head_sha.clone(),
+            additions: pr.additions,
+            deletions: pr.deletions,
+            changed_files: pr.changed_files,
+            updated_at: pr.updated_at.clone(),
+            body: pr.body.clone(),
         }
     }
 }
@@ -351,11 +476,71 @@ mod tests {
             approved: true,
             codex: "ThumbsUp".into(),
             fetched_at: 100,
+            state: "OPEN".into(),
+            mergeable: Some("MERGEABLE".into()),
+            head_branch: "feat/foo".into(),
+            head_sha: "abc123".into(),
+            additions: 287,
+            deletions: 42,
+            changed_files: 6,
+            updated_at: "2026-04-30T12:00:00Z".into(),
+            body: "Some description body".into(),
         };
         let data = pr.to_pr_data();
         assert_eq!(data.codex, state::CodexStatus::ThumbsUp);
+        assert_eq!(data.state, "OPEN");
+        assert_eq!(data.head_sha, "abc123");
+        assert_eq!(data.additions, 287);
         let back = CachedPr::from_pr_data(&data);
         assert_eq!(back.codex, "ThumbsUp");
+        assert_eq!(back.head_sha, "abc123");
+        assert_eq!(back.changed_files, 6);
+    }
+
+    #[test]
+    fn pr_diff_cache_round_trip() {
+        let cache = PrDiffCache {
+            generated_at: 100,
+            diffs: HashMap::from([(
+                4821,
+                CachedPrDiff {
+                    number: 4821,
+                    fetched_at: 200,
+                    head_sha: "deadbeef".into(),
+                    raw_size: 1024,
+                    truncated: false,
+                    error: None,
+                    files: vec![CachedPrDiffFile {
+                        path: "src/foo.rs".into(),
+                        old_path: None,
+                        additions: 10,
+                        deletions: 2,
+                        status: "modified".into(),
+                        hunks: vec![CachedPrDiffHunk {
+                            header: "@@ -1,3 +1,11 @@".into(),
+                            lines: vec![
+                                " context".into(),
+                                "-old".into(),
+                                "+new".into(),
+                            ],
+                        }],
+                    }],
+                },
+            )]),
+        };
+        let json = serde_json::to_string_pretty(&cache).unwrap();
+        let parsed: PrDiffCache = serde_json::from_str(&json).unwrap();
+        let d = &parsed.diffs[&4821];
+        assert_eq!(d.head_sha, "deadbeef");
+        assert_eq!(d.files.len(), 1);
+        assert_eq!(d.files[0].hunks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn pr_diff_budget_constants_sane() {
+        // Sanity bounds — a stamp on the codex-stamped numbers.
+        assert_eq!(PR_DIFF_RAW_BUDGET, 1_500_000);
+        assert_eq!(PR_DIFF_LINES_PER_HUNK, 2_000);
     }
 
     #[test]
