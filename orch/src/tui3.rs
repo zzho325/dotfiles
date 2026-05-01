@@ -1990,18 +1990,18 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         kv_line("  [ / ]    ", "previous / next task (any focus)"),
         kv_line("  1 2 3 4  ", "Overview · PRs · Linear · Panes"),
         kv_line("  Esc      ", "right → list; list → quit"),
-        kv_line("  PgUp/Dn  ", "scroll log"),
-        kv_line("  < / >    ", "log: top / tail"),
-        kv_line("  ?        ", "this overlay"),
-        kv_line("  r m      ", "refresh · message"),
+        kv_line("  PgUp/Dn  ", "log scroll  ·  < top  ·  > tail"),
+        kv_line("  ?  r  m  ", "help · refresh · message"),
         Line::styled(" List", Style::default().fg(IRIS)),
         kv_line("  j k g G  ", "move · top / bottom"),
+        kv_line("  J K      ", "move task down / up in open_order"),
+        kv_line("  s p R x  ", "spawn · pause · resume · close"),
         kv_line("  Enter    ", "attach to active pane"),
         Line::styled(" Right zone", Style::default().fg(IRIS)),
         kv_line("  j k      ", "move cursor in active tab"),
         kv_line("  Enter    ", "open / attach in active tab"),
         Line::styled(
-            " Phase 1F+:  n s p R x M J K o W (not yet wired)",
+            " Phase 1F+:  n M W (not yet wired)",
             Style::default().fg(MUTED),
         ),
     ];
@@ -2114,7 +2114,7 @@ fn total_wrapped_rows(lines: &[String], width: usize) -> usize {
 // via global PgUp/PgDn/`<`/`>` regardless of focus. See
 // `docs/tui-nav-redesign.md`.
 
-const UNWIRED_KEYS: &[char] = &['n', 'M', 'J', 'K', 'W'];
+const UNWIRED_KEYS: &[char] = &['n', 'M', 'W'];
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     if app.show_help {
@@ -2278,7 +2278,66 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('R') => lifecycle_op(app, "resume", lifecycle_resume),
         KeyCode::Char('p') => lifecycle_op(app, "pause", lifecycle_pause),
         KeyCode::Char('x') => lifecycle_op(app, "close", lifecycle_close),
+        // Reorder the selected task within Registry.open_order.
+        // J = move down (swap with next), K = move up (swap with prev).
+        // Mirrors vim's "J/K to move line" idiom in many editors.
+        KeyCode::Char('J') => reorder_selected(app, 1),
+        KeyCode::Char('K') => reorder_selected(app, -1),
         _ => {}
+    }
+}
+
+/// Swap the selected task with its neighbor (delta = +1 down, -1 up)
+/// in `Registry.open_order`. Refreshes the task list so the row
+/// position updates and the cursor follows the moved task.
+fn reorder_selected(app: &mut App, delta: isize) {
+    let store = crate::store::Store::default();
+    if !store.is_authoritative() {
+        app.toast = Some("reorder needs v2 store".into());
+        return;
+    }
+    let selected_name = match app.tasks.get(app.selected) {
+        Some(t) => t.name.clone(),
+        None => return,
+    };
+    let mut registry = match store.load_registry() {
+        Some(r) => r,
+        None => {
+            app.toast = Some("no registry".into());
+            return;
+        }
+    };
+    // Find the selected slug's id by scanning the task records — the
+    // open_order indices may differ from the visible task list when
+    // closed tasks linger, so go via name → record → id.
+    let selected_id = registry
+        .open_order
+        .iter()
+        .copied()
+        .find(|id| {
+            store
+                .load_record(*id)
+                .map(|r| r.slug == selected_name)
+                .unwrap_or(false)
+        });
+    let Some(id) = selected_id else {
+        app.toast = Some(format!("not in open_order: {selected_name}"));
+        return;
+    };
+    let Some(pos) = registry.open_order.iter().position(|i| *i == id) else {
+        return;
+    };
+    let new_pos = pos as isize + delta;
+    if new_pos < 0 || new_pos >= registry.open_order.len() as isize {
+        return;
+    }
+    registry.open_order.swap(pos, new_pos as usize);
+    store.save_registry(&registry);
+    app.refresh_status();
+    // Move the cursor to follow the swapped task so the user sees it
+    // moving, not just disappearing into a different row.
+    if let Some(new_idx) = app.tasks.iter().position(|t| t.name == selected_name) {
+        app.selected = new_idx;
     }
 }
 
