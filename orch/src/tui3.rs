@@ -602,39 +602,64 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Single-line message input modal at the very bottom of the screen.
-/// Shown only when `m` has been pressed (until Esc cancels or Enter
-/// sends). Overdraws whatever was on the bottom row.
+/// Message input modal anchored to the bottom of the screen.
+/// Single line for short input; grows upward as the buffer wraps so
+/// long messages stay visible. Always renders the keymap hint as a
+/// dedicated line above the input.
 fn render_message_input(frame: &mut Frame, area: Rect, app: &App) {
     let Some(buf) = app.message_input.as_ref() else {
         return;
     };
-    if area.height < 1 {
+    if area.height < 2 {
         return;
     }
+    let prompt = " orch ▸ ";
+    let prompt_width = prompt.chars().count();
+    let usable = (area.width as usize).saturating_sub(prompt_width).max(1);
+    // +1 for the trailing cursor glyph.
+    let content_chars = buf.chars().count() + 1;
+    // Visual rows needed (ceil division).
+    let input_rows = ((content_chars + usable - 1) / usable).max(1) as u16;
+    let total_rows = (input_rows + 1).min(area.height); // +1 for hint line
+
     let bar = Rect {
         x: area.x,
-        y: area.y + area.height - 1,
+        y: area.y + area.height - total_rows,
         width: area.width,
-        height: 1,
+        height: total_rows,
     };
     frame.render_widget(ratatui::widgets::Clear, bar);
-    let prompt = Span::styled(
-        " orch ▸ ",
-        Style::default().fg(LOVE),
-    );
-    let body = Span::styled(buf.clone(), Style::default().fg(TEXT));
-    let cursor = Span::styled(
-        "▌",
-        Style::default().fg(LOVE),
-    );
-    let hint = Span::styled(
-        "  Enter to send · Esc to cancel",
-        Style::default().fg(MUTED),
-    );
+
+    // Hint line on top.
+    let hint_area = Rect {
+        x: bar.x,
+        y: bar.y,
+        width: bar.width,
+        height: 1,
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![prompt, body, cursor, hint])),
-        bar,
+        Paragraph::new(Line::styled(
+            " Enter to send · Esc to cancel",
+            Style::default().fg(MUTED),
+        )),
+        hint_area,
+    );
+
+    // Input area below it.
+    let input_area = Rect {
+        x: bar.x,
+        y: bar.y + 1,
+        width: bar.width,
+        height: total_rows.saturating_sub(1).max(1),
+    };
+    let line = Line::from(vec![
+        Span::styled(prompt, Style::default().fg(LOVE)),
+        Span::styled(buf.clone(), Style::default().fg(TEXT)),
+        Span::styled("▌", Style::default().fg(LOVE)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).wrap(Wrap { trim: false }),
+        input_area,
     );
 }
 
