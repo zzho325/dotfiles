@@ -116,17 +116,42 @@ fn fetch_pr(number: u32) -> Option<PrData> {
 
     let title = json["title"].as_str().unwrap_or("").to_string();
 
-    // CI status: check statusCheckRollup
-    let ci_pass = json["statusCheckRollup"]
-        .as_array()
-        .map(|checks| {
-            checks.iter().all(|c| {
-                matches!(
-                    c["conclusion"].as_str(),
-                    Some("SUCCESS" | "SKIPPED" | "NEUTRAL")
-                ) || c["state"].as_str() == Some("SUCCESS")
-            })
-        });
+    // CI status: tristate from statusCheckRollup.
+    //   Some(true)  = all checks done and passing
+    //   Some(false) = at least one check finished and failed
+    //   None        = at least one check still running (no failures yet)
+    let ci_pass = json["statusCheckRollup"].as_array().and_then(|checks| {
+        if checks.is_empty() {
+            return None;
+        }
+        let mut any_pending = false;
+        let mut any_fail = false;
+        for c in checks {
+            let conclusion = c["conclusion"].as_str();
+            let state = c["state"].as_str();
+            let success = matches!(conclusion, Some("SUCCESS" | "SKIPPED" | "NEUTRAL"))
+                || state == Some("SUCCESS");
+            if success {
+                continue;
+            }
+            // CheckRun in progress: conclusion=null. StatusContext pending: state=PENDING.
+            let pending = (conclusion.is_none()
+                && (state.is_none() || state == Some("PENDING") || state == Some("IN_PROGRESS")))
+                || matches!(conclusion, Some("ACTION_REQUIRED" | "STALE"));
+            if pending {
+                any_pending = true;
+            } else {
+                any_fail = true;
+            }
+        }
+        if any_fail {
+            Some(false)
+        } else if any_pending {
+            None
+        } else {
+            Some(true)
+        }
+    });
 
     // Approvals: any review with APPROVED state
     let approved = json["reviews"]

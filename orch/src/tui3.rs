@@ -3347,6 +3347,29 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             app.panes_selected = 0;
             reset_linear_cursor_for_new_task(app);
         }
+        // Cycle the right-zone tab without leaving list focus, so you
+        // can preview a task's PRs/Linear/Panes while keeping j/k on
+        // the list. PR-detail fullscreen still owns h/l (Esc to leave).
+        KeyCode::Char('h') | KeyCode::Left
+            if !matches!(app.pr_view, PrView::Detail { .. }) =>
+        {
+            app.detail_tab = app.detail_tab.prev();
+            if app.detail_tab == Tab::Prs {
+                ensure_pr_cursor(app);
+            } else if app.detail_tab == Tab::Linear {
+                ensure_linear_cursor(app);
+            }
+        }
+        KeyCode::Char('l') | KeyCode::Right
+            if !matches!(app.pr_view, PrView::Detail { .. }) =>
+        {
+            app.detail_tab = app.detail_tab.next();
+            if app.detail_tab == Tab::Prs {
+                ensure_pr_cursor(app);
+            } else if app.detail_tab == Tab::Linear {
+                ensure_linear_cursor(app);
+            }
+        }
         KeyCode::Char('g') => app.selected = 0,
         KeyCode::Char('G') => {
             app.selected = app.tasks.len().saturating_sub(1);

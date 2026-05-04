@@ -822,8 +822,10 @@ fn cmd_busy_stop() {
 // Linear ticket linkage.
 
 fn linear_key_pattern() -> regex::Regex {
-    // PROJ-N or PROJ-NN... — Linear's ticket format
-    regex::Regex::new(r"\b[A-Z][A-Z0-9_]+-\d+\b").expect("valid regex")
+    // PROJ-N or PROJ-NN... — Linear's ticket format. Case-insensitive
+    // because branches commonly use lowercase (`azhou/eng-29592-...`);
+    // matches are uppercased before storage.
+    regex::Regex::new(r"(?i)\b[A-Z][A-Z0-9_]+-\d+\b").expect("valid regex")
 }
 
 fn cmd_linear_add(task: &str, key: &str) {
@@ -898,7 +900,10 @@ fn link_keys_in_record(
     let mut added = 0;
     for text in texts {
         for m in pattern.find_iter(text.as_ref()) {
-            let key = m.as_str().to_string();
+            // Linear identifiers are uppercase by convention; lowercase
+            // matches (from branch names) are normalized so dedup and
+            // not_found checks against the cache work.
+            let key = m.as_str().to_uppercase();
             if record.links.linear_issues.iter().any(|li| li.key == key)
                 || not_found.contains(&key)
             {
