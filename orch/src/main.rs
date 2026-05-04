@@ -884,45 +884,120 @@ fn cmd_linear_ls(task: &str) {
     }
 }
 
-/// Scan one task's .md file for `[A-Z]+-\d+` patterns and link any
-/// not already linked. Keys in the linear cache's `not_found` set are
-/// skipped — they were tried and Linear says they don't resolve.
-/// New links use `source=MarkdownScan`.
-fn scan_task_md_for_keys(task: &str, store: &store::Store) -> usize {
-    let md = state::tasks_dir().join(format!("{task}.md"));
-    let content = match fs::read_to_string(&md) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    let Some(mut record) = store.load_record_by_slug(task) else {
-        return 0;
-    };
-    let not_found: HashSet<String> = cache::read_linear()
-        .not_found
-        .into_iter()
-        .collect();
+/// Append LinearLinks for any `[A-Z]+-\d+` keys in `texts` that aren't
+/// already on the record and aren't in the cache's `not_found` set
+/// (those were already tried and Linear said they don't resolve).
+/// Returns count added. Caller is responsible for `save_record` if > 0.
+fn link_keys_in_record(
+    record: &mut store::TaskRecord,
+    texts: impl IntoIterator<Item = impl AsRef<str>>,
+    source: store::LinkSource,
+    not_found: &HashSet<String>,
+) -> usize {
     let pattern = linear_key_pattern();
     let mut added = 0;
-    for m in pattern.find_iter(&content) {
-        let key = m.as_str().to_string();
-        if record.links.linear_issues.iter().any(|li| li.key == key) {
-            continue;
+    for text in texts {
+        for m in pattern.find_iter(text.as_ref()) {
+            let key = m.as_str().to_string();
+            if record.links.linear_issues.iter().any(|li| li.key == key)
+                || not_found.contains(&key)
+            {
+                continue;
+            }
+            record.links.linear_issues.push(store::LinearLink {
+                key,
+                source,
+                last_verified_at: None,
+            });
+            added += 1;
         }
-        if not_found.contains(&key) {
-            continue;
-        }
-        record.links.linear_issues.push(store::LinearLink {
-            key,
-            source: store::LinkSource::MarkdownScan,
-            last_verified_at: None,
-        });
-        added += 1;
-    }
-    if added > 0 {
-        record.updated_at = cache::now_epoch();
-        store.save_record(&record);
     }
     added
+}
+
+/// Scan the task's .md file for Linear keys. New links use `MarkdownScan`.
+fn scan_task_md_for_keys(
+    record: &mut store::TaskRecord,
+    not_found: &HashSet<String>,
+) -> usize {
+    let md = state::tasks_dir().join(format!("{}.md", record.slug));
+    let Ok(content) = fs::read_to_string(&md) else {
+        return 0;
+    };
+    link_keys_in_record(
+        record,
+        [content.as_str()],
+        store::LinkSource::MarkdownScan,
+        not_found,
+    )
+}
+
+/// Scan the task's worktree bookmarks for Linear keys. Tries jj first
+/// (`bookmark list -r ::@` for the whole stack), falls back to git's
+/// current branch. New links use `BranchDiscovery`.
+fn scan_worktree_bookmark_for_keys(
+    record: &mut store::TaskRecord,
+    not_found: &HashSet<String>,
+) -> usize {
+    let wt = state::expand_home(&record.worktree.path);
+    if wt.is_empty() {
+        return 0;
+    }
+    let names = worktree_bookmark_names(&wt);
+    if names.is_empty() {
+        return 0;
+    }
+    link_keys_in_record(
+        record,
+        names.iter().map(String::as_str),
+        store::LinkSource::BranchDiscovery,
+        not_found,
+    )
+}
+
+fn worktree_bookmark_names(worktree: &str) -> Vec<String> {
+    if let Some(names) = jj_bookmarks(worktree) {
+        return names;
+    }
+    git_branch(worktree).map(|b| vec![b]).unwrap_or_default()
+}
+
+fn jj_bookmarks(worktree: &str) -> Option<Vec<String>> {
+    if !Path::new(worktree).join(".jj").exists() {
+        return None;
+    }
+    let out = Command::new("jj")
+        .args([
+            "bookmark", "list",
+            "--repository", worktree,
+            "-r", "::@",
+            "-T", r#"name ++ "\n""#,
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
+fn git_branch(worktree: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["-C", worktree, "branch", "--show-current"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 fn cmd_linear_clean() {
@@ -968,12 +1043,26 @@ fn cmd_linear_scan(task: Option<&str>) {
         Some(t) => vec![t.to_string()],
         None => state::ordered_open_slugs(),
     };
+    let not_found: HashSet<String> = cache::read_linear()
+        .not_found
+        .into_iter()
+        .collect();
     let mut total = 0;
     for t in &tasks {
-        let n = scan_task_md_for_keys(t, &s);
-        if n > 0 {
-            eprintln!("[linear] {t}: linked {n} key(s) from md");
-            total += n;
+        let Some(mut record) = s.load_record_by_slug(t) else { continue };
+        let md_n = scan_task_md_for_keys(&mut record, &not_found);
+        let bm_n = scan_worktree_bookmark_for_keys(&mut record, &not_found);
+        if md_n > 0 {
+            eprintln!("[linear] {t}: linked {md_n} key(s) from md");
+            total += md_n;
+        }
+        if bm_n > 0 {
+            eprintln!("[linear] {t}: linked {bm_n} key(s) from bookmark");
+            total += bm_n;
+        }
+        if md_n + bm_n > 0 {
+            record.updated_at = cache::now_epoch();
+            s.save_record(&record);
         }
     }
     if total == 0 {
@@ -1096,14 +1185,23 @@ fn spawn_linear_loop() {
                 }
             };
 
-            // Auto-scan every open task's md file for Linear keys
-            // before fetching, so newly-mentioned keys get linked
-            // without an explicit `orch linear scan`. Idempotent —
-            // scan_task_md_for_keys skips already-linked keys.
+            // Auto-scan every open task's md file and worktree bookmarks
+            // for Linear keys before fetching, so newly-mentioned or
+            // newly-named keys get linked without an explicit
+            // `orch linear scan`. Idempotent.
             let store = store::Store::default();
-            let records = store.load_open_records();
-            for record in &records {
-                scan_task_md_for_keys(&record.slug, &store);
+            let mut records = store.load_open_records();
+            let not_found: HashSet<String> = cache::read_linear()
+                .not_found
+                .into_iter()
+                .collect();
+            for record in records.iter_mut() {
+                let md_n = scan_task_md_for_keys(record, &not_found);
+                let bm_n = scan_worktree_bookmark_for_keys(record, &not_found);
+                if md_n + bm_n > 0 {
+                    record.updated_at = cache::now_epoch();
+                    store.save_record(record);
+                }
             }
 
             // Collect every distinct linear key across open tasks.

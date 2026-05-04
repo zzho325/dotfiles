@@ -22,6 +22,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{self, stdout},
     process::{Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -3040,7 +3041,7 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
             kv_line("  H / L    ", "prev / next hunk (Diff focus only)"),
             kv_line("  r        ", "refresh diff for this PR"),
             kv_line("  o        ", "open PR in browser"),
-            kv_line("  1 / 3 / 4", "exit fullscreen, jump to other tab"),
+            kv_line("  1-9      ", "attach to task #N"),
             kv_line("  q        ", "quit orch"),
             Line::styled(" Position is saved per PR — re-Enter restores cursor + scroll", Style::default().fg(MUTED)),
         ]
@@ -3052,7 +3053,7 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
             kv_line("  q        ", "quit"),
             kv_line("  Tab      ", "toggle list ↔ right"),
             kv_line("  [ / ]    ", "previous / next task (any focus)"),
-            kv_line("  1 2 3 4  ", "Overview · PRs · Linear · Panes"),
+            kv_line("  1-9      ", "attach to task #N"),
             kv_line("  Esc      ", "right → list; list → quit"),
             kv_line("  PgUp/Dn  ", "log scroll  ·  < top  ·  > tail"),
             kv_line("  ?  r  m  ", "help · refresh · message"),
@@ -3255,29 +3256,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 };
             }
         }
-        // Number keys jump to a detail tab and focus right. Switching
-        // *away* from the PR tab while drilled saves the position and
-        // exits fullscreen so the three-pane layout returns.
-        (KeyCode::Char('1'), _) => {
-            save_and_exit_pr_detail(app);
-            app.detail_tab = Tab::Overview;
-            app.focus = Pane::Right;
-        }
-        (KeyCode::Char('2'), _) => {
-            app.detail_tab = Tab::Prs;
-            app.focus = Pane::Right;
-            ensure_pr_cursor(app);
-        }
-        (KeyCode::Char('3'), _) => {
-            save_and_exit_pr_detail(app);
-            app.detail_tab = Tab::Linear;
-            app.focus = Pane::Right;
-            ensure_linear_cursor(app);
-        }
-        (KeyCode::Char('4'), _) => {
-            save_and_exit_pr_detail(app);
-            app.detail_tab = Tab::Panes;
-            app.focus = Pane::Right;
+        // 1-9 → attach to task at that 1-based position (matches the
+        // `#N` rank shown in render_list).
+        (KeyCode::Char(c), _) if ('1'..='9').contains(&c) => {
+            let idx = (c as u8 - b'1') as usize;
+            if let Some(task) = app.tasks.get(idx) {
+                if !task.record.tmux.session_name.is_empty() {
+                    attach_session(&task.record.tmux.session_name);
+                    app.should_quit = true;
+                }
+            }
         }
         (KeyCode::Char('m'), _) => {
             app.message_input = Some(String::new());
@@ -3369,6 +3357,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             if let Some(task) = app.selected_task() {
                 if !task.record.tmux.session_name.is_empty() {
                     attach_session(&task.record.tmux.session_name);
+                    app.should_quit = true;
                 }
             }
         }
@@ -3608,12 +3597,17 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
 /// tab"; Enter always means "act on cursored item".
 fn handle_right_key(app: &mut App, key: KeyEvent) {
     match (app.detail_tab, key.code) {
-        // h/l no-op in PR Detail fullscreen; Esc or 1/3/4 to leave.
+        // h/l no-op in PR Detail fullscreen; Esc to leave.
         (_, KeyCode::Char('h')) | (_, KeyCode::Left) => {
             if !matches!(app.pr_view, PrView::Detail { .. })
                 || app.detail_tab != Tab::Prs
             {
                 app.detail_tab = app.detail_tab.prev();
+                if app.detail_tab == Tab::Prs {
+                    ensure_pr_cursor(app);
+                } else if app.detail_tab == Tab::Linear {
+                    ensure_linear_cursor(app);
+                }
             }
         }
         (_, KeyCode::Char('l')) | (_, KeyCode::Right) => {
@@ -3621,6 +3615,11 @@ fn handle_right_key(app: &mut App, key: KeyEvent) {
                 || app.detail_tab != Tab::Prs
             {
                 app.detail_tab = app.detail_tab.next();
+                if app.detail_tab == Tab::Prs {
+                    ensure_pr_cursor(app);
+                } else if app.detail_tab == Tab::Linear {
+                    ensure_linear_cursor(app);
+                }
             }
         }
         (Tab::Panes, KeyCode::Char('j')) | (Tab::Panes, KeyCode::Down) => {
@@ -3636,6 +3635,7 @@ fn handle_right_key(app: &mut App, key: KeyEvent) {
             if let Some(task) = app.selected_task() {
                 if let Some(pane) = task.panes.get(app.panes_selected) {
                     attach_pane(&pane.session, &pane.id);
+                    app.should_quit = true;
                 }
             }
         }
@@ -4292,32 +4292,86 @@ fn handle_message_input_key(app: &mut App, key: KeyEvent) {
 }
 
 fn attach_session(session: &str) {
-    let actual = match find_actual_session(session) {
-        Some(s) => s,
-        None => return,
-    };
-    let action = if std::env::var("TMUX").is_ok() {
-        "switch-client"
-    } else {
-        "attach-session"
-    };
-    let _ = Command::new("tmux").args([action, "-t", &actual]).status();
+    attach(session, None);
 }
 
 fn attach_pane(session: &str, pane_id: &str) {
-    let actual = match find_actual_session(session) {
-        Some(s) => s,
-        None => return,
-    };
-    // Switch to the session, then select the target pane.
-    let action = if std::env::var("TMUX").is_ok() {
-        "switch-client"
-    } else {
-        "attach-session"
-    };
+    attach(session, Some(pane_id));
+}
+
+fn attach(session: &str, pane_id: Option<&str>) {
+    let Some(actual) = find_actual_session(session) else { return };
+    let in_tmux = std::env::var("TMUX").is_ok();
+    let action = if in_tmux { "switch-client" } else { "attach-session" };
     let _ = Command::new("tmux").args([action, "-t", &actual]).status();
+    if let Some(pane) = pane_id {
+        let _ = Command::new("tmux")
+            .args(["select-pane", "-t", pane])
+            .stderr(Stdio::null())
+            .status();
+    }
+    kill_source_pane();
+}
+
+/// Tmux pane id orch is running in. `$TMUX_PANE` first, then a tty/pane-list
+/// match (some launchers filter env vars). Eagerly warmed in `run()` before
+/// raw mode since the `tty` query needs a normal stdin.
+static SOURCE_PANE: OnceLock<Option<String>> = OnceLock::new();
+
+fn resolve_source_pane() -> Option<String> {
+    if let Ok(p) = std::env::var("TMUX_PANE") {
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
+    // `tty` needs to inherit our stdin (the pty) — Rust's default for
+    // Command::output() is a piped stdin, which would make tty report
+    // "not a tty" and exit 1.
+    let tty_out = Command::new("tty")
+        .stdin(Stdio::inherit())
+        .output()
+        .ok()?;
+    if !tty_out.status.success() {
+        return None;
+    }
+    let our_tty = String::from_utf8_lossy(&tty_out.stdout).trim().to_string();
+    if our_tty.is_empty() {
+        return None;
+    }
+    let panes = Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{pane_id} #{pane_tty}"])
+        .output()
+        .ok()?;
+    if !panes.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&panes.stdout);
+    for line in s.lines() {
+        let mut parts = line.splitn(2, ' ');
+        let id = parts.next()?;
+        let pane_tty = parts.next()?.trim();
+        if pane_tty == our_tty {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+fn source_pane() -> Option<&'static str> {
+    SOURCE_PANE
+        .get_or_init(resolve_source_pane)
+        .as_deref()
+}
+
+// Outside tmux, `attach-session` runs tmux itself as the foreground process.
+// No separate source pane to clean up, so skip.
+fn kill_source_pane() {
+    if std::env::var("TMUX").is_err() {
+        return;
+    }
+    let Some(pane) = source_pane() else { return };
     let _ = Command::new("tmux")
-        .args(["select-pane", "-t", pane_id])
+        .args(["kill-pane", "-t", pane])
         .stderr(Stdio::null())
         .status();
 }
@@ -4396,6 +4450,9 @@ pub fn render_debug(
 // Run loop.
 
 pub fn run() -> io::Result<()> {
+    // Resolve our tmux pane id before raw mode kicks in (tty query needs
+    // a normal stdin handle).
+    let _ = source_pane();
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
@@ -4762,8 +4819,7 @@ mod tests {
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("key bindings"));
         assert!(s.contains("toggle list ↔ right"));
-        assert!(s.contains("1 2 3 4"));
-        assert!(s.contains("Overview"));
+        assert!(s.contains("attach to task #N"));
         assert!(s.contains("Enter on a PR row"));
     }
 
@@ -5035,28 +5091,6 @@ mod tests {
         assert_eq!(app.detail_tab, Tab::Overview); // wrap
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
         assert_eq!(app.detail_tab, Tab::Panes); // wrap back
-    }
-
-    #[test]
-    fn number_keys_jump_to_tab_from_any_focus() {
-        let mut app = test_app();
-        // From List focus
-        app.focus = Pane::List;
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('2')));
-        assert_eq!(app.detail_tab, Tab::Prs);
-        assert_eq!(app.focus, Pane::Right);
-
-        // From Log focus
-        app.focus = Pane::Right;
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('4')));
-        assert_eq!(app.detail_tab, Tab::Panes);
-        assert_eq!(app.focus, Pane::Right);
-
-        // 1 = Overview, 3 = Linear
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('1')));
-        assert_eq!(app.detail_tab, Tab::Overview);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('3')));
-        assert_eq!(app.detail_tab, Tab::Linear);
     }
 
     #[test]
