@@ -3,11 +3,12 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 
+use crate::cache;
 use crate::store::{
-    self, DesiredState, LinkSource, PrLink, Store, TaskRecord,
+    DesiredState, LinkSource, PrLink, Store, TaskRecord,
 };
 
 /// Default age (seconds) past which a busy marker is considered stale.
@@ -358,13 +359,6 @@ pub fn load_tasks(
         .collect()
 }
 
-fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Ensure every `tasks/<name>.md` has a v2 record. Populates
 /// `record.worktree.path` if `$ORCH_REPO/task-<name>` exists on disk.
 /// Does NOT populate `tmux.session_name` — empty session signals
@@ -377,7 +371,7 @@ pub fn ensure_state_files() {
 
     let dir = tasks_dir();
     let repo = std::env::var("ORCH_REPO").ok();
-    let now = epoch_secs();
+    let now = cache::now_epoch();
 
     let known_slugs: HashSet<String> = registry
         .open_order
@@ -536,42 +530,72 @@ pub fn reconcile_prs() {
 }
 
 /// Rewrite `record.links.prs` to reflect the discovered numbers,
-/// preserving Manual-sourced links. Re-loads the record before writing
-/// so concurrent mutations on other fields aren't clobbered.
+/// preserving Manual-sourced links.
 fn update_record_prs(store: &Store, slug: String, discovered: &[u32]) {
-    let Some(mut record) = store.load_record_by_slug(&slug) else {
-        return;
-    };
-    let manual: Vec<PrLink> = record
-        .links
-        .prs
-        .iter()
-        .filter(|p| p.source == LinkSource::Manual)
-        .cloned()
-        .collect();
-    let mut new_prs: Vec<PrLink> = discovered
-        .iter()
-        .map(|&n| PrLink {
-            number: n,
-            source: LinkSource::BranchDiscovery,
-            ..Default::default()
-        })
-        .collect();
-    for m in manual {
-        if !new_prs.iter().any(|p| p.number == m.number) {
-            new_prs.push(m);
+    store.update_record_by_slug(&slug, |record| {
+        let manual: Vec<PrLink> = record
+            .links
+            .prs
+            .iter()
+            .filter(|p| p.source == LinkSource::Manual)
+            .cloned()
+            .collect();
+        let mut new_prs: Vec<PrLink> = discovered
+            .iter()
+            .map(|&n| PrLink {
+                number: n,
+                source: LinkSource::BranchDiscovery,
+                ..Default::default()
+            })
+            .collect();
+        for m in manual {
+            if !new_prs.iter().any(|p| p.number == m.number) {
+                new_prs.push(m);
+            }
         }
+        record.links.prs = new_prs;
+        record.updated_at = cache::now_epoch();
+    });
+}
+
+/// Try `git worktree remove`. If git says "not a working tree" (already
+/// disowned), the directory is a pure orphan with no git state, so
+/// `rm -rf` it. Other errors propagate.
+pub fn remove_worktree(path: &Path) -> Result<(), String> {
+    let repo = std::env::var("ORCH_REPO")
+        .map_err(|_| "ORCH_REPO not set".to_string())?;
+    let main = format!("{repo}/main");
+    let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_string())?;
+    let output = Command::new("git")
+        .args(["worktree", "remove", path_str])
+        .current_dir(&main)
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if output.status.success() {
+        return Ok(());
     }
-    record.links.prs = new_prs;
-    record.updated_at = epoch_secs();
-    store.save_record(&record);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let msg = stderr.trim().to_string();
+
+    if msg.contains("is not a working tree")
+        && !path.join(".git").exists()
+        && !path.join(".jj").exists()
+    {
+        fs::remove_dir_all(path).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    Err(msg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{
-        AttentionInfo, DesiredState, TaskRecord, TmuxInfo, WorktreeInfo,
+        self, AttentionInfo, DesiredState, TaskRecord, TmuxInfo, WorktreeInfo,
     };
 
     fn record_with(session: &str, worktree: &str) -> TaskRecord {

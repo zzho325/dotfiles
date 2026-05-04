@@ -20,9 +20,11 @@ require("fzf-lua").setup({
 	},
 	files = {
 		git_icons = true,
+		formatter = "path.filename_first",
 	},
 	grep = {
 		git_icons = true,
+		formatter = "path.filename_first",
 	},
 	buffers = {
 		formatter = "path.filename_first",

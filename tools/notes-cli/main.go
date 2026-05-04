@@ -129,13 +129,15 @@ func stdinIsPipe() bool {
 	return fi.Mode()&os.ModeCharDevice == 0
 }
 
-// consumeStdinFlag checks for a trailing "-" arg (explicit stdin) or a piped
-// stdin. Returns the remaining args and whether to read stdin.
+// consumeStdinFlag checks for a trailing "-" arg (explicit stdin). Returns
+// the remaining args and whether to read stdin. Stdin is read only when "-"
+// is passed explicitly — auto-detection is avoided so the tool never hangs
+// when invoked from non-TTY environments with an inherited empty pipe.
 func consumeStdinFlag(args []string) ([]string, bool) {
 	if len(args) > 0 && args[len(args)-1] == "-" {
 		return args[:len(args)-1], true
 	}
-	return args, stdinIsPipe()
+	return args, false
 }
 
 // extractBodyFlag extracts a "-b <value>" flag from args, returning the value

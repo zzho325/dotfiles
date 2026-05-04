@@ -10,6 +10,11 @@ alias lg='lazygit'
 alias jjs='jj log -r "::@ ~ ::main" --no-graph'
 
 jj() {
+  # Non-colocated bare repo: fast-forward local main before fetch.
+  if [[ "$1" == "git" && "$2" == "fetch" && -d .jj ]]; then
+    local bare=$(cat .jj/repo/store/git_target 2>/dev/null)
+    [[ -n "$bare" ]] && git -C "$bare" fetch origin main:main 2>/dev/null
+  fi
   command jj "$@"; local rc=$?
   [[ $rc -eq 0 && -d .jj ]] && command jj git export 2>/dev/null
   return $rc
@@ -67,8 +72,7 @@ pr() {
 rebase-main() {
   if [[ -d .jj ]]; then
     jj git fetch
-    jj git export
-    git branch -f main origin/main 2>/dev/null
+    jj bookmark set main -r main@origin 2>/dev/null
     local root
     root=$(jj log -r 'roots(::@ & ~::main)' --no-graph -T 'change_id.shortest()' --limit 1)
     if [[ -z "$root" ]]; then

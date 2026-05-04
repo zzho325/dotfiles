@@ -80,6 +80,11 @@ func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int, changesOnly b
 	var standalone []*funcNode
 	for _, fn := range g.funcs {
 		if !fn.exported {
+			// Include unexported functions as roots if they are
+			// new/modified and not called by any other function.
+			if di != nil && di.classify(fn) != unchanged && !called[fn] {
+				standalone = append(standalone, fn)
+			}
 			continue
 		}
 		if fn.recv != "" && typeHasRoot[fn.recv] {
@@ -206,8 +211,18 @@ func printFuncNode(
 		childPrefix = prefix + "│   "
 	}
 
-	for i, c := range children {
-		last := i == len(children)-1
+	// Deduplicate children: only print each callee once per parent.
+	seen := map[*funcNode]bool{}
+	var unique []callChild
+	for _, c := range children {
+		if !seen[c.fn] {
+			seen[c.fn] = true
+			unique = append(unique, c)
+		}
+	}
+
+	for i, c := range unique {
+		last := i == len(unique)-1
 		printFuncNode(w, c.fn, childPrefix, last, false, groupRecv, adj, di, visited, depth+1, maxDepth, short)
 	}
 }

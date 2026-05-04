@@ -41,6 +41,7 @@ use ratatui::{
     Terminal,
 };
 
+use crate::cache;
 use crate::state::{self, TaskStatus, load_tmux_sessions};
 use crate::store::{self, DesiredState, TaskRecord};
 
@@ -966,8 +967,6 @@ fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskVie
 
 fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
     let focused = app.focus == Pane::Right && app.detail_tab == Tab::Prs;
-    // PrView::Detail is handled by the fullscreen fork at the top of
-    // `render()`. By the time we get here, we're rendering the PR list.
     let cursor_number = match &app.pr_view {
         PrView::List { cursor_number } => *cursor_number,
         PrView::Detail { number, .. } => *number,
@@ -1000,9 +999,7 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
             pr.title.clone()
         };
 
-        // Row 1: cursor + #N + title — with right-aligned state badge for
-        // non-OPEN PRs (so a long branch name on row 2 doesn't get joined
-        // with "merged" on a wrapped line).
+        // State badge right-aligned so a wrapped branch name doesn't merge with it.
         let state_badge: Option<(&str, ratatui::style::Color)> = match pr.state.as_str() {
             "MERGED" => Some(("merged", IRIS)),
             "CLOSED" => Some(("closed", MUTED)),
@@ -1802,10 +1799,8 @@ fn linear_preview_target(app: &App) -> Option<(String, &'static str)> {
     }
 }
 
-/// Full-screen wrapper around `render_pr_detail`. Adds:
-/// - 40-col file list (vs 30 in-pane)
-/// - Toast overlay row above the footer when `app.toast.is_some()`
-///   (toasts normally live in `render_log`, which doesn't run here)
+/// Full-screen `render_pr_detail`: 40-col file list + toast overlay
+/// (since `render_log` doesn't run here).
 fn render_pr_detail_fullscreen(
     frame: &mut Frame,
     area: Rect,
@@ -1959,8 +1954,7 @@ fn render_pr_detail_with_widths(
         Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 },
     );
 
-    // Row 2 — blank gap (replaces the old `─` divider; whitespace and
-    // alignment handle the separation, Linear-flavor).
+    // Row 2 — blank gap.
     let mut body_top: u16 = 3;
 
     // Optional row 3 — stale-diff banner.
@@ -2236,7 +2230,6 @@ fn build_pr_diff_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut hunk_anchors: Vec<u16> = Vec::new();
 
-    // File header — Linear flavor: just the path in TEXT, no `--- a/`.
     lines.push(Line::from(vec![
         Span::raw(" "),
         Span::styled(file.path.clone(), Style::default().fg(TEXT)),
@@ -2285,9 +2278,7 @@ fn build_pr_diff_lines(
         const TAB_WIDTH: usize = 4;
         let tab_replacement = " ".repeat(TAB_WIDTH);
         for line in &hunk.lines {
-            // Linear flavor: glyph carries the color (PINE/LOVE), the
-            // code body stays in TEXT/SUBTLE. Faint row tint so add/del
-            // rows scan at a glance.
+            // Glyph in PINE/LOVE; body stays in TEXT/SUBTLE.
             let (prefix, rest, glyph_color, body_color, bg) =
                 if let Some(rest) = line.strip_prefix('+') {
                     ("+", rest, PINE, TEXT, Some(DIFF_ADD_BG))
@@ -3251,9 +3242,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.show_help = true;
             return;
         }
-        // Two-zone toggle. In PR Detail fullscreen, Tab toggles the
-        // intra-detail Files ↔ Diff focus instead — there's no list
-        // pane to flip to.
+        // In PR Detail: toggle Files ↔ Diff focus. Otherwise: cycle panes.
         (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
             if app.detail_tab == Tab::Prs
                 && matches!(app.pr_view, PrView::Detail { .. })
@@ -3297,9 +3286,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // tasks while staying in a detail tab (Linear, PRs, etc) without
         // needing to Tab/Esc back to the list.
         (KeyCode::Char(']'), _) => {
-            // Inside PR Detail, intercept for next-file navigation
-            // (Option A from notes.md). Outside PR Detail, the global
-            // meaning (next task) takes over.
+            // In PR Detail: next file. Otherwise: next task.
             if app.focus == Pane::Right
                 && app.detail_tab == Tab::Prs
                 && matches!(app.pr_view, PrView::Detail { .. })
@@ -3405,10 +3392,6 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
 /// position updates and the cursor follows the moved task.
 fn reorder_selected(app: &mut App, delta: isize) {
     let store = crate::store::Store::default();
-    if !store.is_authoritative() {
-        app.toast = Some("reorder needs v2 store".into());
-        return;
-    }
     let selected_name = match app.tasks.get(app.selected) {
         Some(t) => t.name.clone(),
         None => return,
@@ -3510,7 +3493,7 @@ fn lifecycle_spawn(name: &str, _session: &str) -> Result<String, String> {
     if !send_ok {
         return Err("tmux send-keys failed".into());
     }
-    let now = epoch_secs();
+    let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.tmux.session_name = session.clone();
         r.worktree.path = work_dir.clone();
@@ -3525,7 +3508,7 @@ fn lifecycle_spawn(name: &str, _session: &str) -> Result<String, String> {
 
 fn lifecycle_resume(name: &str, session: &str) -> Result<String, String> {
     let store = store::Store::default();
-    let now = epoch_secs();
+    let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.desired_state = DesiredState::Active;
         r.updated_at = now;
@@ -3544,7 +3527,7 @@ fn lifecycle_pause(name: &str, session: &str) -> Result<String, String> {
         }
     }
     let store = store::Store::default();
-    let now = epoch_secs();
+    let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.desired_state = DesiredState::Paused;
         r.paused_at = Some(now);
@@ -3560,7 +3543,7 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
     };
     let id = record.id;
     let worktree_path = record.worktree.path.clone();
-    let now = epoch_secs();
+    let now = cache::now_epoch();
     let dir = state::tasks_dir();
     let archive_path = dir.join("done").join(format!("{id}-{name}.md"));
 
@@ -3597,48 +3580,22 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
         }
     }
 
-    // 4. Remove worktree. Capture failures so the toast can surface
-    //    them — a silent close that leaves the worktree behind is
-    //    exactly the orphan-worktree pain point we set out to fix.
-    let mut warning: Option<String> = None;
-    if !worktree_path.is_empty() {
+    // 4. Remove worktree. Surface failures via the toast — a silent
+    //    close that leaves the worktree behind is the orphan-worktree
+    //    pain point we set out to fix.
+    let warning = if worktree_path.is_empty() {
+        None
+    } else {
         let wt = state::expand_home(&worktree_path);
         let path = std::path::Path::new(&wt);
         if path.exists() {
-            let repo = std::env::var("ORCH_REPO").unwrap_or_default();
-            let main = format!("{repo}/main");
-            let output = Command::new("git")
-                .args(["worktree", "remove", &wt])
-                .current_dir(&main)
-                .stderr(Stdio::piped())
-                .output();
-            let removed = match output {
-                Ok(o) if o.status.success() => true,
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    // Disowned dir (no .git inside) — fall back to rm -rf,
-                    // mirroring the behavior of `orch gc`.
-                    if stderr.contains("is not a working tree")
-                        && !path.join(".git").exists()
-                        && !path.join(".jj").exists()
-                    {
-                        std::fs::remove_dir_all(path).is_ok()
-                    } else {
-                        warning = Some(format!(
-                            "worktree {wt} not removed: {}",
-                            stderr.trim().replace('\n', " ")
-                        ));
-                        false
-                    }
-                }
-                Err(e) => {
-                    warning = Some(format!("git worktree remove: {e}"));
-                    false
-                }
-            };
-            let _ = removed;
+            state::remove_worktree(path).err().map(|e| {
+                format!("worktree {wt} not removed: {}", e.replace('\n', " "))
+            })
+        } else {
+            None
         }
-    }
+    };
 
     Ok(match warning {
         None => format!("closed {name}"),
@@ -3646,21 +3603,12 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
     })
 }
 
-fn epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// Right-zone key dispatch. j/k always means "move cursor in active
 /// tab"; Enter always means "act on cursored item".
 fn handle_right_key(app: &mut App, key: KeyEvent) {
     match (app.detail_tab, key.code) {
-        // Tab cycling via h/l is kept as a fallback; numbers are the primary path.
-        // In PR Detail fullscreen, h/l would silently kick the user out of
-        // the drill — make them no-op there. Use Esc to leave or 1/3/4 to
-        // jump explicitly to another tab.
+        // h/l no-op in PR Detail fullscreen; Esc or 1/3/4 to leave.
         (_, KeyCode::Char('h')) | (_, KeyCode::Left) => {
             if !matches!(app.pr_view, PrView::Detail { .. })
                 || app.detail_tab != Tab::Prs

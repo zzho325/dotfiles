@@ -250,11 +250,7 @@ pub fn read_pr_diffs() -> PrDiffCache {
 }
 
 pub fn write_pr_diffs(cache: &PrDiffCache) {
-    let dir = cache_dir();
-    fs::create_dir_all(&dir).ok();
-    if let Ok(json) = serde_json::to_string_pretty(cache) {
-        state::atomic_write(&dir.join("pr_diffs.json"), &json);
-    }
+    write_cache_if_changed("pr_diffs.json", cache);
 }
 
 pub fn read_linear() -> LinearCache {
@@ -266,11 +262,7 @@ pub fn read_linear() -> LinearCache {
 }
 
 pub fn write_linear(cache: &LinearCache) {
-    let dir = cache_dir();
-    fs::create_dir_all(&dir).ok();
-    if let Ok(json) = serde_json::to_string_pretty(cache) {
-        state::atomic_write(&dir.join("linear.json"), &json);
-    }
+    write_cache_if_changed("linear.json", cache);
 }
 
 impl CachedLinear {
@@ -361,20 +353,27 @@ pub fn is_daemon_alive() -> bool {
     age < 10
 }
 
-pub fn write_status(cache: &StatusCache) {
+/// Compact JSON; skip write if file already matches. Hot caches rewrite
+/// every tick — without this, every poll cycle dirties disk.
+fn write_cache_if_changed<T: Serialize>(name: &str, cache: &T) {
     let dir = cache_dir();
     fs::create_dir_all(&dir).ok();
-    if let Ok(json) = serde_json::to_string_pretty(cache) {
-        state::atomic_write(&dir.join("status.json"), &json);
+    let Ok(json) = serde_json::to_string(cache) else { return };
+    let path = dir.join(name);
+    if let Ok(existing) = fs::read_to_string(&path) {
+        if existing == json {
+            return;
+        }
     }
+    state::atomic_write(&path, &json);
+}
+
+pub fn write_status(cache: &StatusCache) {
+    write_cache_if_changed("status.json", cache);
 }
 
 pub fn write_prs(cache: &PrCache) {
-    let dir = cache_dir();
-    fs::create_dir_all(&dir).ok();
-    if let Ok(json) = serde_json::to_string_pretty(cache) {
-        state::atomic_write(&dir.join("prs.json"), &json);
-    }
+    write_cache_if_changed("prs.json", cache);
 }
 
 pub fn write_lease() {

@@ -112,8 +112,12 @@ When the user asks to use codex (e.g. "get codex review", "ask codex",
 - Review: `/codex https://github.com/column/column/pull/25827`
 - Question: `/codex "is this the right approach for X?"`
 
-The skill runs codex, posts review findings as PR comments, and presents
-proposals. **Never auto-fix from codex feedback** — always discuss first.
+After codex returns, write each finding to notes.md with your
+response (agree/disagree/already handled) under each item:
+```
+notes propose "Codex review" -b "1. <finding>\n   → <your response>\n\n2. <finding>\n   → <your response>"
+```
+**Never auto-fix from codex feedback** — always discuss first.
 
 ## Phase 5: Execute
 
@@ -126,9 +130,10 @@ proposals. **Never auto-fix from codex feedback** — always discuss first.
 3. **Commit** — format: `type(area): description` (type = fix/feat/refactor, no
    ticket numbers). Use `jj describe` if jj is initialized, otherwise `git commit`.
 4. **Push** — `git push -u origin <branch>` (or `jj git push`)
-5. **PR** — only when the user is ready. Do NOT rush to create a PR before code
-   is reviewed.
-6. **Review** — address feedback, push fixes
+5. **Propose PR** — after pushing, propose branch, title, and PR description
+   in notes.md. Do NOT create the PR yet.
+6. **PR** — only after the user stamps the proposal. Create with `gh pr create`.
+7. **Review** — address feedback, push fixes
 
 </process>
 
@@ -150,8 +155,29 @@ proposals. **Never auto-fix from codex feedback** — always discuss first.
 Use `notes.md` in the repo root as a shared scratchpad for conclusions, designs,
 and code proposals. Keep it clean — resolve stale threads, don't let Q&A accumulate.
 
-**Use the `notes` CLI** (`~/bin/notes`) for all thread/proposal management.
-Do NOT use Edit tool for resolving threads or cleaning up proposals.
+**NEVER use Edit or Write on `notes.md`. Always use the `notes` CLI
+(`~/bin/notes`) for every interaction with it — creating threads, replying,
+resolving, proposing, stamping, deleting, cleanup.** The CLI enforces structure
+the Edit tool will silently break. If a command you need doesn't exist, tell
+the user — do not fall back to Edit.
+
+**Write concisely, prefer visuals. The user has trouble reading long text.**
+Every thread, proposal, or reply should be as short as the content allows — no
+filler, no producty framing, no "here's what I'll do" preamble. Use any visual
+form that makes the content faster to parse than prose:
+
+- Tables for comparisons, before/after, field mappings, status summaries
+- ASCII trees for call graphs, file layouts, test plans
+- Flow/state diagrams for control flow, state machines, decision logic
+- Sequence/ladder diagrams for request flows, interactions
+- Fenced code blocks for diffs, EXPLAIN output, signatures
+- Bullet lists over paragraphs
+
+If you catch yourself writing more than 2-3 sentences of prose to explain
+something, stop and ask whether a table, diagram, or diff block would convey it
+more clearly. Pick whichever visual form fits — don't default to one.
+
+Command reference:
 
 ```
 notes wip                # list WIP threads
@@ -226,6 +252,7 @@ full reference on bookmarks, stacked PRs, absorb, and rebase workflows.
 <rules>
 
 - **NEVER write, edit, or create files under `~/tasks/`.** The orchestrator is the sole writer to task files.
+- **NEVER use Edit or Write on `notes.md`.** Always use the `notes` CLI for every notes.md interaction, no exceptions.
 - If you're stuck or need input, surface it in notes.md (interactive) or `orch -` (autonomous).
 - Never spawn other `claude` processes.
 - Do the work. You are a worker, not a coordinator.

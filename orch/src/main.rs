@@ -140,16 +140,17 @@ enum Cmd {
     /// Garbage-collect orphan worktrees: list `task-*` worktrees under
     /// `$ORCH_REPO` whose `~/tasks/<name>.md` is gone, prompt to remove.
     Gc,
-    /// Close a task: kill tmux, archive .md to done/, remove worktree.
+    /// Close a task: kill tmux, archive .md to done/, remove worktree
+    /// (unless `--keep-worktree`).
     Close {
         /// Task name (e.g. foo for ~/tasks/foo.md)
         name: String,
+        /// Keep the git worktree on disk (overrides cleanup_on_close).
+        #[arg(long)]
+        keep_worktree: bool,
     },
-    /// Internal — Claude Code hook entry points for busy-marker writes.
-    /// `orch busy start` (called from UserPromptSubmit) reads
-    /// `{session_id, cwd}` JSON on stdin and writes a marker file.
-    /// `orch busy stop` (called from Stop / SessionEnd) removes it.
-    /// Writes are atomic so `is_worktree_busy` never sees partial JSON.
+    /// Internal — Claude Code busy-marker hooks. Reads
+    /// `{session_id, cwd}` JSON on stdin.
     Busy {
         #[command(subcommand)]
         action: BusyAction,
@@ -564,7 +565,7 @@ fn cmd_spawn(name: &str) {
         return;
     }
 
-    let now = epoch_secs();
+    let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.tmux.session_name = session.clone();
         r.worktree.path = work_dir.clone();
@@ -592,7 +593,7 @@ fn cmd_pause(name: &str) {
                 .status();
         }
     }
-    let now = epoch_secs();
+    let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.desired_state = store::DesiredState::Paused;
         r.paused_at = Some(now);
@@ -620,7 +621,7 @@ fn find_actual_session(expected: &str) -> Option<String> {
 
 fn cmd_resume(name: &str) {
     let store = store::Store::default();
-    let now = epoch_secs();
+    let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.desired_state = store::DesiredState::Active;
         r.updated_at = now;
@@ -668,51 +669,10 @@ fn find_orphan_worktrees() -> Vec<PathBuf> {
     orphans
 }
 
-/// Remove a worktree. First tries `git worktree remove`. If git says
-/// "not a working tree" (already disowned — common after a partial
-/// cleanup), the directory is a pure orphan with no git state, so we
-/// `rm -rf` it. Other errors (notably "contains modified or untracked
-/// files") propagate so the caller can warn the user.
-fn remove_worktree(path: &Path) -> Result<(), String> {
-    let repo = std::env::var("ORCH_REPO")
-        .map_err(|_| "ORCH_REPO not set".to_string())?;
-    let main = format!("{repo}/main");
-    let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_string())?;
-    let output = Command::new("git")
-        .args(["worktree", "remove", path_str])
-        .current_dir(&main)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let msg = stderr.trim().to_string();
-
-    // Disowned worktree: git no longer tracks it, no .git/.jj inside.
-    // Safe to delete the orphan directory.
-    if msg.contains("is not a working tree")
-        && !path.join(".git").exists()
-        && !path.join(".jj").exists()
-    {
-        fs::remove_dir_all(path).map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-
-    Err(msg)
-}
-
-/// Close a task. Persists `desired_state=Closed` and moves the id from
-/// `Registry.open_order` to `closed_order` first, then runs destructive
-/// cleanup (tmux kill, .md archive, worktree remove).
-///
-/// Archive failure aborts the cleanup — the only durable handle to the
-/// task's history is its markdown file. tmux/worktree failures warn but
-/// don't roll back the FSM (drift flags surface those cases).
-fn cmd_close(name: &str) {
+/// Close a task. FSM transition runs first; archive failure aborts the
+/// rest of cleanup since the .md is the only durable history. tmux and
+/// worktree failures warn but don't roll back.
+fn cmd_close(name: &str, keep_worktree: bool) {
     let store = store::Store::default();
     let Some(record) = store.load_record_by_slug(name) else {
         eprintln!("[close] no task '{name}'");
@@ -723,12 +683,11 @@ fn cmd_close(name: &str) {
     let worktree_path = record.worktree.path.clone();
     let cleanup_on_close = record.worktree.cleanup_on_close;
     let id = record.id;
-    let now = epoch_secs();
+    let now = cache::now_epoch();
     let archive_path = state::tasks_dir()
         .join("done")
         .join(format!("{id}-{name}.md"));
 
-    // 1. FSM transition.
     store.update_record_by_slug(name, |r| {
         r.desired_state = store::DesiredState::Closed;
         r.closed_at = Some(now);
@@ -743,8 +702,8 @@ fn cmd_close(name: &str) {
         store.save_registry(&registry);
     }
 
-    // 2. Archive .md to done/. ABORT on failure — the rest of cleanup
-    //    is destructive and we'd lose history.
+    // Archive .md before destructive cleanup — the .md is the only
+    // durable handle to the task's history.
     let dir = state::tasks_dir();
     let md = dir.join(format!("{name}.md"));
     if md.exists() {
@@ -761,7 +720,6 @@ fn cmd_close(name: &str) {
         eprintln!("[close] archived {} -> {}", md.display(), archive_path.display());
     }
 
-    // 3. Kill tmux.
     if !session_name.is_empty() {
         if let Some(actual) = find_actual_session(&session_name) {
             let killed = Command::new("tmux")
@@ -777,12 +735,11 @@ fn cmd_close(name: &str) {
         }
     }
 
-    // 4. Remove worktree if cleanup_on_close is true (default).
-    if cleanup_on_close && !worktree_path.is_empty() {
+    if !keep_worktree && cleanup_on_close && !worktree_path.is_empty() {
         let wt = state::expand_home(&worktree_path);
         let path = Path::new(&wt);
         if path.exists() {
-            match remove_worktree(path) {
+            match state::remove_worktree(path) {
                 Ok(()) => eprintln!("[close] removed worktree {wt}"),
                 Err(e) => eprintln!(
                     "[close] WARNING: worktree {wt} not removed ({e})\n  run `git worktree remove --force {wt}` to override",
@@ -794,14 +751,9 @@ fn cmd_close(name: &str) {
     eprintln!("[close] {name} closed");
 }
 
-// Busy-marker hooks. Called from Claude Code's UserPromptSubmit / Stop
-// hooks via `orch busy {start,stop}`. Reads `{session_id, cwd}` JSON on
-// stdin and writes/removes a marker at $XDG_RUNTIME_DIR/orch/busy/<sid>.
-// `is_worktree_busy` reads these markers to derive TaskStatus::Working.
-//
-// Failures here are silent: the hook fires on every prompt and partial
-// stdin / missing fields shouldn't surface to the user. ORCH_HOOK_DEBUG
-// in the environment routes diagnostics to stderr.
+// Busy-marker hooks. Failures are silent — the hook fires on every
+// prompt and partial stdin shouldn't surface to the user.
+// ORCH_HOOK_DEBUG routes diagnostics to stderr.
 
 fn parse_busy_input(json: &str) -> Option<(String, String)> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -822,7 +774,7 @@ fn write_busy_marker(busy_dir: &Path, session_id: &str, cwd: &str) -> bool {
     // the marker file's mtime, not this field.
     let payload = serde_json::json!({
         "cwd": cwd,
-        "started_at": epoch_secs(),
+        "started_at": cache::now_epoch(),
         "pid": std::process::id(),
     });
     state::atomic_write(&path, &payload.to_string())
@@ -889,7 +841,7 @@ fn cmd_linear_add(task: &str, key: &str) {
         source: store::LinkSource::Manual,
         last_verified_at: None,
     });
-    record.updated_at = epoch_secs();
+    record.updated_at = cache::now_epoch();
     s.save_record(&record);
     eprintln!("[linear] linked {key} to {task}");
 }
@@ -906,7 +858,7 @@ fn cmd_linear_rm(task: &str, key: &str) {
         eprintln!("[linear] {key} not linked to {task}");
         return;
     }
-    record.updated_at = epoch_secs();
+    record.updated_at = cache::now_epoch();
     s.save_record(&record);
     eprintln!("[linear] unlinked {key} from {task}");
 }
@@ -967,7 +919,7 @@ fn scan_task_md_for_keys(task: &str, store: &store::Store) -> usize {
         added += 1;
     }
     if added > 0 {
-        record.updated_at = epoch_secs();
+        record.updated_at = cache::now_epoch();
         store.save_record(&record);
     }
     added
@@ -998,7 +950,7 @@ fn cmd_linear_clean() {
         record.links.linear_issues.retain(|li| !bad.contains(&li.key));
         let removed = before - record.links.linear_issues.len();
         if removed > 0 {
-            record.updated_at = epoch_secs();
+            record.updated_at = cache::now_epoch();
             s.save_record(&record);
             tasks_touched += 1;
             total_removed += removed;
@@ -1029,13 +981,6 @@ fn cmd_linear_scan(task: Option<&str>) {
     }
 }
 
-fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn cmd_gc() {
     let orphans = find_orphan_worktrees();
     if orphans.is_empty() {
@@ -1061,7 +1006,7 @@ fn cmd_gc() {
     }
 
     for path in orphans {
-        match remove_worktree(&path) {
+        match state::remove_worktree(&path) {
             Ok(()) => eprintln!("[gc] removed {}", path.display()),
             Err(e) => eprintln!(
                 "[gc] failed to remove {} ({e}); run `git worktree remove --force {}` to override",
@@ -1194,12 +1139,7 @@ fn spawn_linear_loop() {
                     &mut hard_failures,
                 );
             }
-            // Fetch each sub-issue as a top-level entry so previews and
-            // drill views see the full record (description, project, age).
-            // BFS through depth — a fetched sub-issue may itself have
-            // children we want (linked issue → child epic → grandchild).
-            // Bounded at depth 5 to keep cycles fast on deeply-nested
-            // hierarchies.
+            // BFS sub-issues as top-level entries up to depth 5.
             let mut depth = 0u32;
             loop {
                 let candidates: Vec<String> = cached_issues
@@ -1245,10 +1185,7 @@ fn spawn_linear_loop() {
     });
 }
 
-/// Fetch one Linear key into the cache. Updates `cached_issues`,
-/// `not_found`, or `hard_failures` based on the API response. The
-/// rate-limit budget for the linear loop is one call per non-cached
-/// key per refresh cycle (every 120s).
+/// Fetch one Linear key into the cache.
 fn fetch_into_cache(
     api_key: &str,
     key: &str,
@@ -1256,10 +1193,7 @@ fn fetch_into_cache(
     not_found: &mut Vec<String>,
     hard_failures: &mut u32,
 ) {
-    // Linear's GraphQL endpoint occasionally 502s — single retry with
-    // a short delay rescues most transient failures. Without this, the
-    // first failure of a cycle silently dropped subsequent issues from
-    // the cache (silent because `hard_failures > 1` muted the logs).
+    // Single retry rescues 502s.
     let mut last_err: Option<String> = None;
     for attempt in 0..2 {
         match linear::fetch_issue(api_key, key) {
@@ -1345,10 +1279,8 @@ fn cmd_daemon() {
 
     runs::prune_old_runs();
 
-    // v2 store migration. Runs at most once per environment — once
-    // store.version=v2 exists, this short-circuits. Crashed prior runs
-    // leave a tmp dir that gets discarded and retried. Failure here
-    // exits the daemon; v2 is the only authoritative store.
+    // Idempotent after first success — short-circuits on store.version=v2.
+    // Failure exits the daemon.
     let store = store::Store::default();
     match store.migrate_from_legacy(&state::tasks_dir()) {
         Ok(0) => {}
@@ -1486,7 +1418,7 @@ fn main() {
             eprintln!("[orch] message sent");
         }
         Some(Cmd::Gc) => cmd_gc(),
-        Some(Cmd::Close { name }) => cmd_close(&name),
+        Some(Cmd::Close { name, keep_worktree }) => cmd_close(&name, keep_worktree),
         Some(Cmd::Busy { action }) => match action {
             BusyAction::Start => cmd_busy_start(),
             BusyAction::Stop => cmd_busy_stop(),
@@ -1520,7 +1452,7 @@ fn main() {
                     eprintln!("[orch] PR #{number} already in {task}");
                     return;
                 }
-                let now = epoch_secs();
+                let now = cache::now_epoch();
                 let updated = store.update_record_by_slug(&task, |r| {
                     r.links.prs.push(store::PrLink {
                         number,
@@ -1537,7 +1469,7 @@ fn main() {
             }
             PrAction::Rm { task, number } => {
                 let store = store::Store::default();
-                let now = epoch_secs();
+                let now = cache::now_epoch();
                 let updated = store.update_record_by_slug(&task, |r| {
                     r.links.prs.retain(|p| p.number != number);
                     r.updated_at = now;

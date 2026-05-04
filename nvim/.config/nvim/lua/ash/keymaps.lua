@@ -4,6 +4,9 @@ local term_opts = { silent = true }
 -- Shorten function name
 local keymap = vim.keymap.set
 
+-- Abbreviations
+vim.cmd("iabbrev fixm FIXME:")
+
 -- Remap space as leader key
 keymap("", "<Space>", "<Nop>", opts)
 vim.g.mapleader = " "
@@ -80,6 +83,9 @@ keymap("t", "<C-j>", "<C-\\><C-N><C-w>j", term_opts)
 keymap("t", "<C-k>", "<C-\\><C-N><C-w>k", term_opts)
 keymap("t", "<C-l>", "<C-\\><C-N><C-w>l", term_opts)
 
+-- Tabs --
+keymap("n", "<leader>tc", ":tabclose<CR>", opts)
+
 -- Nvim-Tree --
 keymap("n", "<leader>e", ":NvimTreeToggle<CR>", opts)
 keymap("n", "<leader>ef", ":NvimTreeFindFile<CR>", opts)
@@ -134,46 +140,76 @@ if ok then
 	keymap("n", "<leader>fh", fzf.help_tags, { desc = "fzf help" })
 	keymap("n", "<leader>gs", fzf.git_status, { desc = "fzf git status" })
 	keymap("n", "<leader>gc", fzf.git_stash, { desc = "fzf git stash" })
-	keymap("n", "<leader>jb", function()
-		fzf.fzf_exec(
-			"jj log -r '::@ ~ ::main' --no-graph"
-				.. " -T 'if(local_bookmarks, local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\")'",
-			{
-				prompt = "jj bookmark> ",
-				preview = "jj diff -r {} --git --color=always",
-				fzf_opts = { ["--preview-window"] = "right,70%" },
-				actions = {
-					["default"] = function(selected)
-						vim.cmd("DiffviewOpen " .. selected[1] .. "^!")
-					end,
-					["ctrl-v"] = function(selected)
-						vim.cmd("DiffviewOpen main.." .. selected[1])
-					end,
-				},
-			}
-		)
-	end, { desc = "jj bookmark diffview" })
+
+	-- jj: open DiffviewOpen for a change by resolving parent..commit IDs.
+	local jj_dv_rev = nil
+	local function jj_diffview(rev)
+		local parent = vim.fn.systemlist(
+			"jj log -r '" .. rev .. "-' --no-graph -T commit_id --limit 1 2>/dev/null"
+		)[1]
+		local commit = vim.fn.systemlist(
+			"jj log -r '" .. rev .. "' --no-graph -T commit_id --limit 1 2>/dev/null"
+		)[1]
+		if parent and commit then
+			vim.cmd("DiffviewOpen " .. parent .. ".." .. commit)
+			jj_dv_rev = rev
+		end
+	end
+
+	-- Extract change ID (first field) from fzf selection.
+	local function jj_change_id(selected)
+		return selected[1]:match("^(%S+)")
+	end
+
+	-- jj stack: hidden change_id, then bookmark + description for display.
+	-- Field 1 (hidden) = change_id, Field 2+ = visible label.
+	local jj_stack_cmd = "jj log -r '::@ ~ ::main' --no-graph"
+		.. [[ -T 'change_id.shortest() ++ "\t"]]
+		.. [[ ++ if(local_bookmarks, local_bookmarks.map(|b| b.name()).join(" ") ++ " ", "")]]
+		.. [[ ++ if(description, description.first_line(), "(no description " ++ change_id.shortest() ++ ")")]]
+		.. [[ ++ "\n"']]
+	local jj_stack_fzf = {
+		["--delimiter"] = "\t",
+		["--with-nth"] = "2..",
+		["--preview-window"] = "right,70%",
+	}
+
 	keymap("n", "<leader>jr", function()
-		fzf.fzf_exec(
-			"jj log -r '::@ ~ ::main' --no-graph"
-				.. " -T 'if(local_bookmarks, local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\")'",
-			{
-				prompt = "jj review> ",
-				preview = "git diff --name-only main...{} 2>/dev/null"
-					.. " | grep '\\.go$'"
-					.. " | xargs -I@ dirname @"
-					.. " | sort -u"
-					.. " | sed 's|^|./|; s|$|/...|'"
-					.. " | xargs goreview --diff main --changes-only --depth 4 --short 2>&1",
-				fzf_opts = { ["--preview-window"] = "right,70%" },
-				actions = {
-					["default"] = function(selected)
-						vim.cmd("DiffviewOpen " .. selected[1] .. "^!")
-					end,
-				},
-			}
-		)
-	end, { desc = "jj bookmark goreview" })
+		if not jj_dv_rev then return end
+		local buf = vim.api.nvim_get_current_buf()
+		local ft = vim.bo[buf].filetype
+		if not ft:match("^Diffview") then return end
+		vim.cmd("DiffviewClose")
+		jj_diffview(jj_dv_rev)
+	end, { desc = "refresh jj diffview" })
+
+
+	keymap("n", "<leader>jb", function()
+		fzf.fzf_exec(jj_stack_cmd, {
+			prompt = "jj change> ",
+			preview = "jj diff -r {1} --git --color=always",
+			fzf_opts = jj_stack_fzf,
+			actions = {
+				["default"] = function(selected) jj_diffview(jj_change_id(selected)) end,
+			},
+		})
+	end, { desc = "jj stack diffview" })
+	keymap("n", "<leader>jg", function()
+		fzf.fzf_exec(jj_stack_cmd, {
+			prompt = "jj review> ",
+			preview = "jj diff -r {1} --git --color=never"
+				.. " | grep '^diff --git' | sed 's|.*b/||'"
+				.. " | grep '\\.go$'"
+				.. " | xargs -I@ dirname @"
+				.. " | sort -u"
+				.. " | sed 's|^|./|; s|$|/...|'"
+				.. " | xargs goreview --diff main --changes-only --depth 4 --short 2>&1",
+			fzf_opts = jj_stack_fzf,
+			actions = {
+				["default"] = function(selected) jj_diffview(jj_change_id(selected)) end,
+			},
+		})
+	end, { desc = "jj stack goreview" })
 end
 
 -- Github --
