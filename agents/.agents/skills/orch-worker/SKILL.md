@@ -31,28 +31,15 @@ Read the task file, understand what's being asked, check for resume state, and e
 
 ## Phase 2: Worktree Setup
 
-**Check before exploring any code.**
+The orchestrator pre-creates a worktree and spawns you inside it. Trust the
+contract; don't run `git`/`wt` yourself to create one. If `pwd` is somehow
+`$ORCH_REPO/main` or otherwise wrong, surface it via notes.md (interactive)
+or `orch -` (autonomous); don't paper over it.
 
-The orchestrator pre-creates a worktree before spawning you. If `pwd` is NOT
-`$ORCH_REPO/main`, you're already in one — skip creation. If `pwd` IS
-`$ORCH_REPO/main` (fallback), create one:
-
-```bash
-git -C $ORCH_REPO/main pull --ff-only
-wt switch --create <feature-name> -y -C $ORCH_REPO
-cd $ORCH_REPO/<feature-name>
-```
-
-If the user invokes you interactively and is already in a worktree, **use it** —
-don't create a new one. Check `git branch --show-current` and `pwd` before
-creating anything.
-
-If implementing against a ticket, create a branch:
-`git checkout -b ashley/ENG-<number>-<short-desc>` (or use jj bookmarks if the
-worktree has jj initialized).
-
-Report the worktree path immediately (autonomous mode:
-`orch - 'task-foo: worktree <pwd>'`).
+When making a bookmark for a task that has a Linear ticket, name it
+`ashley/ENG-<number>-<short-desc>`. Orch's auto-scan reads bookmark names on
+the worktree's stack and links the ticket; you don't need to run
+`orch linear add`.
 
 ## Phase 3: Gather Context & Determine Mode
 
@@ -127,9 +114,9 @@ notes propose "Codex review" -b "1. <finding>\n   → <your response>\n\n2. <fin
    - `golangci-lint run --allow-parallel-runners ./affected/packages/...`
    - `ENV=test go test -v ./affected/packages/... -run '^TestName$' -count=1`
    Record results in notes.md.
-3. **Commit** — format: `type(area): description` (type = fix/feat/refactor, no
-   ticket numbers). Use `jj describe` if jj is initialized, otherwise `git commit`.
-4. **Push** — `git push -u origin <branch>` (or `jj git push`)
+3. **Commit** — `jj describe` with format `type(area): description`
+   (type = fix/feat/refactor, no ticket numbers).
+4. **Push** — `jj git push`
 5. **Propose PR** — after pushing, propose branch, title, and PR description
    in notes.md. Do NOT create the PR yet.
 6. **PR** — only after the user stamps the proposal. Create with `gh pr create`.
