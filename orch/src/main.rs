@@ -971,11 +971,15 @@ fn jj_bookmarks(worktree: &str) -> Option<Vec<String>> {
     if !Path::new(worktree).join(".jj").exists() {
         return None;
     }
+    // `trunk()..@` = bookmarks on this worktree's stack, excluding
+    // anything reachable from trunk. Without the exclusion, `::@`
+    // walks all of main's history and pulls in every bookmark in
+    // the repo (e.g. `task-review-25597`, `task-app-triage-2`).
     let out = Command::new("jj")
         .args([
             "bookmark", "list",
             "--repository", worktree,
-            "-r", "::@",
+            "-r", "trunk()..@",
             "-T", r#"name ++ "\n""#,
         ])
         .stderr(Stdio::null())
