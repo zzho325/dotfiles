@@ -487,7 +487,7 @@ fn panes_for_session(session: &str) -> Vec<TmuxPaneInfo> {
     };
     let output = Command::new("tmux")
         .args([
-            "list-panes", "-t", &actual, "-F",
+            "list-panes", "-s", "-t", &actual, "-F",
             "#{pane_id}|#{session_name}|#{pane_current_command}|#{pane_active}",
         ])
         .stderr(Stdio::null())
@@ -3347,13 +3347,14 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             app.panes_selected = 0;
             reset_linear_cursor_for_new_task(app);
         }
-        // Cycle the right-zone tab without leaving list focus, so you
-        // can preview a task's PRs/Linear/Panes while keeping j/k on
-        // the list. PR-detail fullscreen still owns h/l (Esc to leave).
+        // Cycle the right-zone tab and move focus there, so j/k routes
+        // to the tab's items. Tab/Esc returns to list focus.
+        // PR-detail fullscreen still owns h/l (Esc to leave).
         KeyCode::Char('h') | KeyCode::Left
             if !matches!(app.pr_view, PrView::Detail { .. }) =>
         {
             app.detail_tab = app.detail_tab.prev();
+            app.focus = Pane::Right;
             if app.detail_tab == Tab::Prs {
                 ensure_pr_cursor(app);
             } else if app.detail_tab == Tab::Linear {
@@ -3364,6 +3365,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             if !matches!(app.pr_view, PrView::Detail { .. }) =>
         {
             app.detail_tab = app.detail_tab.next();
+            app.focus = Pane::Right;
             if app.detail_tab == Tab::Prs {
                 ensure_pr_cursor(app);
             } else if app.detail_tab == Tab::Linear {
