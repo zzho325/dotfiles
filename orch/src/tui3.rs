@@ -194,8 +194,9 @@ pub enum LinearView {
         pinned: HashSet<String>,
     },
     Detail {
-        /// Drill stack — `last()` is the currently shown issue.
-        /// `pop()` walks back; empty stack means we're done with detail.
+        /// Drill stack — `last()` is the currently shown issue, `[0]` is
+        /// the key the user drilled in from (restored on Esc).
+        /// `u` walks up to the parent. Esc returns to List.
         stack: Vec<String>,
         /// Cursor index into the rendered detail-view sub-issue list
         /// (sub-issues only — parent/project/url use dedicated keys).
@@ -307,6 +308,9 @@ impl App {
             toast: None,
             readonly: false,
         };
+        if let Some(idx) = current_task_index(&app.tasks) {
+            app.selected = idx;
+        }
         app.open_latest_run();
         app
     }
@@ -460,6 +464,46 @@ impl App {
     pub fn selected_task(&self) -> Option<&TaskView> {
         self.tasks.get(self.selected)
     }
+}
+
+/// Pick the task that matches the user's current working context, so
+/// launching `orch tui` from inside a task worktree (or via a tmux popup
+/// that inherits the surrounding pane's CWD) lands on that task. Tries
+/// CWD prefix first; falls back to the user's attached tmux client's
+/// current session (works inside popups since `client_session` reflects
+/// the user's main view, not the popup's pane).
+fn current_task_index(tasks: &[TaskView]) -> Option<usize> {
+    if let Some(cwd) = std::env::current_dir().ok().and_then(|p| p.canonicalize().ok()) {
+        for (i, task) in tasks.iter().enumerate() {
+            let wt = state::expand_home(&task.record.worktree.path);
+            if wt.is_empty() {
+                continue;
+            }
+            if let Ok(canon) = std::path::Path::new(&wt).canonicalize() {
+                if cwd.starts_with(&canon) {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    if std::env::var("TMUX").is_ok() {
+        if let Ok(out) = Command::new("tmux")
+            .args(["display-message", "-p", "#{client_session}"])
+            .output()
+        {
+            if out.status.success() {
+                let session = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !session.is_empty() {
+                    for (i, task) in tasks.iter().enumerate() {
+                        if state::session_matches(&session, &task.record.tmux.session_name) {
+                            return Some(i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn status_from_str(s: &str) -> TaskStatus {
@@ -1103,7 +1147,7 @@ fn render_tab_linear(frame: &mut Frame, area: Rect, app: &mut App, task: &TaskVi
     let cache = crate::cache::read_linear();
     let focused = app.focus == Pane::Right && app.detail_tab == Tab::Linear;
     match &app.linear_view {
-        LinearView::Detail { stack, sub_cursor } if !stack.is_empty() => {
+        LinearView::Detail { stack, sub_cursor, .. } if !stack.is_empty() => {
             let stack = stack.clone();
             let sub_cursor = *sub_cursor;
             render_linear_detail(frame, area, &stack, sub_cursor, &cache, focused);
@@ -1144,7 +1188,9 @@ fn render_tab_linear(frame: &mut Frame, area: Rect, app: &mut App, task: &TaskVi
 enum RowKind {
     ProjectHeader,
     Parent { collapsed_subs: usize },
-    SubIssue { is_last: bool },
+    /// `branch[i]` = "ancestor at depth i+1 was last among its siblings".
+    /// `branch.last()` = is_last for the row itself. `branch.len()` = depth.
+    SubIssue { branch: Vec<bool> },
     MoreMarker,
 }
 
@@ -1302,31 +1348,59 @@ fn build_linear_rows(
         });
 
         if n_children > 0 {
-            // Sub-issues filtered by the same is_mine rule as top-level.
-            let visible_children: Vec<_> = cached
-                .unwrap()
-                .children
-                .iter()
-                .filter(|ch| is_mine(&ch.assignee, &me))
-                .collect();
-            let n_visible = visible_children.len();
-            for (i, child) in visible_children.iter().enumerate() {
-                rows.push(ListRow {
-                    key: child.identifier.clone(),
-                    kind: RowKind::SubIssue {
-                        is_last: i + 1 == n_visible,
-                    },
-                    title: child.title.clone(),
-                    state_kind: child.state_kind.clone(),
-                    state_name: child.state.clone(),
-                    project_for_strip: project_name.clone(),
-                    not_found: false,
-                });
-            }
+            append_subissue_rows(
+                &mut rows,
+                &cached.unwrap().children,
+                &project_name,
+                cache,
+                &me,
+                &[],
+            );
         }
     }
 
     rows
+}
+
+/// Recursively append sub-issues (and their sub-issues, via the BFS-cached
+/// top-level entries) to the row stream. Filtered by the same `is_mine`
+/// rule as top-level. Recursion bottoms out when a sub-issue isn't in the
+/// cache or has no children.
+fn append_subissue_rows(
+    rows: &mut Vec<ListRow>,
+    children: &[crate::cache::CachedChild],
+    project_name: &str,
+    cache: &crate::cache::LinearCache,
+    me: &str,
+    parents_last: &[bool],
+) {
+    let visible: Vec<_> = children.iter().filter(|ch| is_mine(&ch.assignee, me)).collect();
+    let n = visible.len();
+    for (i, child) in visible.iter().enumerate() {
+        let mut branch = parents_last.to_vec();
+        branch.push(i + 1 == n);
+        rows.push(ListRow {
+            key: child.identifier.clone(),
+            kind: RowKind::SubIssue { branch: branch.clone() },
+            title: child.title.clone(),
+            state_kind: child.state_kind.clone(),
+            state_name: child.state.clone(),
+            project_for_strip: project_name.to_string(),
+            not_found: false,
+        });
+        if let Some(sub_cached) = cache.issues.get(&child.identifier) {
+            if !sub_cached.children.is_empty() {
+                append_subissue_rows(
+                    rows,
+                    &sub_cached.children,
+                    project_name,
+                    cache,
+                    me,
+                    &branch,
+                );
+            }
+        }
+    }
 }
 
 /// Strip a leading `[Project]` prefix from a title when it matches the
@@ -1454,19 +1528,27 @@ fn render_linear_list(
                 ));
                 last_was_header = false;
             }
-            RowKind::SubIssue { is_last } => {
+            RowKind::SubIssue { branch } => {
                 let selected = focused && row.key == cursor_key;
-                // Sub-issues indented 4 cells deeper than parents so
-                // the hierarchy reads at a glance (parent key column 3,
-                // sub-issue key column 7).
-                let last = *is_last;
-                let prefix = if selected {
-                    "     ▸ "
-                } else if last {
-                    "     └ "
+                // `│` continues an ancestor's vertical line when that
+                // ancestor has more siblings below; spaces otherwise.
+                // Row's own depth gets └ (last) / │ (more) / ▸ (cursor).
+                let self_is_last = *branch.last().expect("SubIssue rows have non-empty branch");
+                let self_glyph = if selected {
+                    '▸'
+                } else if self_is_last {
+                    '└'
                 } else {
-                    "     │ "
+                    '│'
                 };
+                let mut prefix = String::from(" ");
+                for ancestor_last in &branch[..branch.len() - 1] {
+                    prefix.push_str("    ");
+                    prefix.push(if *ancestor_last { ' ' } else { '│' });
+                }
+                prefix.push_str("    ");
+                prefix.push(self_glyph);
+                prefix.push(' ');
                 let prefix_color = if selected {
                     LOVE
                 } else {
@@ -1476,7 +1558,7 @@ fn render_linear_list(
                 let glyph = state_glyph(&row.state_kind);
                 let title = strip_project_prefix(&row.title, &row.project_for_strip);
                 lines.push(compose_row(
-                    prefix,
+                    &prefix,
                     prefix_color,
                     &row.key,
                     glyph,
@@ -1700,10 +1782,8 @@ fn render_linear_detail(
     let kid_block_reserved: usize = if n_children == 0 {
         0
     } else {
-        // blank + "Sub-issues (N)" header + up to 3 rows + optional "and N more"
-        let visible = n_children.min(3);
-        let overflow = if n_children > 3 { 1 } else { 0 };
-        2 + visible + overflow
+        // blank + "Sub-issues (N)" header + N rows
+        2 + n_children
     };
     let desc_budget = (area.height as usize)
         .saturating_sub(used + footer_reserved + kid_block_reserved);
@@ -1743,7 +1823,7 @@ fn render_linear_detail(
             format!(" Sub-issues ({n_children})"),
             Style::default().fg(MUTED),
         ));
-        for (i, child) in c.children.iter().take(3).enumerate() {
+        for (i, child) in c.children.iter().enumerate() {
             let selected = i == sub_cursor;
             let cursor = if selected && focused { "▸ " } else { "  " };
             let cursor_color = if selected && focused { LOVE } else { MUTED };
@@ -1764,12 +1844,6 @@ fn render_linear_detail(
                 Span::styled(child.title.clone(), style),
             ]));
         }
-        if c.children.len() > 3 {
-            lines.push(Line::styled(
-                format!(" … and {} more", c.children.len() - 3),
-                Style::default().fg(MUTED),
-            ));
-        }
     }
 
     // Footer
@@ -1788,13 +1862,19 @@ fn render_linear_detail(
 /// log pane renders that issue's preview instead of orchestrator
 /// runs. Returns the key + a discriminator (List vs Detail-stack-top)
 /// when a preview should render; None to fall back to log.
-fn linear_preview_target(app: &App) -> Option<(String, &'static str)> {
+fn linear_preview_target(app: &App, cache: &crate::cache::LinearCache) -> Option<String> {
     if app.focus != Pane::Right || app.detail_tab != Tab::Linear {
         return None;
     }
     match &app.linear_view {
         LinearView::List { cursor_key, .. } if !cursor_key.is_empty() => {
-            Some((cursor_key.clone(), "list"))
+            Some(cursor_key.clone())
+        }
+        LinearView::Detail { stack, sub_cursor } => {
+            // Preview the cursored sub-issue (children of the top-of-stack).
+            let cur = stack.last()?;
+            let kid = cache.issues.get(cur)?.children.get(*sub_cursor)?;
+            Some(kid.identifier.clone())
         }
         _ => None,
     }
@@ -2535,8 +2615,7 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
 /// shared `linear.json` cache. Sub-issues aren't fetched as top-level
 /// entries; their preview is rendered from the parent's `children`
 /// data (title, state, assignee — the subset Linear returns inline).
-fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, _kind: &str) {
-    let cache = crate::cache::read_linear();
+fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, cache: &crate::cache::LinearCache) {
     let cached = cache.issues.get(key);
 
     let header = format!(" preview: {key}");
@@ -2932,9 +3011,12 @@ fn render_log(frame: &mut Frame, area: Rect, app: &App) {
     // a preview of that issue (title + meta + description) so the
     // user can read details without drilling. Restores to the run
     // log as soon as focus leaves Linear.
-    if let Some((key, cursor_kind)) = linear_preview_target(app) {
-        render_linear_preview(frame, area, &key, &cursor_kind);
-        return;
+    if app.focus == Pane::Right && app.detail_tab == Tab::Linear {
+        let cache = crate::cache::read_linear();
+        if let Some(key) = linear_preview_target(app, &cache) {
+            render_linear_preview(frame, area, &key, &cache);
+            return;
+        }
     }
     if let Some(number) = pr_preview_target(app) {
         render_pr_preview(frame, area, number);
@@ -3065,6 +3147,7 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
             Line::styled(" Right zone", Style::default().fg(IRIS)),
             kv_line("  j k      ", "move cursor in active tab"),
             kv_line("  Enter    ", "open / attach in active tab"),
+            kv_line("  y        ", "Linear: copy cursored ID to clipboard"),
             Line::styled(" Enter on a PR row → fullscreen lazygit-style diff", Style::default().fg(MUTED)),
         ]
     };
@@ -3206,17 +3289,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Esc, _) => {
             // Layered Esc per docs/tui-nav-redesign.md + linear-deep-design:
             // 1. modal cancel (handled above by show_help / message_input)
-            // 2. Linear detail → pop stack
+            // 2. Linear detail → list (single Esc, restores cursor; `u` walks parents)
             // 3. focus right → focus list
             // 4. focus list → quit
             if app.focus == Pane::Right
                 && app.detail_tab == Tab::Linear
             {
-                if let LinearView::Detail { stack, .. } = &mut app.linear_view {
-                    stack.pop();
-                    if stack.is_empty() {
-                        app.linear_view = LinearView::default();
-                    }
+                if let LinearView::Detail { stack, .. } = &app.linear_view {
+                    let cursor = stack.first().cloned().unwrap_or_default();
+                    app.linear_view = LinearView::List {
+                        cursor_key: cursor,
+                        pinned: HashSet::new(),
+                    };
                     if was_toasted { app.toast = None; }
                     return;
                 }
@@ -3683,6 +3767,9 @@ fn handle_right_key(app: &mut App, key: KeyEvent) {
         (Tab::Linear, KeyCode::Char('o')) => {
             handle_linear_open_browser(app);
         }
+        (Tab::Linear, KeyCode::Char('y')) => {
+            handle_linear_copy_id(app);
+        }
         // PR tab.
         (Tab::Prs, KeyCode::Char('j')) | (Tab::Prs, KeyCode::Down) => {
             if matches!(app.pr_view, PrView::Detail { .. }) {
@@ -4095,12 +4182,12 @@ fn move_linear_cursor(app: &mut App, delta: isize) {
 
 fn handle_linear_down(app: &mut App) {
     if matches!(app.linear_view, LinearView::Detail { .. }) {
-        if let LinearView::Detail { stack, sub_cursor } = &mut app.linear_view {
+        if let LinearView::Detail { stack, sub_cursor, .. } = &mut app.linear_view {
             let cache = crate::cache::read_linear();
             let n = stack
                 .last()
                 .and_then(|k| cache.issues.get(k))
-                .map(|c| c.children.len().min(3))
+                .map(|c| c.children.len())
                 .unwrap_or(0);
             if *sub_cursor + 1 < n {
                 *sub_cursor += 1;
@@ -4126,33 +4213,13 @@ fn handle_linear_enter(app: &mut App) {
     match &mut app.linear_view {
         LinearView::List { cursor_key, .. } => {
             if !cursor_key.is_empty() {
-                let k = cursor_key.clone();
-                // If the cursored issue is a sub-issue, seed the stack
-                // with its ancestors so Esc walks: cursor → parent →
-                // grandparent → ... → list. Cap at 8 to match the drill
-                // limit elsewhere in this file.
-                let mut stack: Vec<String> = Vec::new();
-                let mut cur = k.clone();
-                while let Some(p) = cache
-                    .issues
-                    .get(&cur)
-                    .and_then(|c| c.parent_key.clone())
-                {
-                    stack.push(p.clone());
-                    cur = p;
-                    if stack.len() >= 7 {
-                        break;
-                    }
-                }
-                stack.reverse();
-                stack.push(k);
                 app.linear_view = LinearView::Detail {
-                    stack,
+                    stack: vec![cursor_key.clone()],
                     sub_cursor: 0,
                 };
             }
         }
-        LinearView::Detail { stack, sub_cursor } => {
+        LinearView::Detail { stack, sub_cursor, .. } => {
             // Drill into the cursored sub-issue.
             let next = stack
                 .last()
@@ -4210,7 +4277,7 @@ fn handle_linear_toggle_expand(app: &mut App) {
 
 fn handle_linear_parent(app: &mut App) {
     let cache = crate::cache::read_linear();
-    if let LinearView::Detail { stack, sub_cursor } = &mut app.linear_view {
+    if let LinearView::Detail { stack, sub_cursor, .. } = &mut app.linear_view {
         let parent = stack
             .last()
             .and_then(|k| cache.issues.get(k))
@@ -4282,6 +4349,31 @@ fn handle_linear_open_browser(app: &mut App) {
     // even without a workspace prefix, redirecting to the user's last-
     // visited workspace. Better than silently failing.
     open_url(&format!("https://linear.app/issue/{key}"));
+}
+
+fn handle_linear_copy_id(app: &mut App) {
+    let cache = crate::cache::read_linear();
+    let Some(key) = linear_preview_target(app, &cache) else {
+        return;
+    };
+    if copy_to_clipboard(&key) {
+        app.toast = Some(format!("copied {key}"));
+    } else {
+        app.toast = Some("pbcopy failed".to_string());
+    }
+}
+
+fn copy_to_clipboard(s: &str) -> bool {
+    use std::io::Write;
+    let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(s.as_bytes()).is_err() {
+            return false;
+        }
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 fn open_url(url: &str) {
@@ -4954,14 +5046,10 @@ mod tests {
         handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
         match &app.linear_view {
             LinearView::Detail { stack, sub_cursor } => {
-                // Last in stack is what's shown; everything before it is
-                // walked by Esc.
-                assert_eq!(stack.last(), Some(&"ENG-29151".to_string()));
-                assert!(
-                    stack.contains(&"ENG-28816".to_string())
-                        || stack.len() == 1,
-                    "stack should contain parent if cache knows it: {stack:?}",
-                );
+                // Stack starts with just the cursored issue; `u` walks
+                // up the parent chain. Esc returns to the list with
+                // cursor restored to stack[0].
+                assert_eq!(stack, &vec!["ENG-29151".to_string()]);
                 assert_eq!(*sub_cursor, 0);
             }
             _ => panic!("expected Detail view, got {:?}", app.linear_view),
@@ -4969,7 +5057,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_esc_pops_detail() {
+    fn linear_esc_returns_to_list() {
         let mut app = test_app();
         app.focus = Pane::Right;
         app.detail_tab = Tab::Linear;
@@ -4977,17 +5065,15 @@ mod tests {
             stack: vec!["ENG-1".into(), "ENG-2".into()],
             sub_cursor: 0,
         };
+        // Single Esc collapses the whole stack back to List with the
+        // cursor restored to where the user drilled in from.
         handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
-        // Esc pops one level
         match &app.linear_view {
-            LinearView::Detail { stack, .. } => {
-                assert_eq!(stack, &vec!["ENG-1".to_string()]);
+            LinearView::List { cursor_key, .. } => {
+                assert_eq!(cursor_key, "ENG-1");
             }
-            _ => panic!("expected Detail with shorter stack"),
+            _ => panic!("expected List, got {:?}", app.linear_view),
         }
-        // Esc again pops to List
-        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
-        assert!(matches!(app.linear_view, LinearView::List { .. }));
         // Esc again returns focus to list zone
         handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
         assert_eq!(app.focus, Pane::List);
