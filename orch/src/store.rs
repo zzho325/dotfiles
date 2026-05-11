@@ -414,6 +414,30 @@ impl Store {
             .collect()
     }
 
+    /// Iterate all records in `closed_order` order (open records excluded).
+    pub fn load_closed_records(&self) -> Vec<TaskRecord> {
+        let Some(registry) = self.load_registry() else {
+            return Vec::new();
+        };
+        registry
+            .closed_order
+            .iter()
+            .filter_map(|id| self.load_record(*id))
+            .collect()
+    }
+
+    /// Persist a worktree-cleanup failure on the record. Returns the
+    /// newline-stripped error string for callers that need to surface it.
+    pub fn mark_worktree_cleanup_failed(&self, slug: &str, err: &str) -> String {
+        let err_str = err.replace('\n', " ");
+        let msg = format!("worktree remove: {err_str}");
+        self.update_record_by_slug(slug, |r| {
+            r.drift.cleanup_failed = true;
+            r.drift.last_error = Some(msg.clone());
+        });
+        err_str
+    }
+
     // Migration. See `docs/redesign.md` §6.
 
     /// Migrate from legacy `.state/*.json` + `order.json` to the v2

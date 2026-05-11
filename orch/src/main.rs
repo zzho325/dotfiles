@@ -502,6 +502,25 @@ fn cmd_status() {
     if !found {
         println!("  (no tasks)");
     }
+
+    // Closed tasks whose worktree cleanup failed — surface so the user
+    // can `git worktree remove --force` deliberately.
+    let pending: Vec<store::TaskRecord> = store::Store::default()
+        .load_closed_records()
+        .into_iter()
+        .filter(|r| r.drift.cleanup_failed)
+        .collect();
+    if !pending.is_empty() {
+        println!("## Pending cleanup\n");
+        for r in &pending {
+            let wt = state::expand_home(&r.worktree.path);
+            println!("  {}  [worktree: {wt}]", r.slug);
+            if let Some(err) = &r.drift.last_error {
+                println!("    {err}");
+            }
+        }
+        println!();
+    }
 }
 
 fn cmd_jump(name: &str) {
@@ -741,9 +760,12 @@ fn cmd_close(name: &str, keep_worktree: bool) {
         if path.exists() {
             match state::remove_worktree(path) {
                 Ok(()) => eprintln!("[close] removed worktree {wt}"),
-                Err(e) => eprintln!(
-                    "[close] WARNING: worktree {wt} not removed ({e})\n  run `git worktree remove --force {wt}` to override",
-                ),
+                Err(e) => {
+                    let err_str = store.mark_worktree_cleanup_failed(name, &e);
+                    eprintln!(
+                        "[close] WARNING: worktree {wt} not removed ({err_str})\n  run `git worktree remove --force {wt}` to override",
+                    );
+                }
             }
         }
     }

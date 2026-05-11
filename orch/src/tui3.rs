@@ -433,22 +433,10 @@ impl App {
             return;
         }
         let next_tasks = Self::load_tasks();
-        // Preserve selection by name when possible.
-        let prev_name = self
-            .tasks
-            .get(self.selected)
-            .map(|t| t.name.clone());
+        let prev_name = self.tasks.get(self.selected).map(|t| t.name.clone());
+        let prev_idx = self.selected;
         self.tasks = next_tasks;
-        if let Some(name) = prev_name {
-            self.selected = self
-                .tasks
-                .iter()
-                .position(|t| t.name == name)
-                .unwrap_or(0);
-        }
-        if self.selected >= self.tasks.len() {
-            self.selected = self.tasks.len().saturating_sub(1);
-        }
+        self.selected = next_selection(prev_idx, prev_name.as_deref(), &self.tasks);
         self.daemon_alive = crate::cache::is_daemon_alive();
         // Selected pane index might now be out of bounds.
         let pane_count = self
@@ -464,6 +452,19 @@ impl App {
     pub fn selected_task(&self) -> Option<&TaskView> {
         self.tasks.get(self.selected)
     }
+}
+
+/// Pick the new selection index after the task list changes. Follows
+/// the task by name (so reorders / inserts above don't shift the
+/// cursor). If the task is gone, keep the previous index clamped to
+/// the new list length.
+fn next_selection(prev_idx: usize, prev_name: Option<&str>, new_tasks: &[TaskView]) -> usize {
+    if let Some(name) = prev_name {
+        if let Some(pos) = new_tasks.iter().position(|t| t.name == name) {
+            return pos;
+        }
+    }
+    prev_idx.min(new_tasks.len().saturating_sub(1))
 }
 
 /// Pick the task that matches the user's current working context, so
@@ -3678,18 +3679,22 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
         }
     }
 
-    // 4. Remove worktree. Surface failures via the toast — a silent
-    //    close that leaves the worktree behind is the orphan-worktree
-    //    pain point we set out to fix.
+    // 4. Remove worktree. Failures persist as drift.cleanup_failed so
+    //    the orphan worktree surfaces in `orch status` later — the
+    //    transient toast alone is easy to miss.
     let warning = if worktree_path.is_empty() {
         None
     } else {
         let wt = state::expand_home(&worktree_path);
         let path = std::path::Path::new(&wt);
         if path.exists() {
-            state::remove_worktree(path).err().map(|e| {
-                format!("worktree {wt} not removed: {}", e.replace('\n', " "))
-            })
+            match state::remove_worktree(path) {
+                Ok(()) => None,
+                Err(e) => {
+                    let err_str = store.mark_worktree_cleanup_failed(name, &e);
+                    Some(format!("worktree {wt} not removed: {err_str}"))
+                }
+            }
         } else {
             None
         }
@@ -4725,6 +4730,34 @@ mod tests {
             toast: None,
             readonly: true,
         }
+    }
+
+    #[test]
+    fn next_selection_follows_name_when_present() {
+        let tasks = test_tasks();
+        // Cursor was on tasks[1], now the same task is at index 2 — follow it.
+        let mut reordered = tasks.clone();
+        reordered.swap(0, 1);
+        let name = tasks[1].name.clone();
+        assert_eq!(next_selection(1, Some(&name), &reordered), 0);
+    }
+
+    #[test]
+    fn next_selection_clamps_to_position_when_name_gone() {
+        let mut shrunk = test_tasks();
+        let closed_name = shrunk.remove(0).name;
+        assert_eq!(next_selection(0, Some(&closed_name), &shrunk), 0);
+        // Cursor on the last task — clamp to new len-1.
+        let mut shrunk = test_tasks();
+        let last = shrunk.len() - 1;
+        let closed_name = shrunk.remove(last).name;
+        assert_eq!(next_selection(last, Some(&closed_name), &shrunk), shrunk.len() - 1);
+    }
+
+    #[test]
+    fn next_selection_empty_list() {
+        assert_eq!(next_selection(0, Some("foo"), &[]), 0);
+        assert_eq!(next_selection(5, None, &[]), 0);
     }
 
     #[test]
