@@ -141,18 +141,17 @@ if ok then
 	keymap("n", "<leader>gs", fzf.git_status, { desc = "fzf git status" })
 	keymap("n", "<leader>gc", fzf.git_stash, { desc = "fzf git stash" })
 
-	-- jj: open DiffviewOpen for a change by resolving parent..commit IDs.
+	-- jj: open DiffviewOpen for a change using git's X^! (= X^..X) shorthand.
 	local jj_dv_rev = nil
 	local function jj_diffview(rev)
-		local parent = vim.fn.systemlist(
-			"jj log -r '" .. rev .. "-' --no-graph -T commit_id --limit 1 2>/dev/null"
-		)[1]
 		local commit = vim.fn.systemlist(
 			"jj log -r '" .. rev .. "' --no-graph -T commit_id --limit 1 2>/dev/null"
 		)[1]
-		if parent and commit then
-			vim.cmd("DiffviewOpen " .. parent .. ".." .. commit)
+		if commit and commit ~= "" then
+			vim.cmd("DiffviewOpen " .. commit .. "^!")
 			jj_dv_rev = rev
+		else
+			vim.notify("jj_diffview: could not resolve " .. rev, vim.log.levels.ERROR)
 		end
 	end
 
