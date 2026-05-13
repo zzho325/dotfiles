@@ -3575,7 +3575,7 @@ fn lifecycle_spawn(name: &str, _session: &str) -> Result<String, String> {
     if !task_file.exists() {
         return Err(format!("no task file: {}", task_file.display()));
     }
-    let cmd_str = format!("claude '/orch:worker {}'", task_file.display());
+    let cmd_str = record.agent.worker_kind.worker_cmd(&task_file);
     let new_ok = Command::new("tmux")
         .args(["new-session", "-d", "-s", &session, "-c", &work_dir])
         .stderr(Stdio::null())

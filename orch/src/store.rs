@@ -124,8 +124,20 @@ pub enum AgentMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerKind {
-    #[default]
     ClaudeCode,
+    #[default]
+    Codex,
+}
+
+impl WorkerKind {
+    /// Shell command that the spawn step `tmux send-keys` into the worker's pane.
+    /// Codex invokes the skill via `$` prefix; Claude Code via `/` slash command.
+    pub fn worker_cmd(&self, task_file: &std::path::Path) -> String {
+        match self {
+            Self::Codex => format!("codex '$orch:worker {}'", task_file.display()),
+            Self::ClaudeCode => format!("claude '/orch:worker {}'", task_file.display()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

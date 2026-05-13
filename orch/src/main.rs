@@ -572,8 +572,7 @@ fn cmd_spawn(name: &str) {
         );
         return;
     }
-    let cmd =
-        format!("claude '/orch:worker {}'", task_file.display());
+    let cmd = record.agent.worker_kind.worker_cmd(&task_file);
 
     if !tmux(&["new-session", "-d", "-s", &session, "-c", &work_dir]) {
         eprintln!("[spawn] failed to create tmux session");

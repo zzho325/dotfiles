@@ -120,6 +120,10 @@ fn fetch_pr(number: u32) -> Option<PrData> {
     //   Some(true)  = all checks done and passing
     //   Some(false) = at least one check finished and failed
     //   None        = at least one check still running (no failures yet)
+    //
+    // CheckRun (GitHub Actions): `status` ∈ {QUEUED, IN_PROGRESS, COMPLETED, ...};
+    //   `conclusion` is empty until status=COMPLETED.
+    // StatusContext (legacy): `state` ∈ {SUCCESS, PENDING, FAILURE, ERROR}.
     let ci_pass = json["statusCheckRollup"].as_array().and_then(|checks| {
         if checks.is_empty() {
             return None;
@@ -127,16 +131,18 @@ fn fetch_pr(number: u32) -> Option<PrData> {
         let mut any_pending = false;
         let mut any_fail = false;
         for c in checks {
-            let conclusion = c["conclusion"].as_str();
+            let conclusion = c["conclusion"].as_str().filter(|s| !s.is_empty());
+            let status = c["status"].as_str();
             let state = c["state"].as_str();
             let success = matches!(conclusion, Some("SUCCESS" | "SKIPPED" | "NEUTRAL"))
                 || state == Some("SUCCESS");
             if success {
                 continue;
             }
-            // CheckRun in progress: conclusion=null. StatusContext pending: state=PENDING.
-            let pending = (conclusion.is_none()
-                && (state.is_none() || state == Some("PENDING") || state == Some("IN_PROGRESS")))
+            let pending = matches!(
+                status,
+                Some("QUEUED" | "IN_PROGRESS" | "WAITING" | "REQUESTED" | "PENDING")
+            ) || state == Some("PENDING")
                 || matches!(conclusion, Some("ACTION_REQUIRED" | "STALE"));
             if pending {
                 any_pending = true;
