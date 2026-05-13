@@ -20,3 +20,4 @@ prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test 
 prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./pkg/accounts/interests -run '^TestNoPayoutIfOtherPayoutUnderReview$' -count=1"], decision="allow")
 prefix_rule(pattern=["/bin/zsh", "-lc", "ENV=test GOCACHE=/tmp/go-build go test ./pkg/interests -run 'Test(UpdatePayoutStatus_ManualPayoutSkipsInterestLedger|GetMonthlyPayoutsByProductsAndAccruedDate_ExcludesManual)$' -count=1"], decision="allow")
 prefix_rule(pattern=["/bin/zsh", "-lc", "curl -s -H \"Authorization: Bearer ${SLACK_BOT_TOKEN}\" \"https://slack.com/api/conversations.replies?channel=C0291K04RGD&ts=1771280480.905549\" | jq '{ok, error, messages: [.messages[]? | {ts, user, text}]}'"], decision="allow")
+prefix_rule(pattern=["rm", "-rf", "/tmp/internalapps-deposit-sweep-overdraft"], decision="allow")

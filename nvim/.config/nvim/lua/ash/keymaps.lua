@@ -143,13 +143,38 @@ if ok then
 
 	-- jj: open DiffviewOpen for a change using git's X^! (= X^..X) shorthand.
 	local jj_dv_rev = nil
-	local function jj_diffview(rev)
+	local jj_dv_root = nil
+	local function jj_root()
+		local start = vim.fn.getcwd()
+		local bufname = vim.api.nvim_buf_get_name(0)
+		if bufname ~= "" and (vim.fn.filereadable(bufname) == 1 or vim.fn.isdirectory(bufname) == 1) then
+			if vim.fn.isdirectory(bufname) == 1 then
+				start = vim.fn.fnamemodify(bufname, ":p")
+			else
+				start = vim.fn.fnamemodify(bufname, ":p:h")
+			end
+		end
+		local root = vim.fn.systemlist("cd " .. vim.fn.shellescape(start) .. " && jj root 2>/dev/null")[1]
+		if not root or root == "" then
+			vim.notify("jj: not in a repo", vim.log.levels.ERROR)
+			return nil
+		end
+		return root
+	end
+	local function jj_cmd(root, cmd)
+		return "cd " .. vim.fn.shellescape(root) .. " && " .. cmd
+	end
+	local function jj_diffview(rev, root)
+		root = root or jj_root()
+		if not root then return end
 		local commit = vim.fn.systemlist(
-			"jj log -r '" .. rev .. "' --no-graph -T commit_id --limit 1 2>/dev/null"
+			jj_cmd(root, "jj log -r '" .. rev .. "' --no-graph -T commit_id --limit 1 2>/dev/null")
 		)[1]
 		if commit and commit ~= "" then
+			vim.cmd("lcd " .. vim.fn.fnameescape(root))
 			vim.cmd("DiffviewOpen " .. commit .. "^!")
 			jj_dv_rev = rev
+			jj_dv_root = root
 		else
 			vim.notify("jj_diffview: could not resolve " .. rev, vim.log.levels.ERROR)
 		end
@@ -160,16 +185,15 @@ if ok then
 		return selected[1]:match("^(%S+)")
 	end
 
-	-- jj stack: hidden change_id, then bookmark + description for display.
-	-- Field 1 (hidden) = change_id, Field 2+ = visible label.
-	local jj_stack_cmd = "jj log -r '::@ ~ ::main' --no-graph"
-		.. [[ -T 'change_id.shortest() ++ "\t"]]
-		.. [[ ++ if(local_bookmarks, local_bookmarks.map(|b| b.name()).join(" ") ++ " ", "")]]
-		.. [[ ++ if(description, description.first_line(), "(no description " ++ change_id.shortest() ++ ")")]]
-		.. [[ ++ "\n"']]
+	-- jj stack: first field is the change id, used by preview/actions.
+	local function jj_stack_cmd(root)
+		return jj_cmd(root, "jj log -r 'main@origin..@' --no-graph"
+			.. [[ -T 'change_id.shortest() ++ "  "]]
+			.. [[ ++ if(local_bookmarks, local_bookmarks.map(|b| b.name()).join(" ") ++ " ", "")]]
+			.. [[ ++ if(description, description.first_line(), "(no description " ++ change_id.shortest() ++ ")")]]
+			.. [[ ++ "\n"']])
+	end
 	local jj_stack_fzf = {
-		["--delimiter"] = "\t",
-		["--with-nth"] = "2..",
 		["--preview-window"] = "right,70%",
 	}
 
@@ -179,33 +203,37 @@ if ok then
 		local ft = vim.bo[buf].filetype
 		if not ft:match("^Diffview") then return end
 		vim.cmd("DiffviewClose")
-		jj_diffview(jj_dv_rev)
+		jj_diffview(jj_dv_rev, jj_dv_root)
 	end, { desc = "refresh jj diffview" })
 
 
 	keymap("n", "<leader>jb", function()
-		fzf.fzf_exec(jj_stack_cmd, {
+		local root = jj_root()
+		if not root then return end
+		fzf.fzf_exec(jj_stack_cmd(root), {
 			prompt = "jj change> ",
-			preview = "jj diff -r {1} --git --color=always",
+			preview = jj_cmd(root, "jj diff -r {1} --git --color=always"),
 			fzf_opts = jj_stack_fzf,
 			actions = {
-				["default"] = function(selected) jj_diffview(jj_change_id(selected)) end,
+				["default"] = function(selected) jj_diffview(jj_change_id(selected), root) end,
 			},
 		})
 	end, { desc = "jj stack diffview" })
 	keymap("n", "<leader>jg", function()
-		fzf.fzf_exec(jj_stack_cmd, {
+		local root = jj_root()
+		if not root then return end
+		fzf.fzf_exec(jj_stack_cmd(root), {
 			prompt = "jj review> ",
-			preview = "jj diff -r {1} --git --color=never"
+			preview = jj_cmd(root, "jj diff -r {1} --git --color=never"
 				.. " | grep '^diff --git' | sed 's|.*b/||'"
 				.. " | grep '\\.go$'"
 				.. " | xargs -I@ dirname @"
 				.. " | sort -u"
 				.. " | sed 's|^|./|; s|$|/...|'"
-				.. " | xargs goreview --diff main --changes-only --depth 4 --short 2>&1",
+				.. " | xargs goreview --diff main --changes-only --depth 4 --short 2>&1"),
 			fzf_opts = jj_stack_fzf,
 			actions = {
-				["default"] = function(selected) jj_diffview(jj_change_id(selected)) end,
+				["default"] = function(selected) jj_diffview(jj_change_id(selected), root) end,
 			},
 		})
 	end, { desc = "jj stack goreview" })
