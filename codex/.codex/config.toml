@@ -35,9 +35,6 @@ voice_transcription = true
 [mcp_servers.linear-server]
 url = "https://mcp.linear.app/mcp"
 
-[mcp_servers.notion]
-url = "https://mcp.notion.com/mcp"
-
 [profiles.safe]
 approval_policy = "untrusted"
 sandbox_mode = "workspace-write"
