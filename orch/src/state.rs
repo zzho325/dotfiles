@@ -359,8 +359,9 @@ pub fn load_tasks(
         .collect()
 }
 
-/// Ensure every `tasks/<name>.md` has a v2 record. Populates
+/// Ensure every `tasks/<name>.md` has an open v2 record. Populates
 /// `record.worktree.path` if `$ORCH_REPO/task-<name>` exists on disk.
+/// Reopens a closed record when its task file exists again.
 /// Does NOT populate `tmux.session_name` — empty session signals
 /// "unspawned" to the orchestrator.
 pub fn ensure_state_files() {
@@ -384,18 +385,94 @@ pub fn ensure_state_files() {
     let mut registry_changed = false;
     for name in load_task_names(&dir) {
         if known_slugs.contains(&name) {
-            // Existing record — backfill worktree from $ORCH_REPO if missing.
+            // Existing record — reopen if the task file exists again, and
+            // backfill a missing/stale worktree from $ORCH_REPO.
             if let Some(mut record) = store.load_record_by_slug(&name) {
-                if record.worktree.path.is_empty() {
+                if record.desired_state == DesiredState::Closed {
+                    record.desired_state = DesiredState::New;
+                    record.closed_at = None;
+                    record.archived_task_file = None;
+                    registry.closed_order.retain(|id| *id != record.id);
+                    if !registry.open_order.contains(&record.id) {
+                        registry.open_order.push(record.id);
+                    }
+                    registry_changed = true;
+                }
+                record.task_file = dir.join(format!("{name}.md"));
+                if worktree_missing(&record.worktree.path) {
                     if let Some(wt) = repo_worktree_for(&repo, &name) {
                         record.worktree.path = wt;
-                        record.updated_at = now;
-                        store.save_record(&record);
                     }
                 }
+                record.updated_at = now;
+                store.save_record(&record);
             }
         } else {
             // New .md added since last daemon scan — allocate a record.
+            let id = registry.allocate_id();
+            registry.open_order.push(id);
+            registry_changed = true;
+            let mut record = TaskRecord {
+                id,
+                slug: name.clone(),
+                task_file: dir.join(format!("{name}.md")),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            if let Some(wt) = repo_worktree_for(&repo, &name) {
+                record.worktree.path = wt;
+            }
+            store.save_record(&record);
+        }
+    }
+    if registry_changed {
+        store.save_registry(&registry);
+    }
+}
+
+fn worktree_missing(worktree: &str) -> bool {
+    worktree.is_empty() || !Path::new(&expand_home(worktree)).exists()
+}
+
+#[cfg(test)]
+fn ensure_state_files_at(store: &Store, dir: &Path, repo: Option<String>, now: u64) {
+    let Some(mut registry) = store.load_registry() else {
+        return;
+    };
+
+    let known_slugs: HashSet<String> = registry
+        .open_order
+        .iter()
+        .chain(registry.closed_order.iter())
+        .filter_map(|id| store.load_record(*id))
+        .map(|r| r.slug)
+        .collect();
+
+    let mut registry_changed = false;
+    for name in load_task_names(dir) {
+        if known_slugs.contains(&name) {
+            if let Some(mut record) = store.load_record_by_slug(&name) {
+                if record.desired_state == DesiredState::Closed {
+                    record.desired_state = DesiredState::New;
+                    record.closed_at = None;
+                    record.archived_task_file = None;
+                    registry.closed_order.retain(|id| *id != record.id);
+                    if !registry.open_order.contains(&record.id) {
+                        registry.open_order.push(record.id);
+                    }
+                    registry_changed = true;
+                }
+                record.task_file = dir.join(format!("{name}.md"));
+                if worktree_missing(&record.worktree.path) {
+                    if let Some(wt) = repo_worktree_for(&repo, &name) {
+                        record.worktree.path = wt;
+                    }
+                }
+                record.updated_at = now;
+                store.save_record(&record);
+            }
+        } else {
             let id = registry.allocate_id();
             registry.open_order.push(id);
             registry_changed = true;
@@ -558,16 +635,17 @@ fn update_record_prs(store: &Store, slug: String, discovered: &[u32]) {
     });
 }
 
-/// Try `git worktree remove`. If git says "not a working tree" (already
-/// disowned), the directory is a pure orphan with no git state, so
-/// `rm -rf` it. Other errors propagate.
+/// Try `git worktree remove --force`. Close is already an explicit cleanup
+/// action, so dirty task worktrees should not linger as stale entries. If git
+/// says "not a working tree" (already disowned), the directory is a pure orphan
+/// with no git state, so `rm -rf` it. Other errors propagate.
 pub fn remove_worktree(path: &Path) -> Result<(), String> {
     let repo = std::env::var("ORCH_REPO")
         .map_err(|_| "ORCH_REPO not set".to_string())?;
     let main = format!("{repo}/main");
     let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_string())?;
     let output = Command::new("git")
-        .args(["worktree", "remove", path_str])
+        .args(["worktree", "remove", "--force", path_str])
         .current_dir(&main)
         .stderr(Stdio::piped())
         .output()
@@ -869,5 +947,62 @@ mod tests {
         assert!(!nums.contains(&200), "discovery-sourced 200 dropped");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_state_reopens_closed_task_and_links_worktree() {
+        let root = std::env::temp_dir()
+            .join("orch-test-reopen-task")
+            .join(".orch");
+        let tasks = std::env::temp_dir().join("orch-test-reopen-task-tasks");
+        let repo = std::env::temp_dir().join("orch-test-reopen-task-repo");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&tasks);
+        let _ = fs::remove_dir_all(&repo);
+        fs::create_dir_all(&tasks).unwrap();
+        fs::create_dir_all(repo.join("task-foo")).unwrap();
+        fs::write(tasks.join("foo.md"), "# Foo\n").unwrap();
+
+        let store = Store::at(root.clone());
+        let mut registry = store::Registry::new();
+        let id = registry.allocate_id();
+        registry.closed_order = vec![id];
+        store.save_registry(&registry);
+        store.save_record(&TaskRecord {
+            id,
+            slug: "foo".into(),
+            desired_state: DesiredState::Closed,
+            closed_at: Some(10),
+            archived_task_file: Some(PathBuf::from("/tmp/old.md")),
+            worktree: store::WorktreeInfo {
+                path: "/tmp/missing-orch-worktree".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        ensure_state_files_at(
+            &store,
+            &tasks,
+            Some(repo.to_string_lossy().to_string()),
+            20,
+        );
+
+        let registry = store.load_registry().unwrap();
+        assert_eq!(registry.open_order, vec![id]);
+        assert!(registry.closed_order.is_empty());
+
+        let record = store.load_record_by_slug("foo").unwrap();
+        assert_eq!(record.desired_state, DesiredState::New);
+        assert_eq!(record.closed_at, None);
+        assert_eq!(record.archived_task_file, None);
+        assert_eq!(
+            record.worktree.path,
+            repo.join("task-foo").to_string_lossy().to_string()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&tasks);
+        let _ = fs::remove_dir_all(&repo);
     }
 }

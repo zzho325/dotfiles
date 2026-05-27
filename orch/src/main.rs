@@ -508,7 +508,11 @@ fn cmd_status() {
     let pending: Vec<store::TaskRecord> = store::Store::default()
         .load_closed_records()
         .into_iter()
-        .filter(|r| r.drift.cleanup_failed)
+        .filter(|r| {
+            r.drift.cleanup_failed
+                && !r.worktree.path.is_empty()
+                && Path::new(&state::expand_home(&r.worktree.path)).exists()
+        })
         .collect();
     if !pending.is_empty() {
         println!("## Pending cleanup\n");
@@ -758,7 +762,14 @@ fn cmd_close(name: &str, keep_worktree: bool) {
         let path = Path::new(&wt);
         if path.exists() {
             match state::remove_worktree(path) {
-                Ok(()) => eprintln!("[close] removed worktree {wt}"),
+                Ok(()) => {
+                    store.update_record_by_slug(name, |r| {
+                        r.drift.cleanup_failed = false;
+                        r.drift.cleanup_pending = false;
+                        r.drift.last_error = None;
+                    });
+                    eprintln!("[close] removed worktree {wt}");
+                }
                 Err(e) => {
                     let err_str = store.mark_worktree_cleanup_failed(name, &e);
                     eprintln!(
@@ -766,6 +777,12 @@ fn cmd_close(name: &str, keep_worktree: bool) {
                     );
                 }
             }
+        } else {
+            store.update_record_by_slug(name, |r| {
+                r.drift.cleanup_failed = false;
+                r.drift.cleanup_pending = false;
+                r.drift.last_error = None;
+            });
         }
     }
 
