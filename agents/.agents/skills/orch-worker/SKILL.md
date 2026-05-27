@@ -106,6 +106,35 @@ notes propose "Codex review" -b "1. <finding>\n   → <your response>\n\n2. <fin
 ```
 **Never auto-fix from codex feedback** — always discuss first.
 
+### Background PR Review
+
+For PR reviews, prefer orch's background review mailbox when the user wants the
+review to run while you keep working:
+
+```
+orch review start https://github.com/column/column/pull/25827
+orch review list
+orch review show <id> --consume
+```
+
+`orch review start` returns immediately. A Codex hook will later add context
+like:
+
+```
+A background PR review is ready: ... Run `orch review show <id> --consume` ...
+```
+
+When that happens:
+
+1. Run exactly the suggested `orch review show <id> --consume`.
+2. Present each finding in `notes.md` as a proposal, with your response under
+   it: agree, disagree, already handled, or needs inspection.
+3. Do not auto-fix review feedback. Wait for the user to stamp/approve the
+   proposal.
+
+Use `/codex` directly for non-PR questions, quick second opinions, or when the
+user explicitly asks for a foreground Codex answer.
+
 ## Phase 5: Execute
 
 1. **Implement** — write code (design already approved in Phase 4)

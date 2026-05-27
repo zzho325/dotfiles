@@ -80,6 +80,8 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const SCAN_MSG: &str = "[scan]";
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -136,6 +138,11 @@ enum Cmd {
     Linear {
         #[command(subcommand)]
         action: LinearAction,
+    },
+    /// Run background PR reviews and surface results to Codex sessions.
+    Review {
+        #[command(subcommand)]
+        action: ReviewAction,
     },
     /// Garbage-collect orphan worktrees: list `task-*` worktrees under
     /// `$ORCH_REPO` whose `~/tasks/<name>.md` is gone, prompt to remove.
@@ -223,6 +230,37 @@ enum BusyAction {
     Start,
     /// Remove the busy marker.
     Stop,
+}
+
+#[derive(Subcommand)]
+enum ReviewAction {
+    /// Start a background Codex review for a PR URL, PR number, or prompt.
+    Start {
+        /// PR URL, PR number, or review target prompt.
+        target: String,
+        /// Optional display label.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Internal — run a queued review by id.
+    #[command(hide = true)]
+    Run {
+        /// Review id.
+        id: String,
+    },
+    /// List review runs.
+    List,
+    /// Print one ready review. Defaults to the newest ready review.
+    Show {
+        /// Review id.
+        id: Option<String>,
+        /// Mark the review consumed after printing.
+        #[arg(long)]
+        consume: bool,
+    },
+    /// Internal — Codex hook entry point.
+    #[command(hide = true)]
+    Hook,
 }
 
 #[derive(Subcommand)]
@@ -855,6 +893,326 @@ fn cmd_busy_stop() {
         return;
     };
     let _ = fs::remove_file(state::busy_dir().join(&session_id));
+}
+
+// Review mailbox — background Codex PR reviews that surface through hooks.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReviewMeta {
+    id: String,
+    target: String,
+    label: String,
+    cwd: String,
+    git_root: String,
+    status: String,
+    started_at: u64,
+    #[serde(default)]
+    finished_at: Option<u64>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    consumed_at: Option<u64>,
+    #[serde(default)]
+    stop_notified_at: Option<u64>,
+}
+
+fn reviews_dir() -> PathBuf {
+    state::tasks_dir().join(".orch").join("reviews")
+}
+
+fn review_dir(id: &str) -> PathBuf {
+    reviews_dir().join(id)
+}
+
+fn review_meta_path(id: &str) -> PathBuf {
+    review_dir(id).join("meta.json")
+}
+
+fn save_review_meta(meta: &ReviewMeta) -> bool {
+    let path = review_meta_path(&meta.id);
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let Ok(json) = serde_json::to_string_pretty(meta) else {
+        return false;
+    };
+    state::atomic_write(&path, &json)
+}
+
+fn load_review_meta(id: &str) -> Option<ReviewMeta> {
+    fs::read_to_string(review_meta_path(id))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn load_review_metas() -> Vec<ReviewMeta> {
+    let Ok(entries) = fs::read_dir(reviews_dir()) else {
+        return Vec::new();
+    };
+    let mut metas: Vec<ReviewMeta> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let id = e.file_name().to_string_lossy().to_string();
+            load_review_meta(&id)
+        })
+        .collect();
+    metas.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    metas
+}
+
+fn git_root_for(cwd: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
+fn review_target_label(target: &str, label: Option<&str>) -> String {
+    if let Some(label) = label.filter(|s| !s.trim().is_empty()) {
+        return label.trim().to_string();
+    }
+    target
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(target)
+        .chars()
+        .take(80)
+        .collect()
+}
+
+fn cmd_review_start(target: &str, label: Option<&str>) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let git_root = git_root_for(&cwd).unwrap_or_else(|| cwd.clone());
+    let id = format!("{}-{}", cache::now_epoch(), std::process::id());
+    let meta = ReviewMeta {
+        id: id.clone(),
+        target: target.to_string(),
+        label: review_target_label(target, label),
+        cwd: cwd.to_string_lossy().to_string(),
+        git_root: git_root.to_string_lossy().to_string(),
+        status: "running".into(),
+        started_at: cache::now_epoch(),
+        finished_at: None,
+        exit_code: None,
+        consumed_at: None,
+        stop_notified_at: None,
+    };
+    if !save_review_meta(&meta) {
+        eprintln!("[review] failed to create review run");
+        return;
+    }
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("orch"));
+    let log_path = review_dir(&id).join("runner.log");
+    let Ok(log) = fs::File::create(&log_path) else {
+        eprintln!("[review] failed to create {}", log_path.display());
+        return;
+    };
+    let log2 = log.try_clone().ok();
+    let mut cmd = Command::new(exe);
+    cmd.args(["review", "run", &id])
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log));
+    if let Some(log2) = log2 {
+        cmd.stderr(Stdio::from(log2));
+    }
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    match cmd.spawn() {
+        Ok(_) => {
+            eprintln!("[review] started {id}");
+            eprintln!("[review] target: {target}");
+            eprintln!("[review] result: {}", review_dir(&id).display());
+        }
+        Err(e) => {
+            let mut failed = meta;
+            failed.status = "failed".into();
+            failed.finished_at = Some(cache::now_epoch());
+            failed.exit_code = Some(-1);
+            save_review_meta(&failed);
+            eprintln!("[review] failed to spawn runner: {e}");
+        }
+    }
+}
+
+fn cmd_review_run(id: &str) {
+    let Some(mut meta) = load_review_meta(id) else {
+        eprintln!("[review] no review id {id}");
+        return;
+    };
+    let dir = review_dir(id);
+    let answer = dir.join("answer.md");
+    let events = dir.join("events.jsonl");
+    let stderr = dir.join("stderr.log");
+    let Ok(stdout) = fs::File::create(&events) else {
+        eprintln!("[review] failed to create {}", events.display());
+        return;
+    };
+    let Ok(stderr_file) = fs::File::create(&stderr) else {
+        eprintln!("[review] failed to create {}", stderr.display());
+        return;
+    };
+
+    let status = Command::new("codex")
+        .args(["exec", "review", "--json", "--ephemeral"])
+        .arg("--output-last-message")
+        .arg(&answer)
+        .arg(&meta.target)
+        .current_dir(state::expand_home(&meta.git_root))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr_file))
+        .status();
+
+    let (status_name, exit_code) = match status {
+        Ok(s) => {
+            let has_answer = fs::metadata(&answer).map(|m| m.len() > 0).unwrap_or(false);
+            let name = if s.success() && has_answer {
+                "ready"
+            } else {
+                "failed"
+            };
+            (name.to_string(), s.code().unwrap_or(-1))
+        }
+        Err(e) => {
+            let _ = fs::write(&stderr, format!("failed to run codex: {e}\n"));
+            ("failed".into(), -1)
+        }
+    };
+    meta.status = status_name;
+    meta.finished_at = Some(cache::now_epoch());
+    meta.exit_code = Some(exit_code);
+    save_review_meta(&meta);
+}
+
+fn cmd_review_list() {
+    let metas = load_review_metas();
+    if metas.is_empty() {
+        eprintln!("[review] no review runs");
+        return;
+    }
+    for m in metas {
+        let consumed = if m.consumed_at.is_some() {
+            " consumed"
+        } else {
+            ""
+        };
+        eprintln!("{}  {}{}  {}", m.id, m.status, consumed, m.label);
+    }
+}
+
+fn newest_ready_review_id() -> Option<String> {
+    load_review_metas()
+        .into_iter()
+        .find(|m| m.status == "ready" && m.consumed_at.is_none())
+        .map(|m| m.id)
+}
+
+fn cmd_review_show(id: Option<&str>, consume: bool) {
+    let id = match id.map(String::from).or_else(newest_ready_review_id) {
+        Some(id) => id,
+        None => {
+            eprintln!("[review] no ready unconsumed review");
+            return;
+        }
+    };
+    let Some(mut meta) = load_review_meta(&id) else {
+        eprintln!("[review] no review id {id}");
+        return;
+    };
+    let answer = review_dir(&id).join("answer.md");
+    match fs::read_to_string(&answer) {
+        Ok(s) if !s.trim().is_empty() => {
+            println!("{s}");
+            if consume && meta.consumed_at.is_none() {
+                meta.consumed_at = Some(cache::now_epoch());
+                save_review_meta(&meta);
+            }
+        }
+        _ => {
+            eprintln!("[review] no answer for {id}");
+            eprintln!(
+                "[review] stderr: {}",
+                review_dir(&id).join("stderr.log").display()
+            );
+        }
+    }
+}
+
+fn hook_input_value() -> serde_json::Value {
+    serde_json::from_str(&read_stdin_to_string()).unwrap_or_default()
+}
+
+fn cwd_matches_review(hook_cwd: &str, meta: &ReviewMeta) -> bool {
+    let cwd = state::expand_home(hook_cwd);
+    let root = state::expand_home(&meta.git_root);
+    cwd == root || cwd.starts_with(&format!("{}/", root.trim_end_matches('/')))
+}
+
+fn pending_review_for_hook(hook_cwd: &str) -> Option<ReviewMeta> {
+    load_review_metas().into_iter().find(|m| {
+        m.status == "ready"
+            && m.consumed_at.is_none()
+            && cwd_matches_review(hook_cwd, m)
+    })
+}
+
+fn review_hook_message(meta: &ReviewMeta) -> String {
+    format!(
+        "A background PR review is ready: {} ({})\n\
+Run `orch review show {} --consume`, present the findings first, \
+and state whether you agree, disagree, or need to inspect further.",
+        meta.label, meta.target, meta.id,
+    )
+}
+
+fn cmd_review_hook() {
+    let input = hook_input_value();
+    let event = input["hook_event_name"].as_str().unwrap_or("");
+    let cwd = input["cwd"].as_str().unwrap_or("");
+    let Some(mut meta) = pending_review_for_hook(cwd) else {
+        return;
+    };
+    let message = review_hook_message(&meta);
+
+    if event == "UserPromptSubmit" {
+        let out = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": message,
+            },
+        });
+        println!("{out}");
+        return;
+    }
+
+    if event == "Stop"
+        && !input["stop_hook_active"].as_bool().unwrap_or(false)
+        && meta.stop_notified_at.is_none()
+    {
+        meta.stop_notified_at = Some(cache::now_epoch());
+        save_review_meta(&meta);
+        let out = serde_json::json!({
+            "decision": "block",
+            "reason": message,
+        });
+        println!("{out}");
+    }
 }
 
 // Linear ticket linkage.
@@ -1579,6 +1937,13 @@ fn main() {
                 linear_cursor.as_deref(),
             )
         }
+        Some(Cmd::Review { action }) => match action {
+            ReviewAction::Start { target, label } => cmd_review_start(&target, label.as_deref()),
+            ReviewAction::Run { id } => cmd_review_run(&id),
+            ReviewAction::List => cmd_review_list(),
+            ReviewAction::Show { id, consume } => cmd_review_show(id.as_deref(), consume),
+            ReviewAction::Hook => cmd_review_hook(),
+        },
         Some(Cmd::Linear { action }) => match action {
             LinearAction::Add { task, key } => cmd_linear_add(&task, &key),
             LinearAction::Rm { task, key } => cmd_linear_rm(&task, &key),
