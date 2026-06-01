@@ -1070,7 +1070,14 @@ fn cmd_review_run(id: &str) {
     };
 
     let status = Command::new("codex")
-        .args(["exec", "review", "--json", "--ephemeral"])
+        .args([
+            "exec",
+            "review",
+            "--disable",
+            "hooks",
+            "--json",
+            "--ephemeral",
+        ])
         .arg("--output-last-message")
         .arg(&answer)
         .arg(&meta.target)
