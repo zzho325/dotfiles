@@ -1,0 +1,23 @@
+# Ignore compiled plugin cache (packer)
+**/packer_compiled.lua
+
+# Local editor / OS state
+.DS_Store
+**/.DS_Store
+**/.netrwhist
+
+# Local-only
+agents/.agents/AGENTS.md
+agents/.agents/skills_local/
+claude/.claude/CLAUDE.md
+claude/.claude/settings.local.json
+codex/.codex/AGENTS.md
+monitor.db
+
+# Rust build artifacts
+orch/target/
+
+# Generated tool binaries
+tools/goreview/goreview
+tools/notes-cli/notes-cli
+tools/orderlint/orderlint-diff

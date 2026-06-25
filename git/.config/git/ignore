@@ -1,0 +1,5 @@
+.nvim.lua
+.rgignore
+.zed
+.cookie
+notes*.md

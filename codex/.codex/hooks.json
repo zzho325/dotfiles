@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "orch busy start" },
+          { "type": "command", "command": "orch review hook" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "orch busy stop" },
+          { "type": "command", "command": "orch review hook" }
+        ]
+      }
+    ]
+  }
+}

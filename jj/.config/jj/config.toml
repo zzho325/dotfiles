@@ -1,0 +1,11 @@
+#:schema https://docs.jj-vcs.dev/latest/config-schema.json
+
+[ui]
+pager = "delta"
+
+[templates]
+log = '''
+change_id.shortest() ++ " " ++
+if(local_bookmarks, local_bookmarks.map(|b| b.name()).join(" ") ++ " ") ++
+description.first_line() ++ "\n"
+'''

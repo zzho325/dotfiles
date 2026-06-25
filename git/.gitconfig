@@ -1,0 +1,28 @@
+[user]
+	email = ashleyzhou62@gmail.com
+	name = Ashley
+[filter "lfs"]
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+	process = git-lfs filter-process
+	required = true
+[core]
+	editor = nvim
+	pager = delta
+[stash]
+	showIncludeUntracked = true
+
+[alias]
+  webdiff = "!f() { \
+    if git diff --quiet \"$@\"; then echo 'No changes.'; exit 0; fi; \
+    tmp=\"${TMPDIR:-/tmp}/git-diff-$(date +%s).html\"; \
+    runner='npx --yes'; command -v pnpm >/dev/null && runner='pnpm dlx'; \
+    git diff \"$@\" | $runner diff2html-cli -i stdin -s side -F \"$tmp\" && \
+    ( command -v xdg-open >/dev/null && xdg-open \"$tmp\" ) || open \"$tmp\"; \
+  }; f"
+[interactive]
+	diffFilter = delta --color-only
+[delta]
+	side-by-side = true
+	line-numbers = true
+	navigate = true

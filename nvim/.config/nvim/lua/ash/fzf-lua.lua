@@ -1,0 +1,35 @@
+require("fzf-lua").setup({
+	formatter = "path.filename_first",
+	fzf_opts = {
+		["--ansi"]     = "",
+		["--multi"]    = "",
+		["--extended"] = "",
+	},
+	keymap = {
+		fzf = {
+			["ctrl-q"] = "select-all+accept",
+		}
+	},
+	fzf_colors = {
+		-- use your CursorLine background for the selected row
+		["bg+"]     = { "bg", "CursorLine" },
+		-- make the selected text a contrasting color
+		["fg+"]     = { "fg", "PmenuSel" },
+		-- keep pointer (the bar) bold/bright
+		["pointer"] = { "fg", "Conditional" },
+	},
+	files = {
+		git_icons = true,
+		formatter = "path.filename_first",
+	},
+	grep = {
+		git_icons = true,
+		formatter = "path.filename_first",
+	},
+	buffers = {
+		formatter = "path.filename_first",
+	},
+	oldfiles = {
+		formatter = "path.filename_first",
+	},
+})

@@ -1,0 +1,55 @@
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+approval_policy = "on-request"
+sandbox_mode = "danger-full-access"
+network_access = true
+suppress_unstable_features_warning = true
+web_search = "live"
+allow_login_shell = true
+service_tier = "default"
+
+[shell_environment_policy]
+inherit = "all"
+
+[tui]
+status_line = ["model-with-reasoning", "context-remaining", "current-dir", "git-branch"]
+theme = "rose-pine-dawn-soft-diff"
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4
+
+[features]
+multi_agent = true
+voice_transcription = true
+hooks = true
+
+[mcp_servers.linear-server]
+url = "https://mcp.linear.app/mcp"
+
+[mcp_servers.linear-server.tools.save_issue]
+approval_mode = "approve"
+
+[profiles.safe]
+approval_policy = "untrusted"
+sandbox_mode = "workspace-write"
+
+[notice]
+hide_rate_limit_model_nudge = true
+
+[notice.model_migrations]
+"gpt-5.3-codex" = "gpt-5.4"
+
+[plugins."gmail@openai-curated"]
+enabled = true
+
+[plugins."github@openai-curated"]
+enabled = true
+
+# model_provider = "aperture"
+
+# [model_providers.aperture]
+# name = "Aperture Proxy"
+# base_url = "http://aperture.tail3d4e4.ts.net/v1"
+# wire_api = "responses"
+
+[hooks.state]

@@ -1,0 +1,22 @@
+# CLI tools
+brew "python"
+brew "ffmpeg"
+brew "git"
+brew "wget"
+brew "tree"
+brew "stow"
+brew "fzf"
+brew "node"
+brew "bash"
+brew "neovim"
+brew "starship"
+brew "zellij"
+brew "rust"
+brew "lazygit"
+brew "ripgrep"
+brew "eza"
+
+#GUI apps
+cask "arc"
+cask "alfred"
+cask "ghostty"

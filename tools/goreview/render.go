@@ -1,0 +1,237 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+)
+
+// subtreeHasChanges returns true if fn or any of its transitive callees are new/modified.
+func subtreeHasChanges(
+	fn *funcNode,
+	adj map[*funcNode][]callChild,
+	di *diffInfo,
+	seen map[*funcNode]bool,
+) bool {
+	if seen[fn] {
+		return false
+	}
+	seen[fn] = true
+	if di.classify(fn) != unchanged {
+		return true
+	}
+	for _, c := range adj[fn] {
+		if subtreeHasChanges(c.fn, adj, di, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+func render(w io.Writer, g *callGraph, di *diffInfo, maxDepth int, changesOnly bool, short bool) {
+	// Header with stats.
+	fmt.Fprintf(w, "%s", g.pkgPath)
+	if di != nil {
+		var nNew, nMod int
+		for _, fn := range g.funcs {
+			switch di.classify(fn) {
+			case added:
+				nNew++
+			case modified:
+				nMod++
+			}
+		}
+		var parts []string
+		if nNew == len(g.funcs) {
+			parts = append(parts, fmt.Sprintf("new package, %d functions", len(g.funcs)))
+		} else {
+			if nNew > 0 {
+				parts = append(parts, fmt.Sprintf("%d new", nNew))
+			}
+			if nMod > 0 {
+				parts = append(parts, fmt.Sprintf("%d modified", nMod))
+			}
+			parts = append(parts, fmt.Sprintf("%d total", len(g.funcs)))
+		}
+		fmt.Fprintf(w, " — %s", strings.Join(parts, ", "))
+	}
+	fmt.Fprintf(w, "\n\n")
+
+	// Which functions are called by something?
+	called := map[*funcNode]bool{}
+	for _, children := range g.adj {
+		for _, c := range children {
+			called[c.fn] = true
+		}
+	}
+
+	// Group exported functions: methods by receiver, rest standalone.
+	// A type gets its own group if it has at least one uncalled exported method
+	// (i.e., an API entry point). Types whose exported methods are *only* ever
+	// called from other functions (e.g., Config.Validate) appear inline.
+	typeHasRoot := map[string]bool{}
+	for _, fn := range g.funcs {
+		if fn.exported && fn.recv != "" && !called[fn] {
+			typeHasRoot[fn.recv] = true
+		}
+	}
+	typeRoots := map[string][]*funcNode{} // recv type → exported methods
+	var standalone []*funcNode
+	for _, fn := range g.funcs {
+		if !fn.exported {
+			// Include unexported functions as roots if they are
+			// new/modified and not called by any other function.
+			if di != nil && di.classify(fn) != unchanged && !called[fn] {
+				standalone = append(standalone, fn)
+			}
+			continue
+		}
+		if fn.recv != "" && typeHasRoot[fn.recv] {
+			typeRoots[fn.recv] = append(typeRoots[fn.recv], fn)
+		} else if fn.recv == "" {
+			standalone = append(standalone, fn)
+		}
+	}
+
+	sort.Slice(standalone, func(i, j int) bool {
+		return standalone[i].line < standalone[j].line
+	})
+
+	visited := map[*funcNode]bool{}
+
+	// Standalone exported functions.
+	changesCheckSeen := map[*funcNode]bool{}
+	for _, fn := range standalone {
+		if changesOnly && di != nil && !subtreeHasChanges(fn, g.adj, di, changesCheckSeen) {
+			continue
+		}
+		printFuncNode(w, fn, "  ", true, true, "", g.adj, di, visited, 0, maxDepth, short)
+	}
+	if len(standalone) > 0 && len(typeRoots) > 0 {
+		fmt.Fprintln(w)
+	}
+
+	// Type groups.
+	typeNames := sortedKeys(typeRoots)
+	for ti, tname := range typeNames {
+		roots := typeRoots[tname]
+		if changesOnly && di != nil {
+			var filtered []*funcNode
+			for _, fn := range roots {
+				if subtreeHasChanges(fn, g.adj, di, changesCheckSeen) {
+					filtered = append(filtered, fn)
+				}
+			}
+			if len(filtered) == 0 {
+				continue
+			}
+			roots = filtered
+		}
+		sort.Slice(roots, func(i, j int) bool {
+			return roots[i].line < roots[j].line
+		})
+		fmt.Fprintf(w, "  %s\n", tname)
+		for i, fn := range roots {
+			isLast := i == len(roots)-1
+			printFuncNode(w, fn, "  ", isLast, false, tname, g.adj, di, visited, 0, maxDepth, short)
+		}
+		if ti < len(typeNames)-1 {
+			fmt.Fprintln(w)
+		}
+	}
+	fmt.Fprintln(w)
+}
+
+func printFuncNode(
+	w io.Writer,
+	fn *funcNode,
+	prefix string,
+	isLast bool,
+	isRoot bool,
+	groupRecv string, // non-empty when inside a type group → strip receiver prefix
+	adj map[*funcNode][]callChild,
+	di *diffInfo,
+	visited map[*funcNode]bool,
+	depth, maxDepth int,
+	short bool,
+) {
+	var marker string
+	if di != nil {
+		marker = di.classify(fn).marker()
+	} else {
+		marker = " "
+	}
+
+	var connector string
+	switch {
+	case isRoot:
+		connector = ""
+	case isLast:
+		connector = "└── "
+	default:
+		connector = "├── "
+	}
+
+	// Display name: strip receiver prefix when inside a type group.
+	name := fn.name
+	if groupRecv != "" && fn.recv == groupRecv {
+		name = fn.shortName
+	}
+
+	// Revisit: show name only with ↩.
+	if visited[fn] {
+		fmt.Fprintf(w, "%s%s%s%s ↩\n", marker, prefix, connector, name)
+		return
+	}
+	visited[fn] = true
+
+	label := name
+	if !short {
+		label += fn.sig
+	}
+	fmt.Fprintf(w, "%s%s%s%s\n", marker, prefix, connector, label)
+
+	if maxDepth > 0 && depth >= maxDepth {
+		return
+	}
+
+	children := adj[fn]
+	if len(children) == 0 {
+		return
+	}
+
+	var childPrefix string
+	switch {
+	case isRoot:
+		childPrefix = prefix
+	case isLast:
+		childPrefix = prefix + "    "
+	default:
+		childPrefix = prefix + "│   "
+	}
+
+	// Deduplicate children: only print each callee once per parent.
+	seen := map[*funcNode]bool{}
+	var unique []callChild
+	for _, c := range children {
+		if !seen[c.fn] {
+			seen[c.fn] = true
+			unique = append(unique, c)
+		}
+	}
+
+	for i, c := range unique {
+		last := i == len(unique)-1
+		printFuncNode(w, c.fn, childPrefix, last, false, groupRecv, adj, di, visited, depth+1, maxDepth, short)
+	}
+}
+
+func sortedKeys(m map[string][]*funcNode) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
