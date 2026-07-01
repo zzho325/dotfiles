@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/api";
@@ -291,10 +292,43 @@ pub fn last_agent_message(transcript_jsonl: &str) -> Option<String> {
 }
 
 fn env_or(key: &str, fallback: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    env_value(key)
+        .or_else(|| local_env_value(key))
         .unwrap_or_else(|| fallback.to_string())
+}
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn local_env_value(key: &str) -> Option<String> {
+    let path = dirs::home_dir()?.join(".zsh_local");
+    env_value_from_file(&path, key)
+}
+
+fn env_value_from_file(path: &Path, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .find_map(|line| env_value_from_line(line, key))
+}
+
+fn env_value_from_line(line: &str, key: &str) -> Option<String> {
+    let line = line.trim();
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let (name, value) = line.split_once('=')?;
+    if name.trim() != key {
+        return None;
+    }
+
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value)
+        .trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn decode_session_response(resp: ureq::Response) -> Result<SessionResponse, String> {
@@ -370,5 +404,41 @@ mod tests {
 }
 "#;
         assert_eq!(last_agent_message(json).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn env_value_from_line_parses_exported_quoted_value() {
+        let line = r#"export ORCH_REMOTE_AGENT_API_URL="https://example.test/api""#;
+        assert_eq!(
+            env_value_from_line(line, "ORCH_REMOTE_AGENT_API_URL").as_deref(),
+            Some("https://example.test/api"),
+        );
+    }
+
+    #[test]
+    fn env_value_from_line_ignores_other_keys() {
+        let line = r#"export OTHER_KEY="https://example.test/api""#;
+        assert_eq!(env_value_from_line(line, "ORCH_REMOTE_AGENT_API_URL"), None);
+    }
+
+    #[test]
+    fn env_value_from_file_reads_local_env_file() {
+        let path = std::env::temp_dir()
+            .join(format!("orch-remote-agent-env-{}.test", std::process::id(),));
+        std::fs::write(
+            &path,
+            r#"
+export OTHER_KEY="ignored"
+export ORCH_REMOTE_AGENT_API_URL='https://example.test/api'
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            env_value_from_file(&path, "ORCH_REMOTE_AGENT_API_URL").as_deref(),
+            Some("https://example.test/api"),
+        );
+
+        std::fs::remove_file(path).unwrap();
     }
 }
