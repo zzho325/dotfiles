@@ -475,62 +475,6 @@ pub fn prepare_task_worktree(
     Ok(worktree.to_string_lossy().to_string())
 }
 
-pub fn ensure_worktree_notes(worktree: &str) -> Result<(), String> {
-    let worktree = Path::new(worktree);
-    ensure_notes_ignored(worktree)?;
-    let notes = worktree.join("notes.md");
-    if notes.exists() {
-        if notes.is_file() {
-            return Ok(());
-        }
-        return Err(format!(
-            "notes.md exists but is not a file: {}",
-            notes.display()
-        ));
-    }
-    fs::write(&notes, initial_notes()).map_err(|e| {
-        format!("failed to initialize {}: {e}", notes.display())
-    })
-}
-
-fn ensure_notes_ignored(worktree: &Path) -> Result<(), String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--git-path", "info/exclude"])
-        .current_dir(worktree)
-        .output()
-        .map_err(|e| format!("git rev-parse failed: {e}"))?;
-    if !output.status.success() {
-        return Err(command_error("git rev-parse", &output));
-    }
-    let exclude = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    let exclude = if exclude.is_absolute() {
-        exclude
-    } else {
-        worktree.join(exclude)
-    };
-    let existing = fs::read_to_string(&exclude).unwrap_or_default();
-    if existing.lines().any(|line| line.trim() == "/notes.md") {
-        return Ok(());
-    }
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str("/notes.md\n");
-    fs::write(&exclude, next).map_err(|e| {
-        format!("failed to update {}: {e}", exclude.display())
-    })
-}
-
-fn initial_notes() -> &'static str {
-    concat!(
-        "### WIP\n\n",
-        "### Proposed changes\n",
-        "Mark [x] to approve, add comment to discuss.\n\n",
-        "### Done\n",
-    )
-}
-
 fn refresh_main_worktree(repo: &Path) -> Result<(), String> {
     let main = repo.join("main");
     if !main.exists() {
@@ -880,33 +824,6 @@ mod tests {
             r#"{"ok": true}"#,
         );
         assert!(!path.with_extension("tmp").exists());
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn ensure_worktree_notes_initializes_file_and_exclude() {
-        let dir = std::env::temp_dir().join(format!(
-            "orch-test-notes-{}-{}",
-            std::process::id(),
-            cache::now_epoch(),
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let status = Command::new("git")
-            .arg("init")
-            .current_dir(&dir)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        ensure_worktree_notes(dir.to_str().unwrap()).unwrap();
-
-        assert_eq!(fs::read_to_string(dir.join("notes.md")).unwrap(), initial_notes());
-        assert!(
-            fs::read_to_string(dir.join(".git/info/exclude"))
-                .unwrap()
-                .lines()
-                .any(|line| line == "/notes.md"),
-        );
         fs::remove_dir_all(&dir).ok();
     }
 

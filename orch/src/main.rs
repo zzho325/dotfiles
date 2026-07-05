@@ -76,7 +76,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Parser, Subcommand};
@@ -86,6 +86,7 @@ use std::os::unix::process::CommandExt;
 
 const SCAN_MSG: &str = "[scan]";
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const ORCHESTRATOR_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 // CLI
 
@@ -149,6 +150,11 @@ enum Cmd {
     Remote {
         #[command(subcommand)]
         action: RemoteAction,
+    },
+    /// Review recent agent sessions and propose AGENTS.md guidance.
+    Guidance {
+        #[command(subcommand)]
+        action: GuidanceAction,
     },
     /// Garbage-collect orphan task worktrees and temporary PR worktrees.
     Gc,
@@ -323,6 +329,17 @@ enum RemoteAction {
 }
 
 #[derive(Subcommand)]
+enum GuidanceAction {
+    /// List proposed global guidance edits from recent agent sessions.
+    List,
+    /// Archive an accepted proposal. Pass `all` to resolve every active one.
+    Resolve { proposal: String },
+    /// Internal — run one queued guidance review.
+    #[command(hide = true)]
+    Run { id: String },
+}
+
+#[derive(Subcommand)]
 enum PrAction {
     /// Add a PR number to a task
     Add {
@@ -348,6 +365,16 @@ fn inbox_dir() -> PathBuf {
 
 fn repo_dir() -> String {
     std::env::var("ORCH_REPO").expect("ORCH_REPO must be set")
+}
+
+fn daemon_agent_cwd() -> PathBuf {
+    std::env::var("ORCH_REPO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| state::tasks_dir())
+}
+
+fn is_internal_orch_path(path: &Path, tasks_dir: &Path) -> bool {
+    path.starts_with(tasks_dir.join(".orch"))
 }
 
 // Inbox — file-based message queue for worker→orchestrator communication.
@@ -424,7 +451,9 @@ fn run_orchestrator(message: &str) {
             "--dangerously-skip-permissions",
         ])
         .env("ORCH_REPO", repo_dir())
+        .env("OLDPWD", repo_dir())
         .env_remove("CLAUDECODE")
+        .current_dir(daemon_agent_cwd())
         .stdin(Stdio::piped())
         .stdout(stdout_cfg)
         .stderr(stderr_cfg)
@@ -444,18 +473,19 @@ fn run_orchestrator(message: &str) {
         let _ = stdin.write_all(message.as_bytes());
     }
 
-    let exit_code = match child.wait() {
-        Ok(s) => {
-            if !s.success() {
-                eprintln!("[orch] claude exited with {s}");
+    let exit_code =
+        match wait_child_with_timeout(&mut child, "claude", ORCHESTRATOR_RUN_TIMEOUT) {
+            Ok(s) => {
+                if !s.success() {
+                    eprintln!("[orch] claude exited with {s}");
+                }
+                s.code().unwrap_or(-1)
             }
-            s.code().unwrap_or(-1)
-        }
-        Err(e) => {
-            eprintln!("[orch] claude wait failed: {e}");
-            -1
-        }
-    };
+            Err(e) => {
+                eprintln!("[orch] claude wait failed: {e}");
+                -1
+            }
+        };
 
     if !run_id.is_empty() {
         runs::finish_run(&run_id, exit_code);
@@ -463,6 +493,25 @@ fn run_orchestrator(message: &str) {
 
     // Reconcile PRs after each orchestrator run
     state::reconcile_prs();
+}
+
+fn wait_child_with_timeout(
+    child: &mut std::process::Child,
+    label: &str,
+    timeout: Duration,
+) -> io::Result<std::process::ExitStatus> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() > timeout {
+            eprintln!("[orch] {label} timed out after 5m");
+            let _ = child.kill();
+            return child.wait();
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 // Tmux helpers — used by daemon for activity polling and by legacy
@@ -679,10 +728,6 @@ fn cmd_spawn(name: &str) {
             return;
         }
     };
-    if let Err(e) = state::ensure_worktree_notes(&work_dir) {
-        eprintln!("[spawn] notes setup failed: {e}");
-        return;
-    }
     let cmd = record.agent.worker_kind.worker_cmd(&task_file);
 
     if !tmux(&["new-session", "-d", "-s", &session, "-c", &work_dir]) {
@@ -1532,6 +1577,540 @@ fn normalized_epoch_secs(epoch: u64) -> u64 {
     }
 }
 
+// Guidance review — propose AGENTS.md updates from recent agent sessions.
+
+const GUIDANCE_LOOKBACK_SECS: u64 = 14 * 24 * 3600;
+const GUIDANCE_MIN_INTERVAL_SECS: u64 = 30 * 60;
+const GUIDANCE_STALE_RUN_SECS: u64 = 60 * 60;
+const GUIDANCE_MAX_EXCERPTS: usize = 80;
+const GUIDANCE_MAX_EVIDENCE_CHARS: usize = 800;
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct GuidanceState {
+    #[serde(default)]
+    last_scan_at: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GuidanceRunMeta {
+    id: String,
+    status: String,
+    started_at: u64,
+    #[serde(default)]
+    finished_at: Option<u64>,
+    max_history_ts: u64,
+    excerpt_count: usize,
+    #[serde(default)]
+    exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuidanceEvent {
+    ts: u64,
+    session_id: String,
+    text: String,
+}
+
+fn guidance_dir() -> PathBuf {
+    state::tasks_dir().join(".orch").join("guidance")
+}
+
+fn guidance_runs_dir() -> PathBuf {
+    guidance_dir().join("runs")
+}
+
+fn guidance_run_dir(id: &str) -> PathBuf {
+    guidance_runs_dir().join(id)
+}
+
+fn guidance_state_path() -> PathBuf {
+    guidance_dir().join("state.json")
+}
+
+fn guidance_proposals_dir() -> PathBuf {
+    guidance_dir().join("proposals")
+}
+
+fn guidance_resolved_dir() -> PathBuf {
+    guidance_dir().join("resolved")
+}
+
+fn guidance_run_meta_path(id: &str) -> PathBuf {
+    guidance_run_dir(id).join("meta.json")
+}
+
+fn guidance_run_input_path(id: &str) -> PathBuf {
+    guidance_run_dir(id).join("input.md")
+}
+
+fn codex_history_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".codex").join("history.jsonl"))
+}
+
+fn codex_agents_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".codex").join("AGENTS.md"))
+}
+
+fn load_guidance_state() -> GuidanceState {
+    fs::read_to_string(guidance_state_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_guidance_state(state_value: &GuidanceState) -> bool {
+    if let Some(parent) = guidance_state_path().parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let Ok(json) = serde_json::to_string_pretty(state_value) else {
+        return false;
+    };
+    state::atomic_write(&guidance_state_path(), &json)
+}
+
+fn save_guidance_run_meta(meta: &GuidanceRunMeta) -> bool {
+    let path = guidance_run_meta_path(&meta.id);
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let Ok(json) = serde_json::to_string_pretty(meta) else {
+        return false;
+    };
+    state::atomic_write(&path, &json)
+}
+
+fn load_guidance_run_meta(id: &str) -> Option<GuidanceRunMeta> {
+    fs::read_to_string(guidance_run_meta_path(id))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn guidance_has_active_run(now: u64) -> bool {
+    let Ok(entries) = fs::read_dir(guidance_runs_dir()) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let id = entry.file_name().to_string_lossy().to_string();
+        let Some(meta) = load_guidance_run_meta(&id) else {
+            return false;
+        };
+        meta.status == "running"
+            && now.saturating_sub(meta.started_at) < GUIDANCE_STALE_RUN_SECS
+    })
+}
+
+fn guidance_batch_window_elapsed(state_value: &GuidanceState, now: u64) -> bool {
+    state_value.last_scan_at == 0
+        || now.saturating_sub(state_value.last_scan_at) >= GUIDANCE_MIN_INTERVAL_SECS
+}
+
+fn recent_history_events(history: &str, since: u64, now: u64) -> Vec<GuidanceEvent> {
+    history
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| {
+            let ts = v["ts"].as_u64().unwrap_or(0);
+            ts > since && ts <= now.saturating_add(60)
+        })
+        .filter_map(|v| {
+            let text = v["text"].as_str()?.trim();
+            if text.is_empty() || text.contains("## Constraints") {
+                return None;
+            }
+            Some(GuidanceEvent {
+                ts: v["ts"].as_u64().unwrap_or(0),
+                session_id: v["session_id"].as_str().unwrap_or("-").to_string(),
+                text: truncate_evidence(text),
+            })
+        })
+        .collect()
+}
+
+fn truncate_evidence(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= GUIDANCE_MAX_EVIDENCE_CHARS {
+        return text;
+    }
+    let mut out = text
+        .chars()
+        .take(GUIDANCE_MAX_EVIDENCE_CHARS.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn guidance_excerpts(events: &[GuidanceEvent]) -> Vec<GuidanceEvent> {
+    events
+        .iter()
+        .rev()
+        .take(GUIDANCE_MAX_EXCERPTS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn guidance_markdown_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+fn active_guidance_proposal_names() -> Vec<String> {
+    guidance_markdown_names(&guidance_proposals_dir())
+}
+
+fn resolved_guidance_proposal_names() -> Vec<String> {
+    guidance_markdown_names(&guidance_resolved_dir())
+}
+
+fn render_guidance_input(
+    since: u64,
+    max_ts: u64,
+    candidates: &[GuidanceEvent],
+) -> String {
+    let mut out = String::new();
+    out.push_str("# Guidance Review Input\n\n");
+    out.push_str(&format!("History range: `{since}` to `{max_ts}`\n\n"));
+    if let Some(path) = codex_agents_path() {
+        out.push_str(&format!("Current AGENTS.md: `{}`\n", path.display()));
+    }
+    out.push_str(&format!(
+        "Proposal directory: `{}`\n\n",
+        guidance_proposals_dir().display(),
+    ));
+
+    let active = active_guidance_proposal_names();
+    if !active.is_empty() {
+        out.push_str("Active proposals:\n");
+        for name in active {
+            out.push_str(&format!("- `{name}`\n"));
+        }
+        out.push('\n');
+    }
+
+    let resolved = resolved_guidance_proposal_names();
+    if !resolved.is_empty() {
+        out.push_str("Resolved proposals already incorporated or dismissed:\n");
+        for name in resolved {
+            out.push_str(&format!("- `{name}`\n"));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## New User Turns\n\n");
+    let mut session_order = Vec::new();
+    let mut by_session: HashMap<&str, Vec<&GuidanceEvent>> = HashMap::new();
+    for event in candidates {
+        let session_id = event.session_id.as_str();
+        if !by_session.contains_key(session_id) {
+            session_order.push(event.session_id.clone());
+        }
+        by_session.entry(session_id).or_default().push(event);
+    }
+    for session_id in session_order {
+        out.push_str(&format!("### Session `{session_id}`\n\n"));
+        if let Some(events) = by_session.get(session_id.as_str()) {
+            for event in events {
+                out.push_str(&format!("- ts={} {}\n", event.ts, event.text));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn prepare_guidance_review(now: u64) -> Option<String> {
+    if guidance_has_active_run(now) {
+        return None;
+    }
+    let Some(history_path) = codex_history_path() else {
+        return None;
+    };
+    let history = fs::read_to_string(&history_path).unwrap_or_default();
+    if history.trim().is_empty() {
+        return None;
+    }
+
+    let state_value = load_guidance_state();
+    if !guidance_batch_window_elapsed(&state_value, now) {
+        return None;
+    }
+    let since = if state_value.last_scan_at == 0 {
+        now.saturating_sub(GUIDANCE_LOOKBACK_SECS)
+    } else {
+        state_value.last_scan_at
+    };
+    let events = recent_history_events(&history, since, now);
+    let max_ts = events.iter().map(|e| e.ts).max().unwrap_or(since);
+    if events.is_empty() {
+        return None;
+    }
+
+    let excerpts = guidance_excerpts(&events);
+
+    let id = format!("{}-{}", now, std::process::id());
+    let dir = guidance_run_dir(&id);
+    if fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    fs::create_dir_all(guidance_proposals_dir()).ok();
+
+    let input = render_guidance_input(since, max_ts, &excerpts);
+    if fs::write(guidance_run_input_path(&id), input).is_err() {
+        return None;
+    }
+
+    let meta = GuidanceRunMeta {
+        id: id.clone(),
+        status: "running".into(),
+        started_at: now,
+        finished_at: None,
+        max_history_ts: max_ts,
+        excerpt_count: excerpts.len(),
+        exit_code: None,
+    };
+    save_guidance_run_meta(&meta).then_some(id)
+}
+
+fn guidance_prompt(id: &str) -> String {
+    let input = guidance_run_input_path(id);
+    format!(
+        "You are the orch guidance reviewer.\n\n\
+Read `{}`. Review only the new user turns in that file. They are grouped by \
+session; repeated corrections within one long session are valid evidence.\n\n\
+Goal:\n\
+- Propose durable global AGENTS.md guidance only when the excerpts show repeated \
+or clearly stable user preferences.\n\
+- Prefer proposals that would have prevented repeated corrections, even when the \
+corrections happen inside one task session.\n\
+- Do not propose task-specific implementation decisions; those belong in design docs.\n\
+- Do not edit AGENTS.md, code, tasks, or design docs.\n\
+- If current AGENTS.md already covers the behavior, do not create a proposal.\n\
+- If an existing proposal file already covers the behavior, update that file instead \
+of creating a duplicate.\n\n\
+- If a resolved proposal already covers the behavior, do not recreate it.\n\n\
+Write proposal markdown files to `{}`. Use stable kebab-case filenames, one proposal \
+per file. If there is nothing worth proposing, write no proposal files.\n\n\
+Proposal format:\n\
+# <short title>\n\n\
+## Proposal\n\
+<the exact AGENTS.md guidance to add or change>\n\n\
+## Evidence\n\
+- <session/timestamp evidence from the input>\n\n\
+## Suggested Patch\n\
+```diff\n\
+...\n\
+```\n",
+        input.display(),
+        guidance_proposals_dir().display(),
+    )
+}
+
+fn guidance_agent_command() -> (String, Vec<String>) {
+    if let Ok(cmd) = std::env::var("ORCH_GUIDANCE_AGENT") {
+        return (cmd, Vec::new());
+    }
+    (
+        "claude".into(),
+        vec![
+            "--model".into(),
+            "opus".into(),
+            "--agent".into(),
+            "orchestrator".into(),
+            "-p".into(),
+            "--dangerously-skip-permissions".into(),
+        ],
+    )
+}
+
+fn spawn_guidance_review() {
+    let now = cache::now_epoch();
+    let Some(id) = prepare_guidance_review(now) else {
+        return;
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("orch"));
+    let log_path = guidance_run_dir(&id).join("runner.log");
+    let Ok(log) = fs::File::create(&log_path) else {
+        eprintln!("[guidance] failed to create {}", log_path.display());
+        return;
+    };
+    let log2 = log.try_clone().ok();
+    let mut cmd = Command::new(exe);
+    cmd.args(["guidance", "run", &id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log));
+    if let Some(log2) = log2 {
+        cmd.stderr(Stdio::from(log2));
+    }
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    match cmd.spawn() {
+        Ok(_) => eprintln!("[guidance] review queued {id}"),
+        Err(e) => eprintln!("[guidance] failed to spawn review: {e}"),
+    }
+}
+
+fn cmd_guidance_run(id: &str) {
+    let Some(mut meta) = load_guidance_run_meta(id) else {
+        eprintln!("[guidance] no run id {id}");
+        return;
+    };
+    let prompt = guidance_prompt(id);
+    let (bin, args) = guidance_agent_command();
+    let mut command = Command::new(bin);
+    command
+        .args(args)
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Ok(repo) = std::env::var("ORCH_REPO") {
+        command
+            .env("ORCH_REPO", &repo)
+            .env("OLDPWD", &repo)
+            .current_dir(repo);
+    }
+    let status = command.spawn().and_then(|mut child| {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(prompt.as_bytes());
+        }
+        wait_child_with_timeout(&mut child, "guidance agent", ORCHESTRATOR_RUN_TIMEOUT)
+    });
+
+    let (status_name, exit_code) = match status {
+        Ok(status) if status.success() => {
+            let mut state_value = load_guidance_state();
+            state_value.last_scan_at = state_value.last_scan_at.max(meta.max_history_ts);
+            save_guidance_state(&state_value);
+            ("done", status.code().unwrap_or(0))
+        }
+        Ok(status) => ("failed", status.code().unwrap_or(-1)),
+        Err(e) => {
+            eprintln!("[guidance] failed to run agent: {e}");
+            ("failed", -1)
+        }
+    };
+
+    meta.status = status_name.into();
+    meta.finished_at = Some(cache::now_epoch());
+    meta.exit_code = Some(exit_code);
+    save_guidance_run_meta(&meta);
+}
+
+fn active_guidance_proposals() -> Vec<(PathBuf, Option<SystemTime>)> {
+    let Ok(entries) = fs::read_dir(guidance_proposals_dir()) else {
+        return Vec::new();
+    };
+    let mut proposals: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|e| {
+            let modified = e.metadata().and_then(|m| m.modified()).ok();
+            Some((e.path(), modified))
+        })
+        .collect();
+    proposals.sort_by(|a, b| b.1.cmp(&a.1));
+    proposals
+}
+
+fn guidance_resolve_target(name: &str) -> Option<PathBuf> {
+    let wanted = Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+    let wanted_stem = wanted.strip_suffix(".md").unwrap_or(wanted);
+
+    active_guidance_proposals()
+        .into_iter()
+        .map(|(path, _)| path)
+        .find(|path| {
+            let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+                return false;
+            };
+            let stem = file_name.strip_suffix(".md").unwrap_or(file_name);
+            file_name == wanted || stem == wanted_stem
+        })
+}
+
+fn guidance_resolved_target(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("proposal.md");
+    let target = guidance_resolved_dir().join(file_name);
+    if !target.exists() {
+        return target;
+    }
+    let stem = file_name.strip_suffix(".md").unwrap_or(file_name);
+    guidance_resolved_dir().join(format!("{}-{}.md", stem, cache::now_epoch()))
+}
+
+fn cmd_guidance_resolve(proposal: &str) {
+    let mut targets = if proposal == "all" {
+        active_guidance_proposals()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>()
+    } else {
+        match guidance_resolve_target(proposal) {
+            Some(path) => vec![path],
+            None => {
+                eprintln!("[guidance] no active proposal matches {proposal}");
+                return;
+            }
+        }
+    };
+
+    if targets.is_empty() {
+        eprintln!("[guidance] no AGENTS.md proposals");
+        return;
+    }
+
+    targets.sort();
+    fs::create_dir_all(guidance_resolved_dir()).ok();
+    for path in targets {
+        let target = guidance_resolved_target(&path);
+        match fs::rename(&path, &target) {
+            Ok(()) => println!("resolved: {}", target.display()),
+            Err(e) => eprintln!("[guidance] failed to resolve {}: {e}", path.display()),
+        }
+    }
+}
+
+fn cmd_guidance_list() {
+    let proposals = active_guidance_proposals();
+    if proposals.is_empty() {
+        eprintln!("[guidance] no AGENTS.md proposals");
+        return;
+    }
+    for (i, (path, _)) in proposals.iter().enumerate() {
+        if i > 0 {
+            println!("\n---\n");
+        }
+        println!("proposal: {}", path.display());
+        println!();
+        match fs::read_to_string(path) {
+            Ok(content) => println!("{}", content.trim()),
+            Err(e) => println!("failed to read proposal: {e}"),
+        }
+    }
+}
+
 fn cmd_review_list() {
     prune_old_reviews();
     let metas = load_review_metas();
@@ -2235,6 +2814,9 @@ fn cmd_daemon() {
     let inbox = inbox_dir();
     fs::create_dir_all(&dir).ok();
     fs::create_dir_all(&inbox).ok();
+    if let Err(e) = std::env::set_current_dir(daemon_agent_cwd()) {
+        eprintln!("[orch] failed to set daemon cwd: {e}");
+    }
 
     runs::prune_old_runs();
 
@@ -2272,6 +2854,7 @@ fn cmd_daemon() {
     startup_msg.push_str(SCAN_MSG);
     eprintln!("[orch] running initial scan...");
     run_orchestrator(&startup_msg);
+    spawn_guidance_review();
 
     let mut tasks = known_tasks(&dir);
     let (tx, rx) = mpsc::channel();
@@ -2283,10 +2866,12 @@ fn cmd_daemon() {
         .expect("failed to watch ~/tasks");
 
     let mut last_activity = session_activity();
-    eprintln!("[orch] watching for changes (activity poll every 20m)...");
+    let mut next_poll = Instant::now() + POLL_INTERVAL;
+    eprintln!("[orch] watching for changes (activity poll every 5m)...");
 
     loop {
-        match rx.recv_timeout(POLL_INTERVAL) {
+        let timeout = next_poll.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(timeout) {
             Ok(Ok(events)) => {
                 // Check for inbox messages triggered by file events
                 let inbox_msgs = events
@@ -2294,6 +2879,12 @@ fn cmd_daemon() {
                     .any(|e| e.path.starts_with(&inbox))
                     .then(|| drain_inbox())
                     .flatten();
+                let has_task_event = events
+                    .iter()
+                    .any(|e| !is_internal_orch_path(&e.path, &dir));
+                if inbox_msgs.is_none() && !has_task_event {
+                    continue;
+                }
 
                 // Detect new task files
                 let current = known_tasks(&dir);
@@ -2311,10 +2902,13 @@ fn cmd_daemon() {
                 if !parts.is_empty() {
                     last_activity = session_activity();
                     run_orchestrator(&parts.join("\n\n"));
+                    spawn_guidance_review();
                 }
             }
             Ok(Err(e)) => eprintln!("[orch] watch error: {e:?}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                next_poll = Instant::now() + POLL_INTERVAL;
+
                 // Reconcile PRs on each poll
                 state::reconcile_prs();
 
@@ -2336,6 +2930,7 @@ fn cmd_daemon() {
                     let list = changed.join(", ");
                     eprintln!("[orch] activity in: {list}");
                     run_orchestrator(&format!("[scan] {list}"));
+                    spawn_guidance_review();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2433,6 +3028,11 @@ fn main() {
                 source,
                 json,
             } => cmd_remote_list(limit, source.as_deref(), json),
+        },
+        Some(Cmd::Guidance { action }) => match action {
+            GuidanceAction::List => cmd_guidance_list(),
+            GuidanceAction::Resolve { proposal } => cmd_guidance_resolve(&proposal),
+            GuidanceAction::Run { id } => cmd_guidance_run(&id),
         },
         Some(Cmd::Linear { action }) => match action {
             LinearAction::Add { task, key } => cmd_linear_add(&task, &key),
@@ -2569,6 +3169,110 @@ mod tests {
         assert_eq!(claude.agent, remote_agent::DEFAULT_CLAUDE_AGENT);
         assert_eq!(claude.model, remote_agent::DEFAULT_CLAUDE_MODEL);
         assert_eq!(claude.effort_level, remote_agent::DEFAULT_EFFORT);
+    }
+
+    #[test]
+    fn recent_history_events_filters_by_cursor() {
+        let history = r#"
+{"session_id":"s1","ts":100,"text":"old"}
+{"session_id":"s1","ts":190,"text":"new"}
+{"session_id":"s2","ts":500,"text":"future"}
+"#;
+
+        let events = recent_history_events(history, 100, 200);
+
+        assert_eq!(
+            events,
+            vec![GuidanceEvent {
+                ts: 190,
+                session_id: "s1".to_string(),
+                text: "new".to_string(),
+            }],
+        );
+    }
+
+    #[test]
+    fn guidance_batch_window_waits_thirty_minutes() {
+        let state_value = GuidanceState {
+            last_scan_at: 1000,
+        };
+
+        assert!(!guidance_batch_window_elapsed(&state_value, 2799));
+        assert!(guidance_batch_window_elapsed(&state_value, 2800));
+        assert!(guidance_batch_window_elapsed(&GuidanceState::default(), 1000));
+    }
+
+    #[test]
+    fn truncate_evidence_keeps_useful_context() {
+        let text = "a".repeat(500);
+
+        assert_eq!(truncate_evidence(&text).chars().count(), 500);
+
+        let long = "a".repeat(GUIDANCE_MAX_EVIDENCE_CHARS + 20);
+        let truncated = truncate_evidence(&long);
+
+        assert_eq!(
+            truncated.chars().count(),
+            GUIDANCE_MAX_EVIDENCE_CHARS,
+        );
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn guidance_excerpts_keep_recent_turns_in_order() {
+        let events = vec![
+            GuidanceEvent {
+                ts: 1,
+                session_id: "s1".to_string(),
+                text: "ok looks good".to_string(),
+            },
+            GuidanceEvent {
+                ts: 2,
+                session_id: "s1".to_string(),
+                text: "dont use fancy error names".to_string(),
+            },
+            GuidanceEvent {
+                ts: 3,
+                session_id: "s2".to_string(),
+                text: "what tests do we need".to_string(),
+            },
+        ];
+
+        let excerpts = guidance_excerpts(&events);
+
+        assert_eq!(excerpts.len(), 3);
+        assert_eq!(excerpts[0].ts, 1);
+        assert_eq!(excerpts[1].ts, 2);
+        assert_eq!(excerpts[2].ts, 3);
+    }
+
+    #[test]
+    fn daemon_agent_cwd_uses_orch_repo_when_set() {
+        unsafe {
+            std::env::set_var("ORCH_REPO", "/tmp/orch-repo");
+        }
+        assert_eq!(daemon_agent_cwd(), PathBuf::from("/tmp/orch-repo"));
+        unsafe {
+            std::env::remove_var("ORCH_REPO");
+        }
+    }
+
+    #[test]
+    fn internal_orch_path_filter_matches_only_orch_state() {
+        let tasks_dir = PathBuf::from("/tmp/tasks");
+
+        assert!(is_internal_orch_path(
+            Path::new("/tmp/tasks/.orch/cache/status.json"),
+            &tasks_dir,
+        ));
+        assert!(!is_internal_orch_path(
+            Path::new("/tmp/tasks/.inbox/message.msg"),
+            &tasks_dir,
+        ));
+        assert!(!is_internal_orch_path(
+            Path::new("/tmp/tasks/task-foo.md"),
+            &tasks_dir,
+        ));
     }
 
     #[test]

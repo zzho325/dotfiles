@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/api";
 pub const DEFAULT_AGENT: &str = "codex";
 pub const DEFAULT_CLAUDE_AGENT: &str = "claude-code";
-pub const DEFAULT_MODEL: &str = "gpt-5.5";
+pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-4-8";
 pub const DEFAULT_EFFORT: &str = "xhigh";
 

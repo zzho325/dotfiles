@@ -8,16 +8,14 @@ Each top-level directory is a **stow package** — its contents mirror `$HOME`:
 
 ```
 dotfiles/
-├── agents/          → ~/.agents/        # AI agent configs, skills, design docs
+├── agents/          → ~/.agents/        # AI agent configs and skills
 │   └── .agents/
 │       ├── agents/                      # Agent definitions (AGENTS.md)
 │       ├── skills/                      # Claude Code / Codex skills (SKILL.md each)
-│       │   ├── orderlint/
-│       │   ├── reviewbot/
-│       │   ├── remote-session/
-│       │   └── ...
-│       ├── skills_local/                # Machine-local skills (not stowed)
-│       └── design/                      # Design docs
+│       │   ├── goanalysis/
+│       │   ├── orch-worker/
+│       │   └── playwriter/
+│       └── skills_local/                # Machine-local skills (not stowed)
 ├── claude/          → ~/.claude/        # Claude Code settings, hooks, keybindings
 │   └── .claude/
 │       ├── settings.json
@@ -31,7 +29,9 @@ dotfiles/
 ├── starship/        → ~/.config/starship/
 ├── tmux/            → ~/.config/tmux/
 ├── tools/                               # Custom dev tools (not stowed)
-│   └── orderlint/                       # Go linter for function ordering
+│   ├── goreview/
+│   ├── notes-cli/
+│   └── orderlint/
 ├── zellij/          → ~/.config/zellij/
 ├── zsh/             → ~/.config/zsh/
 └── setup/                               # Brewfile, bootstrap helpers
@@ -43,7 +43,7 @@ dotfiles/
 
 ```
 dotfiles/git/.config/git/config  →  ~/.config/git/config
-dotfiles/agents/.agents/skills/orderlint/  →  ~/.agents/skills/orderlint
+dotfiles/agents/.agents/skills/goanalysis/  →  ~/.agents/skills/goanalysis
 ```
 
 ### Skills linkage

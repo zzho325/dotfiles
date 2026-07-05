@@ -7,6 +7,7 @@ require "ash.auto-dark-mode"
 require "ash.nvim-tree"
 require "ash.fzf-lua"
 require "ash.gitsigns"
+vim.cmd [[packadd mason-lspconfig.nvim]]
 require("ash.lsp").setup()
 
 -- project level override

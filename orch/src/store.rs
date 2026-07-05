@@ -450,8 +450,6 @@ impl Store {
         err_str
     }
 
-    // Migration. See `docs/redesign.md` §6.
-
     /// Migrate from legacy `.state/*.json` + `order.json` to the v2
     /// store. Idempotent: a partial run leaves `store.v2.tmp/` and no
     /// marker; the next call discards the tmp and starts over.
@@ -589,8 +587,7 @@ fn ordered_names(order: &[String], all: &[String]) -> Vec<String> {
     result
 }
 
-/// Build a TaskRecord from legacy `.state/<slug>.json` plus tmux
-/// observation. Field mapping per `redesign.md` §6.
+/// Build a TaskRecord from legacy `.state/<slug>.json` plus tmux observation.
 fn build_record_from_legacy(
     id: TaskId,
     slug: &str,

@@ -17,7 +17,7 @@ allowed-tools:
 ## Goal
 
 Complete the development task in `$ARGUMENTS`. Read the task, resume any
-existing context, make the change, verify it, and leave a clear handoff.
+existing context, make the change, verify it, and report the outcome.
 
 ## Orch Contract
 
@@ -26,8 +26,7 @@ existing context, make the change, verify it, and leave a clear handoff.
 - If `pwd` is wrong, report it instead of continuing in the wrong checkout.
 - Autonomous worker: use `orch -` for status, blockers, and handoff. Do not edit
   task files directly.
-- Interactive worker: talk in the conversation; use `notes.md` only for durable
-  decisions, designs, PR text, or handoff.
+- Interactive worker: talk in the conversation.
 - For Linear tasks, branch/bookmark names should look like
   `ashley/ENG-<number>-<short-desc>`. Orch can infer the ticket from that.
 
@@ -36,8 +35,8 @@ existing context, make the change, verify it, and leave a clear handoff.
 1. Read the task file at `$ARGUMENTS`, especially `## Summary` and `## Status`.
 2. If the task has `design: <name>`, read `docs/design/<name>/`.
 3. Read `agents/dev-workflow.md` when present for repo-specific commands.
-4. If `notes.md` exists, skim current WIP/decisions. If it is missing, continue;
-   notes are helpful, not a blocker.
+4. If `notes.md` exists, skim it for durable decisions. If it is missing,
+   continue.
 
 ## Working Style
 
@@ -52,29 +51,12 @@ existing context, make the change, verify it, and leave a clear handoff.
 
 ## Notes
 
-`notes.md` is a scratchpad, not a gate.
+`notes.md` is optional memory, not workflow.
 
-- Use it when a conclusion needs to survive context loss: design summary,
-  decisions, review findings, PR description, test plan, handoff.
-- Do not let notes become a chat transcript. Discuss in conversation; summarize
-  settled decisions in notes when useful.
-- Prefer the `notes` CLI when modifying `notes.md`; it keeps sections tidy.
-- If the CLI is missing, broken, or `notes.md` is absent, do not block the task.
-  Continue in conversation and mention the notes issue in the handoff.
-- Keep notes short and visual.
-
-Useful commands:
-
-```sh
-notes wip
-notes wip "title" -
-notes reply <N> "text"
-notes resolve <N>
-notes propose "title" -b "body"
-notes proposals
-notes approved
-notes applied
-```
+- Use it only when a decision, design sketch, PR text, or handoff needs to
+  survive context loss.
+- Do not block on missing `notes.md` or a broken `notes` CLI.
+- Do not turn notes into a chat transcript.
 
 ## Reviews
 
@@ -120,7 +102,7 @@ push. Keep bookmark/stack changes intentional.
 <rules>
 
 - **NEVER write, edit, or create files under `~/tasks/`.** The orchestrator is the sole writer to task files.
-- Prefer the `notes` CLI for `notes.md`; if it is unavailable, continue and say so.
+- Do not block task work on `notes.md` or the `notes` CLI.
 - If stuck, ask in conversation when interactive or report with `orch -` when autonomous.
 - Never spawn other `claude` processes.
 - Do the work. You are a worker, not a coordinator.

@@ -1,7 +1,4 @@
-//! Phase 3 TUI — three-pane layout (list / details / log).
-//!
-//! See `docs/redesign.md` §5 (TUI Layout) and `docs/redesign-notes.md`
-//! Phase 3 for the contract this module implements.
+//! Three-pane TUI: task list, right-side detail tabs, and run log.
 //!
 //! Focus model:
 //!
@@ -27,7 +24,7 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     terminal::{
         disable_raw_mode, enable_raw_mode,
         EnterAlternateScreen, LeaveAlternateScreen,
@@ -77,7 +74,7 @@ const HELP_OVERLAY_HEIGHT: u16 = 25;
 // State.
 
 /// Focus is a two-state toggle. The Log is a passive viewer — always
-/// scrolled via global PgUp/PgDn/`<`/`>` regardless of focus.
+/// scrolled via global Ctrl-U/Ctrl-D/`<`/`>` regardless of focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     List,
@@ -629,9 +626,7 @@ fn linear_from_record(
         })
         .collect();
     let fallback_project = fallback_project_name(&stubs, cache);
-    // Stable sort: project name (alphabetical), with no-project rows
-    // last per docs/linear-list-minimal.md edge case. Then by key
-    // within a project for tiebreak.
+    // Stable sort: project name first, no-project rows last, then key.
     stubs.sort_by(|a, b| {
         let pa = project_name_for_key(&a.key, cache).or_else(|| fallback_project.clone());
         let pb = project_name_for_key(&b.key, cache).or_else(|| fallback_project.clone());
@@ -1212,8 +1207,6 @@ fn render_tab_linear(frame: &mut Frame, area: Rect, app: &mut App, task: &TaskVi
         }
     }
 }
-
-// Row stream for the minimal list view. See docs/linear-list-minimal.md.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RowKind {
@@ -3171,7 +3164,7 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
             kv_line("  [ / ]    ", "previous / next task (any focus)"),
             kv_line("  1-9      ", "attach to task #N"),
             kv_line("  Esc      ", "right → list; list → quit"),
-            kv_line("  PgUp/Dn  ", "log scroll  ·  < top  ·  > tail"),
+            kv_line("  C-u/C-d  ", "log scroll  ·  < top  ·  > tail"),
             kv_line("  ?  r  m  ", "help · refresh · message"),
             Line::styled(" List", Style::default().fg(IRIS)),
             kv_line("  j k g G  ", "move · top / bottom"),
@@ -3290,9 +3283,7 @@ fn total_wrapped_rows(lines: &[String], width: usize) -> usize {
 
 // Key handling.
 //
-// Two-zone focus (List ↔ Right). Log is a passive viewer — scrolled
-// via global PgUp/PgDn/`<`/`>` regardless of focus. See
-// `docs/tui-nav-redesign.md`.
+// Two-zone focus (List <-> Right). Log is passive and uses global scroll keys.
 
 const UNWIRED_KEYS: &[char] = &['n', 'M', 'W'];
 
@@ -3321,11 +3312,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         (KeyCode::Esc, _) => {
-            // Layered Esc per docs/tui-nav-redesign.md + linear-deep-design:
-            // 1. modal cancel (handled above by show_help / message_input)
-            // 2. Linear detail → list (single Esc, restores cursor; `u` walks parents)
-            // 3. focus right → focus list
-            // 4. focus list → quit
+            // Layered Esc: modal cancel, Linear detail -> list,
+            // right focus -> list focus, list focus -> quit.
             if app.focus == Pane::Right
                 && app.detail_tab == Tab::Linear
             {
@@ -3417,11 +3405,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
         // Global log controls.
-        (KeyCode::PageUp, _) => {
+        (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
             app.log.follow_bottom = false;
             app.log.scroll = app.log.scroll.saturating_sub(10);
         }
-        (KeyCode::PageDown, _) => {
+        (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             app.log.follow_bottom = false;
             app.log.scroll = app.log.scroll.saturating_add(10);
         }
@@ -3434,9 +3422,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         // Unwired keys produce a toast instead of silently no-op'ing.
         (KeyCode::Char(c), _) if UNWIRED_KEYS.contains(&c) => {
-            app.toast = Some(format!(
-                "not yet wired — see redesign-notes Phase 1F/4a ({c})"
-            ));
+            app.toast = Some(format!("not yet wired ({c})"));
             return;
         }
         _ => match app.focus {
@@ -3607,7 +3593,6 @@ fn lifecycle_spawn(name: &str, _session: &str) -> Result<String, String> {
         &record.worktree.path,
         allow_existing_dirty,
     )?;
-    state::ensure_worktree_notes(&work_dir)?;
     let cmd_str = record.agent.worker_kind.worker_cmd(&task_file);
     let new_ok = Command::new("tmux")
         .args(["new-session", "-d", "-s", &session, "-c", &work_dir])
@@ -5381,12 +5366,22 @@ mod tests {
 
     #[test]
     fn log_scroll_via_global_keys() {
-        // Log is no longer a focus zone. PgUp/PgDn/`<`/`>` work from any focus.
+        // Log is no longer a focus zone. Ctrl-U/Ctrl-D/`<`/`>` work
+        // from any focus; PgUp/PgDn remain aliases.
         let mut app = test_app();
         app.focus = Pane::List;
         app.log.follow_bottom = true;
-        handle_key(&mut app, KeyEvent::from(KeyCode::PageUp));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
         assert!(!app.log.follow_bottom);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        handle_key(&mut app, KeyEvent::from(KeyCode::PageUp));
+        handle_key(&mut app, KeyEvent::from(KeyCode::PageDown));
         // > re-enables follow_bottom (tail-follow)
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('>')));
         assert!(app.log.follow_bottom);

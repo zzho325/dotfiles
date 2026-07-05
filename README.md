@@ -1,10 +1,13 @@
-# Dotfiles 🐰🚀
+# Dotfiles
 
-Bootstrap dev environment.
+Personal dev environment managed with GNU Stow.
 
-## Backlog
+```sh
+./setup.sh
+```
 
-- [ ] Clean up repo level ignore files, some exclude are missing.
-- [ ] Move devbox only stuff to separate zshrc.
-- [ ] Brew: fix brew installing and skip cast on devbox.
-- [ ] Fix auto-dark on devbox: this requires sudo to send env vir over ssh.
+Main packages:
+
+- shell/editor: `zsh`, `nvim`, `tmux`, `ghostty`, `starship`
+- agent configs: `agents`, `claude`, `codex`
+- tools: `orch`, `orderlint`, `goreview`, `notes-cli`

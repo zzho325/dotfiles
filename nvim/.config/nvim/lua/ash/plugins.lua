@@ -86,13 +86,6 @@ return packer.startup(function(use)
 	})
 	use({
 		"mason-org/mason-lspconfig.nvim",
-		after = "mason.nvim",
-		config = function()
-			require("mason-lspconfig").setup({
-				ensure_installed = { "lua_ls" },
-				automatic_installation = false,
-			})
-		end,
 	})
 	use 'neovim/nvim-lspconfig'
 

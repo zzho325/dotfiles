@@ -1,4 +1,4 @@
-model = "gpt-5.5"
+model = "gpt-5.6-sol"
 model_reasoning_effort = "high"
 approval_policy = "on-request"
 sandbox_mode = "danger-full-access"
@@ -12,11 +12,13 @@ service_tier = "default"
 inherit = "all"
 
 [tui]
-status_line = ["model-with-reasoning", "context-remaining", "current-dir", "git-branch"]
+status_line = ["git-branch"]
 theme = "rose-pine-dawn-soft-diff"
+status_line_use_colors = true
 
 [tui.model_availability_nux]
 "gpt-5.5" = 4
+"gpt-5.6-sol" = 4
 
 [features]
 multi_agent = true
@@ -28,6 +30,9 @@ url = "https://mcp.linear.app/mcp"
 
 [mcp_servers.linear-server.tools.save_issue]
 approval_mode = "approve"
+
+[mcp_servers.openaiDeveloperDocs]
+url = "https://developers.openai.com/mcp"
 
 [profiles.safe]
 approval_policy = "untrusted"
@@ -67,4 +72,7 @@ trusted_hash = "sha256:9abe10d1dd63da07a4e24bbefb16994b03382a278bccfd0027cad3c1c
 trusted_hash = "sha256:264902ca00fcacc5c1b0efe1106ca86ab9fb51648e54a490387a3a1a686dfb52"
 
 [projects."/Users/azhou@column.com"]
+trust_level = "trusted"
+
+[projects."/Users/azhou@column.com/dotfiles"]
 trust_level = "trusted"

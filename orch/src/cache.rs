@@ -121,7 +121,7 @@ pub struct CachedPr {
     pub codex: String,
     pub fetched_at: u64,
 
-    // Extended metadata (PR redesign — preview + drill).
+    // Extended PR metadata for preview and drill-down views.
     /// `OPEN | CLOSED | MERGED`. Empty when never fetched.
     #[serde(default)]
     pub state: String,
