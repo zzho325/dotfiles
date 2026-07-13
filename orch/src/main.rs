@@ -425,10 +425,7 @@ fn run_orchestrator(message: &str) {
     let (run_id, output_file) = match &run {
         Some((id, path)) => {
             eprintln!("[orch] run {id}");
-            (
-                id.clone(),
-                std::fs::File::create(path).ok(),
-            )
+            (id.clone(), std::fs::File::create(path).ok())
         }
         None => (String::new(), None),
     };
@@ -445,8 +442,14 @@ fn run_orchestrator(message: &str) {
 
     let mut child = match Command::new("claude")
         .args([
-            "--model", "opus",
-            "--agent", "orchestrator",
+            "--model",
+            "opus",
+            "--agent",
+            "orchestrator",
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+            "--no-chrome",
             "-p",
             "--dangerously-skip-permissions",
         ])
@@ -473,19 +476,18 @@ fn run_orchestrator(message: &str) {
         let _ = stdin.write_all(message.as_bytes());
     }
 
-    let exit_code =
-        match wait_child_with_timeout(&mut child, "claude", ORCHESTRATOR_RUN_TIMEOUT) {
-            Ok(s) => {
-                if !s.success() {
-                    eprintln!("[orch] claude exited with {s}");
-                }
-                s.code().unwrap_or(-1)
+    let exit_code = match wait_child_with_timeout(&mut child, "claude", ORCHESTRATOR_RUN_TIMEOUT) {
+        Ok(s) => {
+            if !s.success() {
+                eprintln!("[orch] claude exited with {s}");
             }
-            Err(e) => {
-                eprintln!("[orch] claude wait failed: {e}");
-                -1
-            }
-        };
+            s.code().unwrap_or(-1)
+        }
+        Err(e) => {
+            eprintln!("[orch] claude wait failed: {e}");
+            -1
+        }
+    };
 
     if !run_id.is_empty() {
         runs::finish_run(&run_id, exit_code);
@@ -555,8 +557,7 @@ fn session_activity() -> HashMap<String, u64> {
         .lines()
         .filter_map(|line| {
             let (name, epoch) = line.split_once(' ')?;
-            if !state::strip_numeric_prefix(name).starts_with("task-")
-            {
+            if !state::strip_numeric_prefix(name).starts_with("task-") {
                 return None;
             }
             Some((name.to_string(), epoch.parse::<u64>().ok()?))
@@ -617,7 +618,9 @@ fn cmd_status() {
         let session = content
             .lines()
             .find_map(|l| {
-                l.trim().strip_prefix("session:").map(|s| s.trim().to_string())
+                l.trim()
+                    .strip_prefix("session:")
+                    .map(|s| s.trim().to_string())
             })
             .unwrap_or_else(|| format!("task-{name}"));
 
@@ -710,24 +713,18 @@ fn cmd_spawn(name: &str) {
 
     let task_file = state::tasks_dir().join(format!("{name}.md"));
     if !task_file.exists() {
-        eprintln!(
-            "[spawn] task file not found: {}",
-            task_file.display(),
-        );
+        eprintln!("[spawn] task file not found: {}", task_file.display(),);
         return;
     }
     let allow_existing_dirty = record.desired_state != store::DesiredState::New;
-    let work_dir = match state::prepare_task_worktree(
-        name,
-        &record.worktree.path,
-        allow_existing_dirty,
-    ) {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("[spawn] worktree setup failed: {e}");
-            return;
-        }
-    };
+    let work_dir =
+        match state::prepare_task_worktree(name, &record.worktree.path, allow_existing_dirty) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("[spawn] worktree setup failed: {e}");
+                return;
+            }
+        };
     let cmd = record.agent.worker_kind.worker_cmd(&task_file);
 
     if !tmux(&["new-session", "-d", "-s", &session, "-c", &work_dir]) {
@@ -958,12 +955,14 @@ fn cmd_close(name: &str, keep_worktree: bool) {
             return;
         }
         if let Err(e) = fs::rename(&md, &archive_path) {
-            eprintln!(
-                "[close] FAIL: could not archive {name}.md ({e}) — aborting cleanup"
-            );
+            eprintln!("[close] FAIL: could not archive {name}.md ({e}) — aborting cleanup");
             return;
         }
-        eprintln!("[close] archived {} -> {}", md.display(), archive_path.display());
+        eprintln!(
+            "[close] archived {} -> {}",
+            md.display(),
+            archive_path.display()
+        );
     }
 
     if !session_name.is_empty() {
@@ -1473,8 +1472,7 @@ fn cmd_remote_ask(
         match client.create_session(&config) {
             Ok(session) => {
                 eprintln!("[remote] session: {}", session.session_id);
-                let result =
-                    client.ask_existing_session(&session.session_id, &prompt, timeout);
+                let result = client.ask_existing_session(&session.session_id, &prompt, timeout);
                 (session.session_id, result)
             }
             Err(e) => {
@@ -1541,11 +1539,7 @@ fn cmd_remote_list(limit: u32, source: Option<&str>, json: bool) {
 }
 
 fn dash_if_empty(s: &str) -> &str {
-    if s.trim().is_empty() {
-        "-"
-    } else {
-        s
-    }
+    if s.trim().is_empty() { "-" } else { s }
 }
 
 fn format_age(epoch: u64) -> String {
@@ -1698,8 +1692,7 @@ fn guidance_has_active_run(now: u64) -> bool {
         let Some(meta) = load_guidance_run_meta(&id) else {
             return false;
         };
-        meta.status == "running"
-            && now.saturating_sub(meta.started_at) < GUIDANCE_STALE_RUN_SECS
+        meta.status == "running" && now.saturating_sub(meta.started_at) < GUIDANCE_STALE_RUN_SECS
     })
 }
 
@@ -1776,11 +1769,7 @@ fn resolved_guidance_proposal_names() -> Vec<String> {
     guidance_markdown_names(&guidance_resolved_dir())
 }
 
-fn render_guidance_input(
-    since: u64,
-    max_ts: u64,
-    candidates: &[GuidanceEvent],
-) -> String {
+fn render_guidance_input(since: u64, max_ts: u64, candidates: &[GuidanceEvent]) -> String {
     let mut out = String::new();
     out.push_str("# Guidance Review Input\n\n");
     out.push_str(&format!("History range: `{since}` to `{max_ts}`\n\n"));
@@ -1930,6 +1919,10 @@ fn guidance_agent_command() -> (String, Vec<String>) {
             "opus".into(),
             "--agent".into(),
             "orchestrator".into(),
+            "--strict-mcp-config".into(),
+            "--mcp-config".into(),
+            r#"{"mcpServers":{}}"#.into(),
+            "--no-chrome".into(),
             "-p".into(),
             "--dangerously-skip-permissions".into(),
         ],
@@ -2179,11 +2172,9 @@ fn cwd_matches_review(hook_cwd: &str, meta: &ReviewMeta) -> bool {
 }
 
 fn pending_review_for_hook(hook_cwd: &str) -> Option<ReviewMeta> {
-    load_review_metas().into_iter().find(|m| {
-        m.status == "ready"
-            && m.consumed_at.is_none()
-            && cwd_matches_review(hook_cwd, m)
-    })
+    load_review_metas()
+        .into_iter()
+        .find(|m| m.status == "ready" && m.consumed_at.is_none() && cwd_matches_review(hook_cwd, m))
 }
 
 fn review_hook_message(meta: &ReviewMeta) -> String {
@@ -2315,8 +2306,7 @@ fn link_keys_in_record(
             // matches (from branch names) are normalized so dedup and
             // not_found checks against the cache work.
             let key = m.as_str().to_uppercase();
-            if record.links.linear_issues.iter().any(|li| li.key == key)
-                || not_found.contains(&key)
+            if record.links.linear_issues.iter().any(|li| li.key == key) || not_found.contains(&key)
             {
                 continue;
             }
@@ -2332,10 +2322,7 @@ fn link_keys_in_record(
 }
 
 /// Scan the task's .md file for Linear keys. New links use `MarkdownScan`.
-fn scan_task_md_for_keys(
-    record: &mut store::TaskRecord,
-    not_found: &HashSet<String>,
-) -> usize {
+fn scan_task_md_for_keys(record: &mut store::TaskRecord, not_found: &HashSet<String>) -> usize {
     let md = state::tasks_dir().join(format!("{}.md", record.slug));
     let Ok(content) = fs::read_to_string(&md) else {
         return 0;
@@ -2388,10 +2375,14 @@ fn jj_bookmarks(worktree: &str) -> Option<Vec<String>> {
     // the repo (e.g. `task-review-25597`, `task-app-triage-2`).
     let out = Command::new("jj")
         .args([
-            "bookmark", "list",
-            "--repository", worktree,
-            "-r", "trunk()..@",
-            "-T", r#"name ++ "\n""#,
+            "bookmark",
+            "list",
+            "--repository",
+            worktree,
+            "-r",
+            "trunk()..@",
+            "-T",
+            r#"name ++ "\n""#,
         ])
         .stderr(Stdio::null())
         .output()
@@ -2439,10 +2430,19 @@ fn cmd_linear_clean() {
     };
     let mut total_removed = 0;
     let mut tasks_touched = 0;
-    for id in registry.open_order.iter().chain(registry.closed_order.iter()) {
-        let Some(mut record) = s.load_record(*id) else { continue };
+    for id in registry
+        .open_order
+        .iter()
+        .chain(registry.closed_order.iter())
+    {
+        let Some(mut record) = s.load_record(*id) else {
+            continue;
+        };
         let before = record.links.linear_issues.len();
-        record.links.linear_issues.retain(|li| !bad.contains(&li.key));
+        record
+            .links
+            .linear_issues
+            .retain(|li| !bad.contains(&li.key));
         let removed = before - record.links.linear_issues.len();
         if removed > 0 {
             record.updated_at = cache::now_epoch();
@@ -2452,9 +2452,7 @@ fn cmd_linear_clean() {
             eprintln!("  {}: removed {removed} key(s)", record.slug);
         }
     }
-    eprintln!(
-        "[linear] cleaned {total_removed} link(s) from {tasks_touched} task(s)"
-    );
+    eprintln!("[linear] cleaned {total_removed} link(s) from {tasks_touched} task(s)");
 }
 
 fn cmd_linear_scan(task: Option<&str>) {
@@ -2463,13 +2461,12 @@ fn cmd_linear_scan(task: Option<&str>) {
         Some(t) => vec![t.to_string()],
         None => state::ordered_open_slugs(),
     };
-    let not_found: HashSet<String> = cache::read_linear()
-        .not_found
-        .into_iter()
-        .collect();
+    let not_found: HashSet<String> = cache::read_linear().not_found.into_iter().collect();
     let mut total = 0;
     for t in &tasks {
-        let Some(mut record) = s.load_record_by_slug(t) else { continue };
+        let Some(mut record) = s.load_record_by_slug(t) else {
+            continue;
+        };
         let md_n = scan_task_md_for_keys(&mut record, &not_found);
         let bm_n = scan_worktree_bookmark_for_keys(&mut record, &not_found);
         if md_n > 0 {
@@ -2499,10 +2496,7 @@ fn cmd_gc() {
     }
 
     if !task_orphans.is_empty() {
-        eprintln!(
-            "[gc] found {} orphan task worktree(s):",
-            task_orphans.len(),
-        );
+        eprintln!("[gc] found {} orphan task worktree(s):", task_orphans.len(),);
         for path in &task_orphans {
             eprintln!("  {}", path.display());
         }
@@ -2562,16 +2556,14 @@ fn spawn_status_loop() {
             let mut cached_tasks = HashMap::new();
             for task in &tasks {
                 let session = &task.record.tmux.session_name;
-                let matched = sessions.values().find(|s| {
-                    state::session_matches(&s.name, session)
-                });
+                let matched = sessions
+                    .values()
+                    .find(|s| state::session_matches(&s.name, session));
                 cached_tasks.insert(
                     task.name.clone(),
                     cache::CachedTask {
                         session: session.clone(),
-                        actual_session: matched
-                            .map(|s| s.name.clone())
-                            .unwrap_or_default(),
+                        actual_session: matched.map(|s| s.name.clone()).unwrap_or_default(),
                         status: match task.status {
                             state::TaskStatus::Ready => "ready",
                             state::TaskStatus::Working => "working",
@@ -2582,8 +2574,7 @@ fn spawn_status_loop() {
                             state::TaskStatus::Error => "error",
                         }
                         .to_string(),
-                        has_active_process: matched
-                            .is_some_and(|s| s.has_active_process),
+                        has_active_process: matched.is_some_and(|s| s.has_active_process),
                     },
                 );
             }
@@ -2631,10 +2622,7 @@ fn spawn_linear_loop() {
             // `orch linear scan`. Idempotent.
             let store = store::Store::default();
             let mut records = store.load_open_records();
-            let not_found: HashSet<String> = cache::read_linear()
-                .not_found
-                .into_iter()
-                .collect();
+            let not_found: HashSet<String> = cache::read_linear().not_found.into_iter().collect();
             for record in records.iter_mut() {
                 let md_n = scan_task_md_for_keys(record, &not_found);
                 let bm_n = scan_worktree_bookmark_for_keys(record, &not_found);
@@ -2685,16 +2673,12 @@ fn spawn_linear_loop() {
                     .flat_map(|c: &cache::CachedLinear| {
                         c.children.iter().map(|ch| ch.identifier.clone())
                     })
-                    .filter(|k| {
-                        !cached_issues.contains_key(k)
-                            && !not_found.contains(k)
-                    })
+                    .filter(|k| !cached_issues.contains_key(k) && !not_found.contains(k))
                     .collect();
                 if candidates.is_empty() || depth >= 5 {
                     break;
                 }
-                let mut seen: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for key in &candidates {
                     if !seen.insert(key.clone()) {
                         continue;
@@ -2709,8 +2693,7 @@ fn spawn_linear_loop() {
                 }
                 depth += 1;
             }
-            let disconnected = hard_failures > 0
-                && cached_issues.is_empty();
+            let disconnected = hard_failures > 0 && cached_issues.is_empty();
             cache::write_linear(&cache::LinearCache {
                 generated_at: cache::now_epoch(),
                 issues: cached_issues,
@@ -2736,10 +2719,7 @@ fn fetch_into_cache(
     for attempt in 0..2 {
         match linear::fetch_issue(api_key, key) {
             Ok(Some(issue)) => {
-                cached_issues.insert(
-                    key.to_string(),
-                    cache::CachedLinear::from_issue(&issue),
-                );
+                cached_issues.insert(key.to_string(), cache::CachedLinear::from_issue(&issue));
                 return;
             }
             Ok(None) => {
@@ -2791,10 +2771,7 @@ fn spawn_pr_loop() {
             let mut cached_prs = HashMap::new();
             for num in &all_prs {
                 if let Some(data) = pr_cache.get(*num) {
-                    cached_prs.insert(
-                        *num,
-                        cache::CachedPr::from_pr_data(&data),
-                    );
+                    cached_prs.insert(*num, cache::CachedPr::from_pr_data(&data));
                 }
             }
             cache::write_prs(&cache::PrCache {
@@ -2879,17 +2856,14 @@ fn cmd_daemon() {
                     .any(|e| e.path.starts_with(&inbox))
                     .then(|| drain_inbox())
                     .flatten();
-                let has_task_event = events
-                    .iter()
-                    .any(|e| !is_internal_orch_path(&e.path, &dir));
+                let has_task_event = events.iter().any(|e| !is_internal_orch_path(&e.path, &dir));
                 if inbox_msgs.is_none() && !has_task_event {
                     continue;
                 }
 
                 // Detect new task files
                 let current = known_tasks(&dir);
-                let new_tasks: Vec<_> =
-                    current.difference(&tasks).cloned().collect();
+                let new_tasks: Vec<_> = current.difference(&tasks).cloned().collect();
                 tasks = current;
 
                 let mut parts = Vec::new();
@@ -2972,31 +2946,38 @@ fn main() {
             eprintln!("[orch] message sent");
         }
         Some(Cmd::Gc) => cmd_gc(),
-        Some(Cmd::Close { name, keep_worktree }) => cmd_close(&name, keep_worktree),
+        Some(Cmd::Close {
+            name,
+            keep_worktree,
+        }) => cmd_close(&name, keep_worktree),
         Some(Cmd::Busy { action }) => match action {
             BusyAction::Start => cmd_busy_start(),
             BusyAction::Stop => cmd_busy_stop(),
         },
-        Some(Cmd::RenderDebug { width, height, tab, focus, select, linear_detail, linear_cursor }) => {
-            tui3::render_debug(
-                width,
-                height,
-                &tab,
-                &focus,
-                select,
-                linear_detail.as_deref(),
-                linear_cursor.as_deref(),
-            )
-        }
+        Some(Cmd::RenderDebug {
+            width,
+            height,
+            tab,
+            focus,
+            select,
+            linear_detail,
+            linear_cursor,
+        }) => tui3::render_debug(
+            width,
+            height,
+            &tab,
+            &focus,
+            select,
+            linear_detail.as_deref(),
+            linear_cursor.as_deref(),
+        ),
         Some(Cmd::Review { action }) => match action {
             ReviewAction::Start {
                 target,
                 label,
                 local,
                 claude,
-            } => {
-                cmd_review_start(&target, label.as_deref(), local, claude)
-            }
+            } => cmd_review_start(&target, label.as_deref(), local, claude),
             ReviewAction::Run { id } => cmd_review_run(&id),
             ReviewAction::List => cmd_review_list(),
             ReviewAction::Show { id, consume } => cmd_review_show(id.as_deref(), consume),
@@ -3090,12 +3071,22 @@ mod tests {
 
     #[test]
     fn is_tmp_review_worktree_matches_pr_review_dirs() {
-        assert!(is_tmp_review_worktree(Path::new("/private/tmp/repo-pr29145")));
-        assert!(is_tmp_review_worktree(Path::new("/private/tmp/repo-pr-29145")));
+        assert!(is_tmp_review_worktree(Path::new(
+            "/private/tmp/repo-pr29145"
+        )));
+        assert!(is_tmp_review_worktree(Path::new(
+            "/private/tmp/repo-pr-29145"
+        )));
         assert!(is_tmp_review_worktree(Path::new("/private/tmp/pr29150")));
-        assert!(is_tmp_review_worktree(Path::new("/private/tmp/pr29150.bamegW")));
-        assert!(is_tmp_review_worktree(Path::new("/private/tmp/pr29150-review")));
-        assert!(is_tmp_review_worktree(Path::new("/private/tmp/pr29150-worktree")));
+        assert!(is_tmp_review_worktree(Path::new(
+            "/private/tmp/pr29150.bamegW"
+        )));
+        assert!(is_tmp_review_worktree(Path::new(
+            "/private/tmp/pr29150-review"
+        )));
+        assert!(is_tmp_review_worktree(Path::new(
+            "/private/tmp/pr29150-worktree"
+        )));
         assert!(!is_tmp_review_worktree(Path::new("/private/tmp/project")));
         assert!(!is_tmp_review_worktree(Path::new("/tmp/pr29150")));
     }
@@ -3193,13 +3184,14 @@ mod tests {
 
     #[test]
     fn guidance_batch_window_waits_thirty_minutes() {
-        let state_value = GuidanceState {
-            last_scan_at: 1000,
-        };
+        let state_value = GuidanceState { last_scan_at: 1000 };
 
         assert!(!guidance_batch_window_elapsed(&state_value, 2799));
         assert!(guidance_batch_window_elapsed(&state_value, 2800));
-        assert!(guidance_batch_window_elapsed(&GuidanceState::default(), 1000));
+        assert!(guidance_batch_window_elapsed(
+            &GuidanceState::default(),
+            1000
+        ));
     }
 
     #[test]
@@ -3211,10 +3203,7 @@ mod tests {
         let long = "a".repeat(GUIDANCE_MAX_EVIDENCE_CHARS + 20);
         let truncated = truncate_evidence(&long);
 
-        assert_eq!(
-            truncated.chars().count(),
-            GUIDANCE_MAX_EVIDENCE_CHARS,
-        );
+        assert_eq!(truncated.chars().count(), GUIDANCE_MAX_EVIDENCE_CHARS,);
         assert!(truncated.ends_with("..."));
     }
 

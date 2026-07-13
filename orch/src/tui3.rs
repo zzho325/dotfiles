@@ -45,23 +45,67 @@ use crate::store::{self, DesiredState, TaskRecord};
 
 const FAST_TICK: Duration = Duration::from_secs(2);
 
-// Rosé Pine Dawn palette.
-const TEXT: Color = Color::Rgb(0x57, 0x52, 0x79);
-const SUBTLE: Color = Color::Rgb(0x79, 0x75, 0x93);
-const MUTED: Color = Color::Rgb(0x98, 0x93, 0xa5);
-const LOVE: Color = Color::Rgb(0xb4, 0x63, 0x7a);
-const GOLD: Color = Color::Rgb(0xea, 0x9d, 0x34);
-const PINE: Color = Color::Rgb(0x28, 0x69, 0x83);
-const FOAM: Color = Color::Rgb(0x56, 0x94, 0x9f);
-const IRIS: Color = Color::Rgb(0x90, 0x7a, 0xa9);
-const HL_LOW: Color = Color::Rgb(0xf4, 0xed, 0xe8);
-/// Stronger highlight for the focused-pane cursor row. Visible enough
-/// to read at a glance against Rosé Pine Dawn's `0xfaf4ed` base.
-const HL_MED: Color = Color::Rgb(0xe5, 0xd5, 0xc4);
-/// Pale green-tinted background for `+` lines in the diff body.
-const DIFF_ADD_BG: Color = Color::Rgb(0xea, 0xf0, 0xe2);
-/// Pale rose-tinted background for `-` lines.
-const DIFF_DEL_BG: Color = Color::Rgb(0xf6, 0xe2, 0xe2);
+#[derive(Clone, Copy)]
+struct Palette {
+    text: Color,
+    subtle: Color,
+    muted: Color,
+    love: Color,
+    gold: Color,
+    pine: Color,
+    foam: Color,
+    iris: Color,
+    highlight_low: Color,
+    diff_add: Color,
+    diff_del: Color,
+}
+
+const LIGHT_PALETTE: Palette = Palette {
+    text: Color::Rgb(0x57, 0x52, 0x79),
+    subtle: Color::Rgb(0x79, 0x75, 0x93),
+    muted: Color::Rgb(0x98, 0x93, 0xa5),
+    love: Color::Rgb(0xb4, 0x63, 0x7a),
+    gold: Color::Rgb(0xea, 0x9d, 0x34),
+    pine: Color::Rgb(0x28, 0x69, 0x83),
+    foam: Color::Rgb(0x56, 0x94, 0x9f),
+    iris: Color::Rgb(0x90, 0x7a, 0xa9),
+    highlight_low: Color::Rgb(0xf4, 0xed, 0xe8),
+    diff_add: Color::Rgb(0xea, 0xf0, 0xe2),
+    diff_del: Color::Rgb(0xf6, 0xe2, 0xe2),
+};
+
+const DARK_PALETTE: Palette = Palette {
+    text: Color::Rgb(0xe0, 0xde, 0xf4),
+    subtle: Color::Rgb(0x90, 0x8c, 0xaa),
+    muted: Color::Rgb(0x6e, 0x6a, 0x86),
+    love: Color::Rgb(0xeb, 0x6f, 0x92),
+    gold: Color::Rgb(0xf6, 0xc1, 0x77),
+    pine: Color::Rgb(0x31, 0x74, 0x8f),
+    foam: Color::Rgb(0x9c, 0xcf, 0xd8),
+    iris: Color::Rgb(0xc4, 0xa7, 0xe7),
+    highlight_low: Color::Rgb(0x26, 0x23, 0x3a),
+    diff_add: Color::Rgb(0x1f, 0x3a, 0x33),
+    diff_del: Color::Rgb(0x3b, 0x25, 0x30),
+};
+
+fn palette() -> &'static Palette {
+    static PALETTE: OnceLock<Palette> = OnceLock::new();
+    PALETTE.get_or_init(|| {
+        if macos_dark_mode() {
+            DARK_PALETTE
+        } else {
+            LIGHT_PALETTE
+        }
+    })
+}
+
+fn macos_dark_mode() -> bool {
+    Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .map(|output| output.status.success() && output.stdout.starts_with(b"Dark"))
+        .unwrap_or(false)
+}
 
 // Layout constants.
 const LIST_WIDTH: u16 = 34;
@@ -263,6 +307,7 @@ pub struct App {
     /// scroll)` survive; `focus` resets to `Files`.
     pub pr_detail_state: HashMap<u32, (usize, u16)>,
     pub log: LogPane,
+    pub show_activity: bool,
     pub show_help: bool,
     pub daemon_alive: bool,
     pub last_fast: Instant,
@@ -270,8 +315,7 @@ pub struct App {
     pub message_input: Option<String>,
     pub read_runs: HashSet<String>,
     pub last_run_count: usize,
-    /// Transient single-line message rendered in the log header.
-    /// Used to surface "not yet wired" feedback for unimplemented keys.
+    /// Transient operation feedback rendered near the bottom.
     /// Cleared on next non-toast key press.
     pub toast: Option<String>,
     /// Skip live IO during tests.
@@ -295,6 +339,7 @@ impl App {
             pr_view: PrView::default(),
             pr_detail_state: HashMap::new(),
             log: LogPane::default(),
+            show_activity: false,
             show_help: false,
             daemon_alive,
             last_fast: Instant::now(),
@@ -409,9 +454,19 @@ impl App {
     }
 
     fn refresh_log(&mut self) {
-        let Some(run_id) = self.log.run_id.clone() else {
+        if self.readonly {
+            return;
+        }
+        let Some(run) = crate::runs::list_runs(1).into_iter().next() else {
             return;
         };
+        if self.log.run_id.as_deref() != Some(run.id.as_str()) {
+            self.open_run(&run);
+            return;
+        }
+
+        self.log.finished = run.finished_at.is_some();
+        let run_id = run.id;
         let cur_len = crate::runs::output_len(&run_id);
         if cur_len == self.log.last_len {
             return;
@@ -701,34 +756,53 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    let outer = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(1), // left ruler
-            Constraint::Length(LIST_WIDTH),
-            Constraint::Length(SEPARATOR_WIDTH),
-            Constraint::Length(1), // right ruler
-            Constraint::Min(0),
-        ])
-        .split(area);
+    let outer = Layout::horizontal([
+        Constraint::Length(LIST_WIDTH),
+        Constraint::Length(SEPARATOR_WIDTH),
+        Constraint::Min(0),
+    ])
+    .split(area);
 
-    render_focus_ruler(frame, outer[0], app.focus == Pane::List);
-    render_list(frame, outer[1], app);
-    render_vertical_separator(frame, outer[2]);
-    render_focus_ruler(frame, outer[3], app.focus == Pane::Right);
+    render_list(frame, outer[0], app);
+    render_vertical_separator(frame, outer[1]);
 
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let preview_active = app.focus == Pane::Right
+        && match app.detail_tab {
+            Tab::Prs => pr_preview_target(app).is_some(),
+            Tab::Linear => app
+                .selected_task()
+                .map(|task| !task.linear.is_empty())
+                .unwrap_or(false),
+            _ => false,
+        };
+    if app.show_activity || preview_active {
+        let right = Layout::vertical([
             Constraint::Percentage(100 - LOG_HEIGHT_RATIO),
-            Constraint::Length(1), // horizontal separator
+            Constraint::Length(1),
             Constraint::Min(3),
         ])
-        .split(outer[4]);
-
-    render_details(frame, right[0], app);
-    render_horizontal_separator(frame, right[1]);
-    render_log(frame, right[2], app);
+        .split(outer[2]);
+        render_details(frame, right[0], app);
+        render_horizontal_separator(frame, right[1]);
+        render_log(frame, right[2], app);
+    } else {
+        render_details(frame, outer[2], app);
+        if let Some(toast) = &app.toast {
+            let toast_area = Rect {
+                x: outer[2].x,
+                y: outer[2].bottom().saturating_sub(1),
+                width: outer[2].width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!(" {toast}"),
+                    Style::default().fg(palette().muted),
+                )),
+                toast_area,
+            );
+        }
+    }
 
     if app.show_help {
         render_help_overlay(frame, area);
@@ -776,7 +850,7 @@ fn render_message_input(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Line::styled(
             " Enter to send · Esc to cancel",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         )),
         hint_area,
     );
@@ -789,9 +863,9 @@ fn render_message_input(frame: &mut Frame, area: Rect, app: &App) {
         height: total_rows.saturating_sub(1).max(1),
     };
     let line = Line::from(vec![
-        Span::styled(prompt, Style::default().fg(LOVE)),
-        Span::styled(buf.clone(), Style::default().fg(TEXT)),
-        Span::styled("▌", Style::default().fg(LOVE)),
+        Span::styled(prompt, Style::default().fg(palette().love)),
+        Span::styled(buf.clone(), Style::default().fg(palette().text)),
+        Span::styled("▌", Style::default().fg(palette().love)),
     ]);
     frame.render_widget(
         Paragraph::new(line).wrap(Wrap { trim: false }),
@@ -799,21 +873,10 @@ fn render_message_input(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_focus_ruler(frame: &mut Frame, area: Rect, focused: bool) {
-    if !focused {
-        return;
-    }
-    let mut lines = Vec::with_capacity(area.height as usize);
-    for _ in 0..area.height {
-        lines.push(Line::styled("▎", Style::default().fg(LOVE)));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
 fn render_vertical_separator(frame: &mut Frame, area: Rect) {
     let mut lines = Vec::with_capacity(area.height as usize);
     for _ in 0..area.height {
-        lines.push(Line::styled("│", Style::default().fg(MUTED)));
+        lines.push(Line::styled("│", Style::default().fg(palette().muted)));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -821,7 +884,7 @@ fn render_vertical_separator(frame: &mut Frame, area: Rect) {
 fn render_horizontal_separator(frame: &mut Frame, area: Rect) {
     let bar = "─".repeat(area.width as usize);
     frame.render_widget(
-        Paragraph::new(Line::styled(bar, Style::default().fg(MUTED))),
+        Paragraph::new(Line::styled(bar, Style::default().fg(palette().muted))),
         area,
     );
 }
@@ -832,32 +895,34 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
 
     // Header.
     let header_style = if focused {
-        Style::default().fg(TEXT)
+        Style::default().fg(palette().text)
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(palette().muted)
     };
-    lines.push(Line::styled(" tasks", header_style));
+    lines.push(Line::from(vec![
+        Span::styled(" tasks", header_style),
+        Span::styled(
+            format!("  {}", app.tasks.len()),
+            Style::default().fg(palette().muted),
+        ),
+    ]));
     lines.push(Line::styled(
         "─".repeat(area.width as usize),
-        Style::default().fg(MUTED),
+        Style::default().fg(palette().muted),
     ));
 
     if app.tasks.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            " no tasks · n to create",
-            Style::default().fg(SUBTLE),
+            " no tasks",
+            Style::default().fg(palette().subtle),
         ));
     } else {
-        let name_color = if focused { TEXT } else { SUBTLE };
+        let name_color = if focused { palette().text } else { palette().subtle };
         for (i, task) in app.tasks.iter().enumerate() {
             let selected = i == app.selected;
             let badge = status_str(task.status);
             let badge_color = status_color(task.status);
-            // Selected row keeps HL_LOW background regardless of focus,
-            // so the user can navigate back to it.
-            let row_bg = if selected { Some(HL_LOW) } else { None };
-
             // P/L counts intentionally omitted from the list — the
             // user only cared about drift state at a glance, and the
             // detail tabs already surface PR/Linear counts.
@@ -886,17 +951,17 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             let mut spans = vec![
                 Span::styled(
                     cursor,
-                    Style::default().fg(if selected { LOVE } else { MUTED }),
+                    Style::default().fg(if selected { palette().love } else { palette().muted }),
                 ),
-                Span::styled(id_text, Style::default().fg(MUTED)),
+                Span::styled(id_text, Style::default().fg(palette().muted)),
                 Span::styled(name_str, Style::default().fg(name_color)),
                 Span::raw(" ".repeat(pad)),
             ];
             if !counts.is_empty() {
                 let counts_color = if task.drift() && counts.starts_with(" ⚠") {
-                    LOVE
+                    palette().love
                 } else {
-                    SUBTLE
+                    palette().subtle
                 };
                 spans.push(Span::styled(counts, Style::default().fg(counts_color)));
             }
@@ -906,8 +971,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             ));
 
             let mut line = Line::from(spans);
-            if let Some(bg) = row_bg {
-                line = line.style(Style::default().bg(bg));
+            if selected {
+                line = line.style(Style::default().bg(palette().highlight_low));
             }
             lines.push(line);
         }
@@ -920,14 +985,13 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.tasks.is_empty() {
         let placeholder = Paragraph::new(vec![
             Line::raw(""),
-            Line::styled(" select a task", Style::default().fg(SUBTLE)),
+            Line::styled(" select a task", Style::default().fg(palette().subtle)),
         ]);
         frame.render_widget(placeholder, area);
         return;
     }
 
-    // Tab bar. Active tab gets a `▎` underline glyph next to its label
-    // so the user can identify the live tab without relying on color alone.
+    // Tab bar.
     let focused = app.focus == Pane::Right;
     let tabs = [Tab::Overview, Tab::Prs, Tab::Linear, Tab::Panes];
     let mut tab_spans: Vec<Span> = Vec::new();
@@ -935,18 +999,15 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
     for (i, tab) in tabs.iter().enumerate() {
         let active = *tab == app.detail_tab;
         let style = if active {
-            Style::default().fg(if focused { LOVE } else { TEXT })
+            Style::default().fg(if focused { palette().love } else { palette().text })
         } else if focused {
-            Style::default().fg(SUBTLE)
+            Style::default().fg(palette().subtle)
         } else {
-            Style::default().fg(MUTED)
+            Style::default().fg(palette().muted)
         };
-        if active {
-            tab_spans.push(Span::styled("▎", Style::default().fg(LOVE)));
-        }
         tab_spans.push(Span::styled(tab.label(), style));
         if i + 1 < tabs.len() {
-            tab_spans.push(Span::styled("  ·  ", Style::default().fg(MUTED)));
+            tab_spans.push(Span::styled("  ·  ", Style::default().fg(palette().muted)));
         }
     }
     let tab_bar = Paragraph::new(Line::from(tab_spans));
@@ -959,7 +1020,7 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(tab_bar, tab_area);
     let divider = Paragraph::new(Line::styled(
         "─".repeat(area.width as usize),
-        Style::default().fg(MUTED),
+        Style::default().fg(palette().muted),
     ));
     let div_area = Rect {
         x: area.x,
@@ -998,7 +1059,7 @@ fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskVie
     let worktree_str = if task.record.worktree.path.is_empty() {
         "—".to_string()
     } else {
-        task.record.worktree.path.clone()
+        display_worktree_path(&task.record.worktree.path)
     };
     let prs_str = if task.prs.is_empty() {
         "—".to_string()
@@ -1022,18 +1083,53 @@ fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskVie
 
     let mut lines = vec![
         Line::raw(""),
-        kv_line(" title:    ", &task.name),
-        kv_line(" status:   ", status_str(task.status)),
-        kv_line(" session:  ", &session_str),
-        kv_line(" worktree: ", &worktree_str),
-        kv_line(" prs:      ", &prs_str),
-        kv_line(" linear:   ", &linear_str),
-        kv_line(" panes:    ", &panes_str),
+        Line::styled(format!(" {}", task.name), Style::default().fg(palette().text)),
+        Line::from(vec![
+            Span::styled(
+                format!(" {}", status_str(task.status)),
+                Style::default().fg(status_color(task.status)),
+            ),
+            Span::styled(format!("  ·  {panes_str} panes"), Style::default().fg(palette().subtle)),
+        ]),
+        Line::raw(""),
+        kv_line(" session   ", &session_str),
+        kv_line(" worktree  ", &worktree_str),
     ];
+    if prs_str != "—" {
+        lines.push(kv_line(" prs       ", &prs_str));
+    }
+    if linear_str != "—" {
+        lines.push(kv_line(" linear    ", &linear_str));
+    }
     if task.record.attention.needs_input {
-        lines.push(kv_line(" attention:", "needs input"));
+        lines.push(kv_line(" attention ", "needs input"));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn display_worktree_path(path: &str) -> String {
+    let repo = std::env::var("ORCH_REPO").ok();
+    display_worktree_path_with_repo(path, repo.as_deref())
+}
+
+fn display_worktree_path_with_repo(path: &str, repo: Option<&str>) -> String {
+    let expanded = state::expand_home(path);
+    let worktree = std::path::Path::new(&expanded);
+
+    if let Some(repo) = repo {
+        let repo = state::expand_home(repo);
+        if let Ok(rel) = worktree.strip_prefix(std::path::Path::new(&repo)) {
+            let rel = rel.to_string_lossy();
+            if !rel.is_empty() {
+                return rel.to_string();
+            }
+        }
+    }
+
+    worktree
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
@@ -1047,11 +1143,11 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
     if task.prs.is_empty() {
         lines.push(Line::styled(
             " (no linked PRs)",
-            Style::default().fg(SUBTLE),
+            Style::default().fg(palette().subtle),
         ));
         lines.push(Line::styled(
             " orch pr add <task> <number>",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
         return;
@@ -1061,8 +1157,8 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
     for pr in &task.prs {
         let selected = focused && pr.number == cursor_number;
         let cursor_glyph = if selected { " ▸ " } else { "   " };
-        let cursor_color = if selected { LOVE } else { MUTED };
-        let id_color = if selected { LOVE } else { IRIS };
+        let cursor_color = if selected { palette().love } else { palette().muted };
+        let id_color = if selected { palette().love } else { palette().iris };
 
         let title = if pr.title.is_empty() {
             "(no title cached)".into()
@@ -1072,8 +1168,8 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
 
         // State badge right-aligned so a wrapped branch name doesn't merge with it.
         let state_badge: Option<(&str, ratatui::style::Color)> = match pr.state.as_str() {
-            "MERGED" => Some(("merged", IRIS)),
-            "CLOSED" => Some(("closed", MUTED)),
+            "MERGED" => Some(("merged", palette().iris)),
+            "CLOSED" => Some(("closed", palette().muted)),
             _ => None,
         };
         let id_text = format!("#{}", pr.number);
@@ -1090,7 +1186,7 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
             Span::styled(cursor_glyph, Style::default().fg(cursor_color)),
             Span::styled(id_text, Style::default().fg(id_color)),
             Span::raw("  "),
-            Span::styled(title_str, Style::default().fg(TEXT)),
+            Span::styled(title_str, Style::default().fg(palette().text)),
             Span::raw(" ".repeat(pad)),
         ];
         if let Some((t, color)) = state_badge {
@@ -1101,31 +1197,31 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
         // Row 2: meta strip — ci · review · codex · age · branch (truncated).
         let mut meta: Vec<Span> = vec![Span::raw("    ")];
         meta.push(match pr.ci_pass {
-            Some(true) => Span::styled("✓ ci", Style::default().fg(PINE)),
-            Some(false) => Span::styled("✗ ci", Style::default().fg(LOVE)),
-            None => Span::styled("· ci", Style::default().fg(MUTED)),
+            Some(true) => Span::styled("✓ ci", Style::default().fg(palette().pine)),
+            Some(false) => Span::styled("✗ ci", Style::default().fg(palette().love)),
+            None => Span::styled("· ci", Style::default().fg(palette().muted)),
         });
         meta.push(if pr.approved {
-            Span::styled("  ·  ✓ review", Style::default().fg(PINE))
+            Span::styled("  ·  ✓ review", Style::default().fg(palette().pine))
         } else {
-            Span::styled("  ·  · review", Style::default().fg(MUTED))
+            Span::styled("  ·  · review", Style::default().fg(palette().muted))
         });
         meta.push(match pr.codex {
             crate::state::CodexStatus::ThumbsUp => {
-                Span::styled("  ·  ✓ codex", Style::default().fg(PINE))
+                Span::styled("  ·  ✓ codex", Style::default().fg(palette().pine))
             }
             crate::state::CodexStatus::Commented => {
-                Span::styled("  ·  · codex commented", Style::default().fg(GOLD))
+                Span::styled("  ·  · codex commented", Style::default().fg(palette().gold))
             }
             crate::state::CodexStatus::None => {
-                Span::styled("  ·  · codex", Style::default().fg(MUTED))
+                Span::styled("  ·  · codex", Style::default().fg(palette().muted))
             }
         });
         let age = relative_age(&pr.updated_at);
         if !age.is_empty() {
             meta.push(Span::styled(
                 format!("  ·  {age}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ));
         }
         if !pr.head_branch.is_empty() {
@@ -1135,12 +1231,12 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
             let branch = truncate(&pr.head_branch, branch_room);
             meta.push(Span::styled(
                 format!("  ·  {branch}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ));
         }
         // Mergeable: glyph only on conflict (skip cell noise on green path).
         if pr.mergeable.as_deref() == Some("CONFLICTING") {
-            meta.push(Span::styled("  ⚠ conflict", Style::default().fg(GOLD)));
+            meta.push(Span::styled("  ⚠ conflict", Style::default().fg(palette().gold)));
         }
         lines.push(Line::from(meta));
 
@@ -1150,11 +1246,11 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
                 Span::raw("    "),
                 Span::styled(
                     format!("+{} / -{}", pr.additions, pr.deletions),
-                    Style::default().fg(SUBTLE),
+                    Style::default().fg(palette().subtle),
                 ),
                 Span::styled(
                     format!("  ·  {} files", pr.changed_files),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(palette().muted),
                 ),
             ]));
         }
@@ -1163,7 +1259,7 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
     if focused {
         lines.push(Line::styled(
             " j/k move · Enter open · o browser",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -1480,11 +1576,11 @@ fn render_linear_list(
             Line::raw(""),
             Line::styled(
                 " (no linked Linear issues)",
-                Style::default().fg(SUBTLE),
+                Style::default().fg(palette().subtle),
             ),
             Line::styled(
                 " orch linear add <task> ENG-123  ·  orch linear scan <task>",
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ),
         ];
         frame.render_widget(Paragraph::new(lines), area);
@@ -1529,7 +1625,7 @@ fn render_linear_list(
                     Span::raw(" "),
                     Span::styled(
                         row.title.to_lowercase(),
-                        Style::default().fg(IRIS),
+                        Style::default().fg(palette().iris),
                     ),
                 ]));
                 last_was_header = true;
@@ -1537,7 +1633,7 @@ fn render_linear_list(
             RowKind::Parent { collapsed_subs: _ } => {
                 let selected = focused && row.key == cursor_key;
                 let cursor_glyph = if selected { " ▸ " } else { "   " };
-                let cursor_color = if selected { LOVE } else { MUTED };
+                let cursor_color = if selected { palette().love } else { palette().muted };
                 let state_color = linear_state_color(&row.state_name);
                 let glyph = state_glyph(&row.state_kind);
                 let title = strip_project_prefix(&row.title, &row.project_for_strip);
@@ -1548,7 +1644,7 @@ fn render_linear_list(
                     glyph,
                     state_color,
                     &title,
-                    if row.not_found { Some(LOVE) } else { None },
+                    if row.not_found { Some(palette().love) } else { None },
                     None,
                     width,
                     selected,
@@ -1577,9 +1673,9 @@ fn render_linear_list(
                 prefix.push(self_glyph);
                 prefix.push(' ');
                 let prefix_color = if selected {
-                    LOVE
+                    palette().love
                 } else {
-                    MUTED
+                    palette().muted
                 };
                 let state_color = linear_state_color(&row.state_name);
                 let glyph = state_glyph(&row.state_kind);
@@ -1600,8 +1696,8 @@ fn render_linear_list(
             }
             RowKind::MoreMarker => {
                 lines.push(Line::from(vec![
-                    Span::styled(" └ ", Style::default().fg(MUTED)),
-                    Span::styled(row.title.clone(), Style::default().fg(MUTED)),
+                    Span::styled(" └ ", Style::default().fg(palette().muted)),
+                    Span::styled(row.title.clone(), Style::default().fg(palette().muted)),
                 ]));
                 last_was_header = false;
             }
@@ -1613,7 +1709,7 @@ fn render_linear_list(
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             " j/k move · Enter open · o browser",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
 
@@ -1639,7 +1735,7 @@ fn compose_row(
     selected: bool,
 ) -> Line<'static> {
     let key_field = format!("{key:<9}");
-    let title_color = title_color_override.unwrap_or(TEXT);
+    let title_color = title_color_override.unwrap_or(palette().text);
     let prefix_len = prefix.chars().count();
     let key_len = 9;
     let glyph_len = state_glyph_str.chars().count();
@@ -1666,7 +1762,7 @@ fn compose_row(
 
     let mut spans = vec![
         Span::styled(prefix.to_string(), Style::default().fg(prefix_color)),
-        Span::styled(key_field, Style::default().fg(IRIS)),
+        Span::styled(key_field, Style::default().fg(palette().iris)),
         Span::raw("  "),
         Span::styled(state_glyph_str.to_string(), Style::default().fg(state_color)),
         Span::raw("  "),
@@ -1676,12 +1772,12 @@ fn compose_row(
         spans.push(Span::raw(" ".repeat(title_pad)));
         spans.push(Span::styled(
             format!("  {t}"),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     let line = Line::from(spans);
     if selected {
-        line.style(Style::default().bg(HL_LOW))
+        line.style(Style::default().bg(palette().highlight_low))
     } else {
         line
     }
@@ -1712,18 +1808,18 @@ fn render_linear_detail(
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!(" {key}  loading…"),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
         if cache.not_found.contains(&key) {
             lines.push(Line::styled(
                 " not on Linear",
-                Style::default().fg(LOVE),
+                Style::default().fg(palette().love),
             ));
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             " Esc back · o browser",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
         frame.render_widget(Paragraph::new(lines), area);
         return;
@@ -1734,7 +1830,7 @@ fn render_linear_detail(
     let priority_label = priority_glyph(c.priority);
     let mut id_line = vec![Span::styled(
         format!(" {}", c.identifier),
-        Style::default().fg(IRIS),
+        Style::default().fg(palette().iris),
     )];
     if !priority_label.is_empty() {
         id_line.push(Span::styled(
@@ -1750,13 +1846,13 @@ fn render_linear_detail(
     if !age.is_empty() {
         id_line.push(Span::styled(
             format!("  ·  {age}"),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     if stack.len() > 1 {
         id_line.push(Span::styled(
             format!("  (depth {})", stack.len() - 1),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     lines.push(Line::from(id_line));
@@ -1764,40 +1860,40 @@ fn render_linear_detail(
     // Row 2: title
     lines.push(Line::from(vec![
         Span::raw(" "),
-        Span::styled(c.title.clone(), Style::default().fg(TEXT)),
+        Span::styled(c.title.clone(), Style::default().fg(palette().text)),
     ]));
     lines.push(Line::raw(""));
 
     // Project / parent / cycle / assignee meta block
     if let Some(p) = &c.project {
         lines.push(Line::from(vec![
-            Span::styled(" Project   ", Style::default().fg(MUTED)),
-            Span::styled(p.name.clone(), Style::default().fg(TEXT)),
+            Span::styled(" Project   ", Style::default().fg(palette().muted)),
+            Span::styled(p.name.clone(), Style::default().fg(palette().text)),
         ]));
     }
     if let Some(parent_key) = &c.parent_key {
         let title = c.parent_title.clone().unwrap_or_default();
         lines.push(Line::from(vec![
-            Span::styled(" Parent    ", Style::default().fg(MUTED)),
+            Span::styled(" Parent    ", Style::default().fg(palette().muted)),
             Span::styled(
                 format!("{parent_key}  "),
-                Style::default().fg(IRIS),
+                Style::default().fg(palette().iris),
             ),
-            Span::styled(title, Style::default().fg(TEXT)),
+            Span::styled(title, Style::default().fg(palette().text)),
         ]));
     }
     if let Some(cycle) = &c.cycle_name {
         if !cycle.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled(" Cycle     ", Style::default().fg(MUTED)),
-                Span::styled(cycle.clone(), Style::default().fg(TEXT)),
+                Span::styled(" Cycle     ", Style::default().fg(palette().muted)),
+                Span::styled(cycle.clone(), Style::default().fg(palette().text)),
             ]));
         }
     }
     if !c.assignee.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(" Assignee  ", Style::default().fg(MUTED)),
-            Span::styled(format!("@{}", c.assignee), Style::default().fg(TEXT)),
+            Span::styled(" Assignee  ", Style::default().fg(palette().muted)),
+            Span::styled(format!("@{}", c.assignee), Style::default().fg(palette().text)),
         ]));
     }
 
@@ -1818,7 +1914,7 @@ fn render_linear_detail(
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             " Description",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
         let width = (area.width.saturating_sub(2) as usize).max(20);
         let wrapped = wrap_text(&c.description, width);
@@ -1832,13 +1928,13 @@ fn render_linear_detail(
         for w in wrapped.iter().take(take) {
             lines.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(w.clone(), Style::default().fg(SUBTLE)),
+                Span::styled(w.clone(), Style::default().fg(palette().subtle)),
             ]));
         }
         if wrapped.len() > take {
             lines.push(Line::styled(
                 " …",
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ));
         }
     }
@@ -1848,24 +1944,24 @@ fn render_linear_detail(
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!(" Sub-issues ({n_children})"),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
         for (i, child) in c.children.iter().enumerate() {
             let selected = i == sub_cursor;
             let cursor = if selected && focused { "▸ " } else { "  " };
-            let cursor_color = if selected && focused { LOVE } else { MUTED };
+            let cursor_color = if selected && focused { palette().love } else { palette().muted };
             let glyph = state_glyph(&child.state_kind);
             let glyph_color = linear_state_color(&child.state);
             let style = if selected && focused {
-                Style::default().fg(TEXT).bg(HL_LOW)
+                Style::default().fg(palette().text).bg(palette().highlight_low)
             } else {
-                Style::default().fg(TEXT)
+                Style::default().fg(palette().text)
             };
             lines.push(Line::from(vec![
                 Span::styled(cursor, Style::default().fg(cursor_color)),
                 Span::styled(
                     format!("{}  ", child.identifier),
-                    Style::default().fg(IRIS),
+                    Style::default().fg(palette().iris),
                 ),
                 Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
                 Span::styled(child.title.clone(), style),
@@ -1880,7 +1976,7 @@ fn render_linear_detail(
     } else {
         " j/k navigate · Enter drill · u parent · p project · o browser · Esc back"
     };
-    lines.push(Line::styled(footer, Style::default().fg(MUTED)));
+    lines.push(Line::styled(footer, Style::default().fg(palette().muted)));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -1948,7 +2044,7 @@ fn render_pr_detail_fullscreen(
         frame.render_widget(
             Paragraph::new(Line::styled(
                 format!(" {t}"),
-                Style::default().fg(GOLD),
+                Style::default().fg(palette().gold),
             )),
             Rect { x: area.x, y: toast_y, width: area.width, height: 1 },
         );
@@ -1987,8 +2083,8 @@ fn render_pr_detail_with_widths(
     let title = pr.map(|p| p.title.clone()).unwrap_or_default();
     let state_badge: Option<(&str, ratatui::style::Color)> = pr.and_then(|p| {
         match p.state.as_str() {
-            "MERGED" => Some(("merged", IRIS)),
-            "CLOSED" => Some(("closed", MUTED)),
+            "MERGED" => Some(("merged", palette().iris)),
+            "CLOSED" => Some(("closed", palette().muted)),
             _ => None,
         }
     });
@@ -2001,9 +2097,9 @@ fn render_pr_detail_with_widths(
     let title_str = truncate(&title, title_room);
     let title_pad = title_room.saturating_sub(title_str.chars().count());
     let mut row0 = vec![
-        Span::styled(id_text, Style::default().fg(IRIS)),
+        Span::styled(id_text, Style::default().fg(palette().iris)),
         Span::raw("  "),
-        Span::styled(title_str, Style::default().fg(TEXT)),
+        Span::styled(title_str, Style::default().fg(palette().text)),
         Span::raw(" ".repeat(title_pad)),
     ];
     if let Some((t, color)) = state_badge {
@@ -2018,43 +2114,43 @@ fn render_pr_detail_with_widths(
     let mut meta: Vec<Span> = vec![Span::raw(" ")];
     if let Some(c) = pr {
         meta.push(match c.ci_pass {
-            Some(true) => Span::styled("✓ ci", Style::default().fg(PINE)),
-            Some(false) => Span::styled("✗ ci", Style::default().fg(LOVE)),
-            None => Span::styled("· ci", Style::default().fg(MUTED)),
+            Some(true) => Span::styled("✓ ci", Style::default().fg(palette().pine)),
+            Some(false) => Span::styled("✗ ci", Style::default().fg(palette().love)),
+            None => Span::styled("· ci", Style::default().fg(palette().muted)),
         });
         meta.push(if c.approved {
-            Span::styled("  ·  ✓ review", Style::default().fg(PINE))
+            Span::styled("  ·  ✓ review", Style::default().fg(palette().pine))
         } else {
-            Span::styled("  ·  · review", Style::default().fg(MUTED))
+            Span::styled("  ·  · review", Style::default().fg(palette().muted))
         });
         meta.push(match c.codex.as_str() {
-            "ThumbsUp" => Span::styled("  ·  ✓ codex", Style::default().fg(PINE)),
-            "Commented" => Span::styled("  ·  · codex commented", Style::default().fg(GOLD)),
-            _ => Span::styled("  ·  · codex", Style::default().fg(MUTED)),
+            "ThumbsUp" => Span::styled("  ·  ✓ codex", Style::default().fg(palette().pine)),
+            "Commented" => Span::styled("  ·  · codex commented", Style::default().fg(palette().gold)),
+            _ => Span::styled("  ·  · codex", Style::default().fg(palette().muted)),
         });
         let age = relative_age(&c.updated_at);
         if !age.is_empty() {
             meta.push(Span::styled(
                 format!("  ·  {age}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ));
         }
         if !c.head_branch.is_empty() {
             meta.push(Span::styled(
                 format!("  ·  {} → main", truncate(&c.head_branch, 36)),
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ));
         }
         meta.push(Span::styled(
             format!("  ·  +{} / -{}", c.additions, c.deletions),
-            Style::default().fg(SUBTLE),
+            Style::default().fg(palette().subtle),
         ));
         meta.push(Span::styled(
             format!("  ·  {} files", c.changed_files),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
         if c.mergeable.as_deref() == Some("CONFLICTING") {
-            meta.push(Span::styled("  ·  ⚠ conflict", Style::default().fg(GOLD)));
+            meta.push(Span::styled("  ·  ⚠ conflict", Style::default().fg(palette().gold)));
         }
     }
     frame.render_widget(
@@ -2076,7 +2172,7 @@ fn render_pr_detail_with_widths(
         frame.render_widget(
             Paragraph::new(Line::styled(
                 " diff stale (head moved) · r refresh",
-                Style::default().fg(GOLD),
+                Style::default().fg(palette().gold),
             )),
             Rect { x: area.x, y: area.y + body_top, width: area.width, height: 1 },
         );
@@ -2099,7 +2195,7 @@ fn render_pr_detail_with_widths(
             PrDetailFocus::Diff => " j/k scroll · H/L hunk · Tab files · ]/[ next/prev · r refresh · o browser · Esc back",
         };
         frame.render_widget(
-            Paragraph::new(Line::styled(hint, Style::default().fg(MUTED))),
+            Paragraph::new(Line::styled(hint, Style::default().fg(palette().muted))),
             Rect {
                 x: area.x,
                 y: area.y + area.height.saturating_sub(1),
@@ -2113,16 +2209,16 @@ fn render_pr_detail_with_widths(
     let Some(d) = diff else {
         let mut lines = vec![Line::raw("")];
         if pr.map(|p| p.head_sha.is_empty()).unwrap_or(true) {
-            lines.push(Line::styled(" PR metadata not yet fetched.", Style::default().fg(MUTED)));
+            lines.push(Line::styled(" PR metadata not yet fetched.", Style::default().fg(palette().muted)));
             lines.push(Line::styled(
                 " Wait for the next PR loop cycle (~30s) or restart `orch daemon`.",
-                Style::default().fg(SUBTLE),
+                Style::default().fg(palette().subtle),
             ));
         } else {
-            lines.push(Line::styled(" diff loading…", Style::default().fg(MUTED)));
+            lines.push(Line::styled(" diff loading…", Style::default().fg(palette().muted)));
             lines.push(Line::styled(
                 " (refreshing in the background; press r to retry)",
-                Style::default().fg(SUBTLE),
+                Style::default().fg(palette().subtle),
             ));
         }
         frame.render_widget(Paragraph::new(lines), body_area);
@@ -2133,11 +2229,11 @@ fn render_pr_detail_with_widths(
         let mut lines = vec![Line::raw("")];
         lines.push(Line::styled(
             format!(" diff fetch failed: {err}"),
-            Style::default().fg(LOVE),
+            Style::default().fg(palette().love),
         ));
         lines.push(Line::styled(
             " r retry · o browser · Esc back",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
         frame.render_widget(Paragraph::new(lines), body_area);
         return;
@@ -2150,11 +2246,11 @@ fn render_pr_detail_with_widths(
                 " diff is {:.1} MB · too large to render",
                 (d.raw_size as f64) / 1_000_000.0,
             ),
-            Style::default().fg(GOLD),
+            Style::default().fg(palette().gold),
         ));
         lines.push(Line::styled(
             " press o to open in browser",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
         frame.render_widget(Paragraph::new(lines), body_area);
         return;
@@ -2162,7 +2258,7 @@ fn render_pr_detail_with_widths(
 
     if d.files.is_empty() {
         frame.render_widget(
-            Paragraph::new(Line::styled(" no changes", Style::default().fg(MUTED))),
+            Paragraph::new(Line::styled(" no changes", Style::default().fg(palette().muted))),
             body_area,
         );
         return;
@@ -2217,7 +2313,7 @@ fn render_pr_file_list(
         } else {
             prefix.clone()
         };
-        lines.push(Line::styled(label, Style::default().fg(MUTED)));
+        lines.push(Line::styled(label, Style::default().fg(palette().muted)));
     }
     let header_rows = lines.len();
     let visible = (area.height as usize).saturating_sub(header_rows);
@@ -2233,8 +2329,8 @@ fn render_pr_file_list(
         let is_cur = i == cursor;
         let cur_focused = is_cur && focused && matches!(focus, PrDetailFocus::Files);
         let glyph = if is_cur { "▸ " } else { "  " };
-        let glyph_color = if cur_focused { LOVE } else { MUTED };
-        let path_color = if is_cur { TEXT } else { SUBTLE };
+        let glyph_color = if cur_focused { palette().love } else { palette().muted };
+        let path_color = if is_cur { palette().text } else { palette().subtle };
         let stats = format!("+{}/-{}", f.additions, f.deletions);
         // path + stats fits in `area.width` minus glyph (2) + " " + stats.
         let stats_room = stats.chars().count();
@@ -2243,7 +2339,7 @@ fn render_pr_file_list(
         let pad = path_room.saturating_sub(path.chars().count());
 
         let base_style = if is_cur && focused {
-            Style::default().bg(HL_LOW)
+            Style::default().bg(palette().highlight_low)
         } else {
             Style::default()
         };
@@ -2262,7 +2358,7 @@ fn render_pr_file_list(
                 base_style,
             ),
             Span::styled(" ", base_style),
-            Span::styled(stats, base_style.fg(MUTED)),
+            Span::styled(stats, base_style.fg(palette().muted)),
         ];
         // Pad the highlight bar across the full workspace width so it
         // reads as a continuous row (not a fragment around the text).
@@ -2340,12 +2436,12 @@ fn build_pr_diff_lines(
 
     lines.push(Line::from(vec![
         Span::raw(" "),
-        Span::styled(file.path.clone(), Style::default().fg(TEXT)),
+        Span::styled(file.path.clone(), Style::default().fg(palette().text)),
     ]));
     if file.status != "modified" {
         lines.push(Line::styled(
             format!(" ({})", file.status),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     lines.push(Line::raw(""));
@@ -2353,7 +2449,7 @@ fn build_pr_diff_lines(
     if file.status == "binary" {
         lines.push(Line::styled(
             " binary file · diff suppressed",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
         return (lines, hunk_anchors);
     }
@@ -2363,19 +2459,19 @@ fn build_pr_diff_lines(
         if let Some((header_part, ctx)) = split_hunk_header(&hunk.header) {
             let mut spans = vec![
                 Span::raw(" "),
-                Span::styled(header_part.to_string(), Style::default().fg(MUTED)),
+                Span::styled(header_part.to_string(), Style::default().fg(palette().muted)),
             ];
             if !ctx.is_empty() {
                 spans.push(Span::styled(
                     format!(" {ctx}"),
-                    Style::default().fg(SUBTLE),
+                    Style::default().fg(palette().subtle),
                 ));
             }
             lines.push(Line::from(spans));
         } else {
             lines.push(Line::styled(
                 format!(" {}", hunk.header),
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ));
         }
         // Body cells available for the line content after the ` X ` glyph.
@@ -2386,16 +2482,16 @@ fn build_pr_diff_lines(
         const TAB_WIDTH: usize = 4;
         let tab_replacement = " ".repeat(TAB_WIDTH);
         for line in &hunk.lines {
-            // Glyph in PINE/LOVE; body stays in TEXT/SUBTLE.
+            // Color the glyph by status while keeping the body neutral.
             let (prefix, rest, glyph_color, body_color, bg) =
                 if let Some(rest) = line.strip_prefix('+') {
-                    ("+", rest, PINE, TEXT, Some(DIFF_ADD_BG))
+                    ("+", rest, palette().pine, palette().text, Some(palette().diff_add))
                 } else if let Some(rest) = line.strip_prefix('-') {
-                    ("-", rest, LOVE, TEXT, Some(DIFF_DEL_BG))
+                    ("-", rest, palette().love, palette().text, Some(palette().diff_del))
                 } else if let Some(rest) = line.strip_prefix(' ') {
-                    (" ", rest, MUTED, SUBTLE, None)
+                    (" ", rest, palette().muted, palette().subtle, None)
                 } else {
-                    (" ", line.as_str(), MUTED, MUTED, None)
+                    (" ", line.as_str(), palette().muted, palette().muted, None)
                 };
             // Expand tabs first so truncation/padding math is in cells.
             let expanded = rest.replace('\t', &tab_replacement);
@@ -2484,7 +2580,7 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
 
     let header = format!(" preview: #{number}");
     frame.render_widget(
-        Paragraph::new(Line::styled(header, Style::default().fg(MUTED))),
+        Paragraph::new(Line::styled(header, Style::default().fg(palette().muted))),
         Rect {
             x: area.x,
             y: area.y,
@@ -2503,7 +2599,7 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
     let mut lines: Vec<Line> = Vec::new();
 
     let Some(c) = cached else {
-        lines.push(Line::styled(" loading…", Style::default().fg(MUTED)));
+        lines.push(Line::styled(" loading…", Style::default().fg(palette().muted)));
         frame.render_widget(Paragraph::new(lines), body_area);
         return;
     };
@@ -2512,7 +2608,7 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
     if !c.title.is_empty() {
         lines.push(Line::from(vec![
             Span::raw(" "),
-            Span::styled(c.title.clone(), Style::default().fg(TEXT)),
+            Span::styled(c.title.clone(), Style::default().fg(palette().text)),
         ]));
     }
 
@@ -2520,35 +2616,35 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
     let mut meta: Vec<Span> = vec![Span::raw(" ")];
     meta.push(Span::styled(
         format!("#{}", c.number),
-        Style::default().fg(IRIS),
+        Style::default().fg(palette().iris),
     ));
     meta.push(Span::raw("  "));
     meta.push(match c.ci_pass {
-        Some(true) => Span::styled("✓ ci", Style::default().fg(PINE)),
-        Some(false) => Span::styled("✗ ci", Style::default().fg(LOVE)),
-        None => Span::styled("· ci", Style::default().fg(MUTED)),
+        Some(true) => Span::styled("✓ ci", Style::default().fg(palette().pine)),
+        Some(false) => Span::styled("✗ ci", Style::default().fg(palette().love)),
+        None => Span::styled("· ci", Style::default().fg(palette().muted)),
     });
     meta.push(if c.approved {
-        Span::styled("  ·  ✓ review", Style::default().fg(PINE))
+        Span::styled("  ·  ✓ review", Style::default().fg(palette().pine))
     } else {
-        Span::styled("  ·  · review", Style::default().fg(MUTED))
+        Span::styled("  ·  · review", Style::default().fg(palette().muted))
     });
     meta.push(match c.codex.as_str() {
-        "ThumbsUp" => Span::styled("  ·  ✓ codex", Style::default().fg(PINE)),
-        "Commented" => Span::styled("  ·  · codex commented", Style::default().fg(GOLD)),
-        _ => Span::styled("  ·  · codex", Style::default().fg(MUTED)),
+        "ThumbsUp" => Span::styled("  ·  ✓ codex", Style::default().fg(palette().pine)),
+        "Commented" => Span::styled("  ·  · codex commented", Style::default().fg(palette().gold)),
+        _ => Span::styled("  ·  · codex", Style::default().fg(palette().muted)),
     });
     let age = relative_age(&c.updated_at);
     if !age.is_empty() {
         meta.push(Span::styled(
             format!("  ·  {age}"),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     if !c.head_branch.is_empty() {
         meta.push(Span::styled(
             format!("  ·  {}", truncate(&c.head_branch, 36)),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     lines.push(Line::from(meta));
@@ -2557,14 +2653,14 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
     let mut stats: Vec<Span> = vec![Span::raw(" ")];
     stats.push(Span::styled(
         format!("+{} / -{}", c.additions, c.deletions),
-        Style::default().fg(SUBTLE),
+        Style::default().fg(palette().subtle),
     ));
     stats.push(Span::styled(
         format!("  ·  {} files", c.changed_files),
-        Style::default().fg(MUTED),
+        Style::default().fg(palette().muted),
     ));
     let merge_glyph = match c.mergeable.as_deref() {
-        Some("CONFLICTING") => Some(("  ·  ⚠ conflict", GOLD)),
+        Some("CONFLICTING") => Some(("  ·  ⚠ conflict", palette().gold)),
         Some("MERGEABLE") => None,
         _ => None,
     };
@@ -2572,8 +2668,8 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
         stats.push(Span::styled(s, Style::default().fg(color)));
     }
     match c.state.as_str() {
-        "MERGED" => stats.push(Span::styled("  ·  merged", Style::default().fg(IRIS))),
-        "CLOSED" => stats.push(Span::styled("  ·  closed", Style::default().fg(MUTED))),
+        "MERGED" => stats.push(Span::styled("  ·  merged", Style::default().fg(palette().iris))),
+        "CLOSED" => stats.push(Span::styled("  ·  closed", Style::default().fg(palette().muted))),
         _ => {}
     }
     lines.push(Line::from(stats));
@@ -2592,11 +2688,11 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
         for w in wrapped.iter().take(take) {
             lines.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(w.clone(), Style::default().fg(SUBTLE)),
+                Span::styled(w.clone(), Style::default().fg(palette().subtle)),
             ]));
         }
         if wrapped.len() > take && take > 0 {
-            lines.push(Line::styled(" …", Style::default().fg(MUTED)));
+            lines.push(Line::styled(" …", Style::default().fg(palette().muted)));
         }
     }
 
@@ -2616,11 +2712,11 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
                     Span::raw(" "),
                     Span::styled(
                         truncate(&f.path, 32),
-                        Style::default().fg(SUBTLE),
+                        Style::default().fg(palette().subtle),
                     ),
                     Span::styled(
                         format!("  +{}/-{}", f.additions, f.deletions),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(palette().muted),
                     ),
                 ]));
             }
@@ -2628,7 +2724,7 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
             if extra > 0 {
                 lines.push(Line::styled(
                     format!(" ({extra} more)"),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(palette().muted),
                 ));
             }
         }
@@ -2647,7 +2743,7 @@ fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, cache: &crate
 
     let header = format!(" preview: {key}");
     frame.render_widget(
-        Paragraph::new(Line::styled(header, Style::default().fg(MUTED))),
+        Paragraph::new(Line::styled(header, Style::default().fg(palette().muted))),
         Rect {
             x: area.x,
             y: area.y,
@@ -2673,12 +2769,12 @@ fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, cache: &crate
         if cache.not_found.contains(&key.to_string()) {
             lines.push(Line::styled(
                 " not on Linear",
-                Style::default().fg(LOVE),
+                Style::default().fg(palette().love),
             ));
         } else {
             lines.push(Line::styled(
                 " loading…",
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ));
         }
         frame.render_widget(Paragraph::new(lines), body_area);
@@ -2688,7 +2784,7 @@ fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, cache: &crate
     // Title
     lines.push(Line::from(vec![
         Span::raw(" "),
-        Span::styled(c.title.clone(), Style::default().fg(TEXT)),
+        Span::styled(c.title.clone(), Style::default().fg(palette().text)),
     ]));
 
     // Meta: state · age · assignee · project · sub-count
@@ -2704,26 +2800,26 @@ fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, cache: &crate
     if !age.is_empty() {
         meta.push(Span::styled(
             format!("  ·  {age}"),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     if !c.assignee.is_empty() {
         meta.push(Span::styled(
             format!("  ·  @{}", c.assignee),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     if let Some(p) = &c.project {
         meta.push(Span::styled(
             format!("  ·  {}", p.name),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     if let Some(parent_key) = &c.parent_key {
         let title = c.parent_title.clone().unwrap_or_default();
         meta.push(Span::styled(
             format!("  ·  parent {parent_key} {title}"),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     lines.push(Line::from(meta));
@@ -2741,13 +2837,13 @@ fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, cache: &crate
         for w in wrapped.iter().take(take) {
             lines.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(w.clone(), Style::default().fg(SUBTLE)),
+                Span::styled(w.clone(), Style::default().fg(palette().subtle)),
             ]));
         }
         if wrapped.len() > take && take > 0 {
             lines.push(Line::styled(
                 " …",
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ));
         }
     }
@@ -2790,7 +2886,7 @@ fn render_child_detail(
     let mut lines: Vec<Line> = Vec::new();
     let state_color = linear_state_color(&child.state);
     lines.push(Line::from(vec![
-        Span::styled(format!(" {key}"), Style::default().fg(IRIS)),
+        Span::styled(format!(" {key}"), Style::default().fg(palette().iris)),
         Span::styled(
             format!(
                 "  ·  {} {}",
@@ -2802,31 +2898,31 @@ fn render_child_detail(
     ]));
     lines.push(Line::from(vec![
         Span::raw(" "),
-        Span::styled(child.title.clone(), Style::default().fg(TEXT)),
+        Span::styled(child.title.clone(), Style::default().fg(palette().text)),
     ]));
     lines.push(Line::raw(""));
     if !child.assignee.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(" Assignee  ", Style::default().fg(MUTED)),
+            Span::styled(" Assignee  ", Style::default().fg(palette().muted)),
             Span::styled(
                 format!("@{}", child.assignee),
-                Style::default().fg(TEXT),
+                Style::default().fg(palette().text),
             ),
         ]));
     }
     lines.push(Line::from(vec![
-        Span::styled(" Parent    ", Style::default().fg(MUTED)),
-        Span::styled(parent_key.to_string(), Style::default().fg(TEXT)),
+        Span::styled(" Parent    ", Style::default().fg(palette().muted)),
+        Span::styled(parent_key.to_string(), Style::default().fg(palette().text)),
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         " (sub-issue inline data — full description requires open in browser)",
-        Style::default().fg(MUTED),
+        Style::default().fg(palette().muted),
     ));
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         " Esc back · u parent · o browser",
-        Style::default().fg(MUTED),
+        Style::default().fg(palette().muted),
     ));
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -2842,7 +2938,7 @@ fn render_child_preview(
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::raw(" "),
-        Span::styled(child.title.clone(), Style::default().fg(TEXT)),
+        Span::styled(child.title.clone(), Style::default().fg(palette().text)),
     ]));
     let state_color = linear_state_color(&child.state);
     let mut meta: Vec<Span> = vec![
@@ -2855,12 +2951,12 @@ fn render_child_preview(
     if !child.assignee.is_empty() {
         meta.push(Span::styled(
             format!("  ·  @{}", child.assignee),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     meta.push(Span::styled(
         format!("  ·  child of {parent_key}"),
-        Style::default().fg(MUTED),
+        Style::default().fg(palette().muted),
     ));
     lines.push(Line::from(meta));
     frame.render_widget(Paragraph::new(lines), body_area);
@@ -2909,9 +3005,9 @@ fn priority_glyph(priority: u8) -> &'static str {
 
 fn priority_color(priority: u8) -> Color {
     match priority {
-        1 | 2 => LOVE,
-        3 => GOLD,
-        _ => MUTED,
+        1 | 2 => palette().love,
+        3 => palette().gold,
+        _ => palette().muted,
     }
 }
 
@@ -2995,7 +3091,7 @@ fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
     if task.panes.is_empty() {
         lines.push(Line::styled(
             " (no live tmux panes — task not spawned)",
-            Style::default().fg(SUBTLE),
+            Style::default().fg(palette().subtle),
         ));
     } else {
         let focused =
@@ -3005,18 +3101,18 @@ fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
             let marker = if pane.active { "●" } else { "·" };
             let prefix = if selected && focused { "▸" } else { " " };
             let style = if selected && focused {
-                Style::default().fg(LOVE).bg(HL_LOW)
+                Style::default().fg(palette().love).bg(palette().highlight_low)
             } else if selected {
-                Style::default().fg(TEXT).bg(HL_LOW)
+                Style::default().fg(palette().text).bg(palette().highlight_low)
             } else if focused {
-                Style::default().fg(TEXT)
+                Style::default().fg(palette().text)
             } else {
-                Style::default().fg(SUBTLE)
+                Style::default().fg(palette().subtle)
             };
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {prefix} {marker} "),
-                    Style::default().fg(if pane.active { PINE } else { MUTED }),
+                    Style::default().fg(if pane.active { palette().pine } else { palette().muted }),
                 ),
                 Span::styled(
                     format!("{}  {}", pane.id, pane.command),
@@ -3027,7 +3123,7 @@ fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             " j/k navigate · Enter attach",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette().muted),
         ));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -3050,15 +3146,19 @@ fn render_log(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Log is a passive viewer — no focus state. Header in MUTED.
+    // Log is a passive viewer with no focus state.
     // Toast (if present) overrides the run-id label.
-    let header_style = Style::default().fg(MUTED);
+    let header_style = Style::default().fg(palette().muted);
     let header_text = if let Some(toast) = &app.toast {
-        format!(" log: {toast}")
+        format!(" activity  {toast}")
     } else {
         match &app.log.run_id {
-            Some(id) => format!(" log: {}{}", id, if app.log.finished { " ·done" } else { "" }),
-            None => " log: no activity".to_string(),
+            Some(id) => format!(
+                " activity  {}{}",
+                id,
+                if app.log.finished { " · done" } else { "" },
+            ),
+            None => " activity  none".to_string(),
         }
     };
     let header_area = Rect {
@@ -3082,7 +3182,7 @@ fn render_log(frame: &mut Frame, area: Rect, app: &App) {
     if app.log.lines.is_empty() {
         let placeholder = Paragraph::new(Line::styled(
             " (no activity)",
-            Style::default().fg(SUBTLE),
+            Style::default().fg(palette().subtle),
         ));
         frame.render_widget(placeholder, body_area);
         return;
@@ -3102,7 +3202,7 @@ fn render_log(frame: &mut Frame, area: Rect, app: &App) {
         .log
         .lines
         .iter()
-        .map(|l| Line::styled(l.as_str(), Style::default().fg(SUBTLE)))
+        .map(|l| Line::styled(l.as_str(), Style::default().fg(palette().subtle)))
         .collect();
 
     frame.render_widget(
@@ -3141,8 +3241,8 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
 
     let lines: Vec<Line> = if pr_detail {
         vec![
-            Line::styled(" key bindings — PR detail (fullscreen)", Style::default().fg(LOVE)),
-            Line::styled("─".repeat(w as usize), Style::default().fg(MUTED)),
+            Line::styled(" key bindings — PR detail (fullscreen)", Style::default().fg(palette().love)),
+            Line::styled("─".repeat(w as usize), Style::default().fg(palette().muted)),
             kv_line("  Esc      ", "back to PR list (saves position)"),
             kv_line("  Tab      ", "toggle Files ↔ Diff focus"),
             kv_line("  j / k    ", "Files: prev/next file  ·  Diff: scroll"),
@@ -3152,30 +3252,30 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
             kv_line("  o        ", "open PR in browser"),
             kv_line("  1-9      ", "attach to task #N"),
             kv_line("  q        ", "quit orch"),
-            Line::styled(" Position is saved per PR — re-Enter restores cursor + scroll", Style::default().fg(MUTED)),
+            Line::styled(" Position is saved per PR — re-Enter restores cursor + scroll", Style::default().fg(palette().muted)),
         ]
     } else {
         vec![
-            Line::styled(" key bindings", Style::default().fg(LOVE)),
-            Line::styled("─".repeat(w as usize), Style::default().fg(MUTED)),
-            Line::styled(" Global", Style::default().fg(IRIS)),
+            Line::styled(" key bindings", Style::default().fg(palette().love)),
+            Line::styled("─".repeat(w as usize), Style::default().fg(palette().muted)),
+            Line::styled(" Global", Style::default().fg(palette().iris)),
             kv_line("  q        ", "quit"),
-            kv_line("  Tab      ", "toggle list ↔ right"),
-            kv_line("  [ / ]    ", "previous / next task (any focus)"),
+            kv_line("  Tab h l  ", "focus list ↔ right"),
+            kv_line("  [ ] H L  ", "tasks · detail tabs"),
             kv_line("  1-9      ", "attach to task #N"),
             kv_line("  Esc      ", "right → list; list → quit"),
             kv_line("  C-u/C-d  ", "log scroll  ·  < top  ·  > tail"),
-            kv_line("  ?  r  m  ", "help · refresh · message"),
-            Line::styled(" List", Style::default().fg(IRIS)),
+            kv_line("  ? r m a  ", "help · refresh · message · activity"),
+            Line::styled(" List", Style::default().fg(palette().iris)),
             kv_line("  j k g G  ", "move · top / bottom"),
             kv_line("  J K      ", "move task down / up in open_order"),
             kv_line("  s p R x  ", "spawn · pause · resume · close"),
             kv_line("  Enter    ", "attach to active pane"),
-            Line::styled(" Right zone", Style::default().fg(IRIS)),
+            Line::styled(" Right zone", Style::default().fg(palette().iris)),
             kv_line("  j k      ", "move cursor in active tab"),
             kv_line("  Enter    ", "open / attach in active tab"),
             kv_line("  y        ", "Linear: copy cursored ID to clipboard"),
-            Line::styled(" Enter on a PR row → fullscreen lazygit-style diff", Style::default().fg(MUTED)),
+            Line::styled(" Enter on a PR row → fullscreen lazygit-style diff", Style::default().fg(palette().muted)),
         ]
     };
 
@@ -3194,14 +3294,14 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
     use ratatui::widgets::{Block, Borders};
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(LOVE));
+        .border_style(Style::default().fg(palette().love));
     frame.render_widget(block, overlay);
 }
 
 fn kv_line<'a>(key: &'a str, value: &'a str) -> Line<'a> {
     Line::from(vec![
-        Span::styled(key, Style::default().fg(MUTED)),
-        Span::styled(value, Style::default().fg(TEXT)),
+        Span::styled(key, Style::default().fg(palette().muted)),
+        Span::styled(value, Style::default().fg(palette().text)),
     ])
 }
 
@@ -3232,33 +3332,33 @@ fn status_str(status: TaskStatus) -> &'static str {
     }
 }
 
-/// Color a Linear workflow state name. Falls back to `MUTED` for
+/// Color a Linear workflow state name. Falls back to the muted color for
 /// unknowns (including the loading-stub `manual, loading…`).
 fn linear_state_color(state: &str) -> Color {
     let lower = state.to_lowercase();
     if lower.contains("progress") {
-        FOAM
+        palette().foam
     } else if lower.contains("done") || lower.contains("complete") {
-        PINE
+        palette().pine
     } else if lower.contains("review") {
-        GOLD
+        palette().gold
     } else if lower.contains("cancel") {
-        LOVE
+        palette().love
     } else if lower.contains("backlog") || lower.contains("todo") {
-        IRIS
+        palette().iris
     } else {
-        MUTED
+        palette().muted
     }
 }
 
 fn status_color(status: TaskStatus) -> Color {
     match status {
-        TaskStatus::Ready => PINE,
-        TaskStatus::Working => FOAM,
-        TaskStatus::Input => GOLD,
-        TaskStatus::Paused => IRIS,
-        TaskStatus::Idle | TaskStatus::Attached => MUTED,
-        TaskStatus::Error => LOVE,
+        TaskStatus::Ready => palette().pine,
+        TaskStatus::Working => palette().foam,
+        TaskStatus::Input => palette().gold,
+        TaskStatus::Paused => palette().iris,
+        TaskStatus::Idle | TaskStatus::Attached => palette().muted,
+        TaskStatus::Error => palette().love,
     }
 }
 
@@ -3284,8 +3384,6 @@ fn total_wrapped_rows(lines: &[String], width: usize) -> usize {
 // Key handling.
 //
 // Two-zone focus (List <-> Right). Log is passive and uses global scroll keys.
-
-const UNWIRED_KEYS: &[char] = &['n', 'M', 'W'];
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     if app.show_help {
@@ -3376,6 +3474,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('m'), _) => {
             app.message_input = Some(String::new());
         }
+        (KeyCode::Char('a'), _) => {
+            app.show_activity = !app.show_activity;
+        }
+        // Detail tabs are global view state. Switching them does not
+        // pull focus away from the task list.
+        (KeyCode::Char('H'), _) if !matches!(app.pr_view, PrView::Detail { .. }) => {
+            cycle_detail_tab(app, false);
+        }
+        (KeyCode::Char('L'), _) if !matches!(app.pr_view, PrView::Detail { .. }) => {
+            cycle_detail_tab(app, true);
+        }
         // Navigate tasks from any focus — useful for cycling through
         // tasks while staying in a detail tab (Linear, PRs, etc) without
         // needing to Tab/Esc back to the list.
@@ -3420,11 +3529,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('>'), _) => {
             app.log.follow_bottom = true;
         }
-        // Unwired keys produce a toast instead of silently no-op'ing.
-        (KeyCode::Char(c), _) if UNWIRED_KEYS.contains(&c) => {
-            app.toast = Some(format!("not yet wired ({c})"));
-            return;
-        }
         _ => match app.focus {
             Pane::List => handle_list_key(app, key),
             Pane::Right => handle_right_key(app, key),
@@ -3451,30 +3555,11 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             app.panes_selected = 0;
             reset_linear_cursor_for_new_task(app);
         }
-        // Cycle the right-zone tab and move focus there, so j/k routes
-        // to the tab's items. Tab/Esc returns to list focus.
-        // PR-detail fullscreen still owns h/l (Esc to leave).
-        KeyCode::Char('h') | KeyCode::Left
-            if !matches!(app.pr_view, PrView::Detail { .. }) =>
-        {
-            app.detail_tab = app.detail_tab.prev();
-            app.focus = Pane::Right;
-            if app.detail_tab == Tab::Prs {
-                ensure_pr_cursor(app);
-            } else if app.detail_tab == Tab::Linear {
-                ensure_linear_cursor(app);
-            }
+        KeyCode::Char('h') | KeyCode::Left if !matches!(app.pr_view, PrView::Detail { .. }) => {
+            app.focus = Pane::List;
         }
-        KeyCode::Char('l') | KeyCode::Right
-            if !matches!(app.pr_view, PrView::Detail { .. }) =>
-        {
-            app.detail_tab = app.detail_tab.next();
+        KeyCode::Char('l') | KeyCode::Right if !matches!(app.pr_view, PrView::Detail { .. }) => {
             app.focus = Pane::Right;
-            if app.detail_tab == Tab::Prs {
-                ensure_pr_cursor(app);
-            } else if app.detail_tab == Tab::Linear {
-                ensure_linear_cursor(app);
-            }
         }
         KeyCode::Char('g') => app.selected = 0,
         KeyCode::Char('G') => {
@@ -3502,6 +3587,19 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('J') => reorder_selected(app, 1),
         KeyCode::Char('K') => reorder_selected(app, -1),
         _ => {}
+    }
+}
+
+fn cycle_detail_tab(app: &mut App, forward: bool) {
+    app.detail_tab = if forward {
+        app.detail_tab.next()
+    } else {
+        app.detail_tab.prev()
+    };
+    if app.detail_tab == Tab::Prs {
+        ensure_pr_cursor(app);
+    } else if app.detail_tab == Tab::Linear {
+        ensure_linear_cursor(app);
     }
 }
 
@@ -3729,30 +3827,11 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
 /// tab"; Enter always means "act on cursored item".
 fn handle_right_key(app: &mut App, key: KeyEvent) {
     match (app.detail_tab, key.code) {
-        // h/l no-op in PR Detail fullscreen; Esc to leave.
         (_, KeyCode::Char('h')) | (_, KeyCode::Left) => {
-            if !matches!(app.pr_view, PrView::Detail { .. })
-                || app.detail_tab != Tab::Prs
-            {
-                app.detail_tab = app.detail_tab.prev();
-                if app.detail_tab == Tab::Prs {
-                    ensure_pr_cursor(app);
-                } else if app.detail_tab == Tab::Linear {
-                    ensure_linear_cursor(app);
-                }
-            }
+            app.focus = Pane::List;
         }
         (_, KeyCode::Char('l')) | (_, KeyCode::Right) => {
-            if !matches!(app.pr_view, PrView::Detail { .. })
-                || app.detail_tab != Tab::Prs
-            {
-                app.detail_tab = app.detail_tab.next();
-                if app.detail_tab == Tab::Prs {
-                    ensure_pr_cursor(app);
-                } else if app.detail_tab == Tab::Linear {
-                    ensure_linear_cursor(app);
-                }
-            }
+            app.focus = Pane::Right;
         }
         (Tab::Panes, KeyCode::Char('j')) | (Tab::Panes, KeyCode::Down) => {
             let n = app.selected_task().map(|t| t.panes.len()).unwrap_or(0);
@@ -4746,6 +4825,7 @@ mod tests {
                 last_len: 100,
                 finished: false,
             },
+            show_activity: false,
             show_help: false,
             daemon_alive: true,
             last_fast: Instant::now(),
@@ -4857,9 +4937,9 @@ mod tests {
         assert!(s.contains("PRs"));
         assert!(s.contains("Linear"));
         assert!(s.contains("Panes"));
-        // Right bottom: log header.
-        assert!(s.contains("log:"));
-        assert!(s.contains("infra-triage: working"));
+        // Activity is hidden by default.
+        assert!(!s.contains("activity"));
+        assert!(!s.contains("infra-triage: working"));
     }
 
     #[test]
@@ -4884,11 +4964,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_three_pane_log_focus() {
+    fn snapshot_activity_visible() {
         let mut app = test_app();
         app.focus = Pane::Right;
+        app.show_activity = true;
         let s = render_to_string(&app, 100, 25);
-        assert!(s.contains("log:"));
+        assert!(s.contains("activity"));
+        assert!(s.contains("infra-triage: working"));
     }
 
     #[test]
@@ -4898,9 +4980,31 @@ mod tests {
         app.detail_tab = Tab::Overview;
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("infra-triage"));
-        assert!(s.contains("session:"));
-        assert!(s.contains("worktree:"));
-        assert!(s.contains("/Users/a/work/repo/task-infra-triage"));
+        assert!(s.contains("session"));
+        assert!(s.contains("worktree"));
+        assert!(s.contains("task-infra-triage"));
+    }
+
+    #[test]
+    fn display_worktree_path_strips_repo_prefix() {
+        assert_eq!(
+            display_worktree_path_with_repo(
+                "/Users/a/work/repo/task-create-cancel-sar-filing-endpoints",
+                Some("/Users/a/work/repo"),
+            ),
+            "task-create-cancel-sar-filing-endpoints",
+        );
+    }
+
+    #[test]
+    fn display_worktree_path_falls_back_to_name() {
+        assert_eq!(
+            display_worktree_path_with_repo(
+                "/Users/a/other/task-create-cancel-sar-filing-endpoints",
+                Some("/Users/a/work/repo"),
+            ),
+            "task-create-cancel-sar-filing-endpoints",
+        );
     }
 
     #[test]
@@ -4950,6 +5054,7 @@ mod tests {
     fn snapshot_log_wrapped_lines() {
         let mut app = test_app();
         app.focus = Pane::Right;
+        app.show_activity = true;
         app.log.lines = vec![
             "this is a really long log line that absolutely will not fit in 60 workspaces of width and must wrap onto multiple visual rows when rendered".into(),
             "".into(),
@@ -4967,6 +5072,7 @@ mod tests {
     fn snapshot_log_scroll_preserved() {
         let mut app = test_app();
         app.focus = Pane::Right;
+        app.show_activity = true;
         app.log.lines = (0..30).map(|i| format!("line {i}")).collect();
         app.log.scroll = 5;
         app.log.follow_bottom = false;
@@ -4984,7 +5090,6 @@ mod tests {
         app.tasks.clear();
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("no tasks"));
-        assert!(s.contains("n to create"));
         assert!(s.contains("select a task"));
     }
 
@@ -4994,8 +5099,10 @@ mod tests {
         app.show_help = true;
         let s = render_to_string(&app, 100, 25);
         assert!(s.contains("key bindings"));
-        assert!(s.contains("toggle list ↔ right"));
+        assert!(s.contains("focus list ↔ right"));
+        assert!(s.contains("tasks · detail tabs"));
         assert!(s.contains("attach to task #N"));
+        assert!(s.contains("activity"));
         assert!(s.contains("Enter on a PR row"));
     }
 
@@ -5232,7 +5339,7 @@ mod tests {
         let s = render_to_string(&app, 100, 25);
         // Minimal-list view: stubs render as one-line rows with key +
         // state glyph + title. Test stubs don't populate cache.issues,
-        // so state_kind is empty and glyph defaults to "·" (MUTED).
+        // so state_kind is empty and the glyph defaults to muted "·".
         assert!(s.contains("ENG-29151"));
     }
 
@@ -5294,18 +5401,33 @@ mod tests {
     #[test]
     fn tab_cycling_next_prev() {
         let mut app = test_app();
-        app.focus = Pane::Right;
+        app.focus = Pane::List;
         assert_eq!(app.detail_tab, Tab::Overview);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')));
         assert_eq!(app.detail_tab, Tab::Prs);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.focus, Pane::List);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')));
         assert_eq!(app.detail_tab, Tab::Linear);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')));
         assert_eq!(app.detail_tab, Tab::Panes);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')));
         assert_eq!(app.detail_tab, Tab::Overview); // wrap
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('H')));
         assert_eq!(app.detail_tab, Tab::Panes); // wrap back
+    }
+
+    #[test]
+    fn horizontal_navigation_changes_focus_without_changing_tab() {
+        let mut app = test_app();
+        app.detail_tab = Tab::Prs;
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.focus, Pane::Right);
+        assert_eq!(app.detail_tab, Tab::Prs);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(app.focus, Pane::List);
+        assert_eq!(app.detail_tab, Tab::Prs);
     }
 
     #[test]
@@ -5392,18 +5514,24 @@ mod tests {
     }
 
     #[test]
-    fn unwired_keys_show_toast() {
+    fn activity_toggles_from_any_focus() {
         let mut app = test_app();
-        // M (modify slug, Phase 4a) still unwired
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('M')));
-        assert!(app.toast.is_some());
-        let toast = app.toast.as_ref().unwrap();
-        assert!(toast.contains("not yet wired"));
-        assert!(toast.contains("M"));
+        assert!(!app.show_activity);
 
-        // Next non-toast key clears the toast
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')));
-        assert!(app.toast.is_none());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        assert!(app.show_activity);
+
+        app.focus = Pane::Right;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        assert!(!app.show_activity);
+    }
+
+    #[test]
+    fn transient_feedback_renders_when_activity_hidden() {
+        let mut app = test_app();
+        app.toast = Some("task paused".into());
+
+        assert!(render_to_string(&app, 100, 25).contains("task paused"));
     }
 
     #[test]

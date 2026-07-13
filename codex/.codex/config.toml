@@ -12,7 +12,7 @@ service_tier = "default"
 inherit = "all"
 
 [tui]
-status_line = ["git-branch"]
+status_line = ["git-branch", "context-used"]
 theme = "rose-pine-dawn-soft-diff"
 status_line_use_colors = true
 
@@ -56,23 +56,3 @@ enabled = true
 # name = "Aperture Proxy"
 # base_url = "http://aperture.tail3d4e4.ts.net/v1"
 # wire_api = "responses"
-
-[hooks.state]
-
-[hooks.state."/Users/azhou@column.com/.codex/hooks.json:user_prompt_submit:0:0"]
-trusted_hash = "sha256:530ce7214e44d9506699ab1e3bac0160d94a3100021adb598541b264ce30bfbf"
-
-[hooks.state."/Users/azhou@column.com/.codex/hooks.json:user_prompt_submit:0:1"]
-trusted_hash = "sha256:da6d32a4807bb34bf2a4ec31d3351b92aeb2de0c770444bd27c4590d49d82d39"
-
-[hooks.state."/Users/azhou@column.com/.codex/hooks.json:stop:0:0"]
-trusted_hash = "sha256:9abe10d1dd63da07a4e24bbefb16994b03382a278bccfd0027cad3c1c83b9cf7"
-
-[hooks.state."/Users/azhou@column.com/.codex/hooks.json:stop:0:1"]
-trusted_hash = "sha256:264902ca00fcacc5c1b0efe1106ca86ab9fb51648e54a490387a3a1a686dfb52"
-
-[projects."/Users/azhou@column.com"]
-trust_level = "trusted"
-
-[projects."/Users/azhou@column.com/dotfiles"]
-trust_level = "trusted"
