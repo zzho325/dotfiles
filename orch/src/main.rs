@@ -71,6 +71,7 @@ mod tui3;
 
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -373,6 +374,18 @@ fn daemon_agent_cwd() -> PathBuf {
         .unwrap_or_else(|_| state::tasks_dir())
 }
 
+fn daemon_agent_path() -> OsString {
+    let mut paths = dirs::home_dir()
+        .map(|home| vec![home.join("bin")])
+        .unwrap_or_default();
+    paths.extend(
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>()),
+    );
+    std::env::join_paths(paths).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+}
+
 fn is_internal_orch_path(path: &Path, tasks_dir: &Path) -> bool {
     path.starts_with(tasks_dir.join(".orch"))
 }
@@ -451,10 +464,12 @@ fn run_orchestrator(message: &str) {
             r#"{"mcpServers":{}}"#,
             "--no-chrome",
             "-p",
-            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "auto",
         ])
         .env("ORCH_REPO", repo_dir())
         .env("OLDPWD", repo_dir())
+        .env("PATH", daemon_agent_path())
         .env_remove("CLAUDECODE")
         .current_dir(daemon_agent_cwd())
         .stdin(Stdio::piped())
@@ -1924,7 +1939,8 @@ fn guidance_agent_command() -> (String, Vec<String>) {
             r#"{"mcpServers":{}}"#.into(),
             "--no-chrome".into(),
             "-p".into(),
-            "--dangerously-skip-permissions".into(),
+            "--permission-mode".into(),
+            "auto".into(),
         ],
     )
 }
@@ -3244,6 +3260,15 @@ mod tests {
         unsafe {
             std::env::remove_var("ORCH_REPO");
         }
+    }
+
+    #[test]
+    fn daemon_agent_path_starts_with_user_bin() {
+        let home = dirs::home_dir().unwrap();
+        let path = daemon_agent_path();
+        let paths = std::env::split_paths(&path).collect::<Vec<_>>();
+
+        assert_eq!(paths.first(), Some(&home.join("bin")));
     }
 
     #[test]
