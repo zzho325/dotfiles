@@ -111,7 +111,7 @@
     "deny": [],
     "defaultMode": "bypassPermissions"
   },
-  "model": "claude-opus-4-8[1m]",
+  "model": "opus[1m]",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -164,9 +164,9 @@
   "tui": "default",
   "prefersReducedMotion": true,
   "skipDangerousModePermissionPrompt": true,
-  "voiceEnabled": true,
   "theme": "dark-ansi",
   "editorMode": "vim",
   "autoCompactEnabled": false,
-  "terminalProgressBarEnabled": false
+  "terminalProgressBarEnabled": false,
+  "voiceEnabled": true
 }

@@ -36,6 +36,13 @@ pub struct TmuxSession {
     pub has_active_process: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxPane {
+    pub id: String,
+    pub command: String,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum CodexStatus {
     #[default]
@@ -75,8 +82,7 @@ pub enum TaskStatus {
     Idle,
     Attached,
     Paused,
-    /// `Active` desired_state but the worker process is dead inside an
-    /// otherwise-live tmux session. User can `R` resume to re-spawn.
+    /// Retained for backward-compatible status-cache reads.
     Error,
 }
 
@@ -148,6 +154,119 @@ pub fn load_tmux_sessions() -> HashMap<String, TmuxSession> {
 
 fn is_worker_process(cmd: &str) -> bool {
     cmd == "claude" || cmd == "node" || cmd.starts_with("codex")
+}
+
+fn is_shell_process(cmd: &str) -> bool {
+    matches!(
+        cmd.trim_start_matches('-'),
+        "bash" | "fish" | "nu" | "sh" | "zsh"
+    )
+}
+
+pub fn load_tmux_panes(expected_session: &str) -> Vec<TmuxPane> {
+    let output = Command::new("tmux")
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}\t#{session_name}\t#{pane_current_command}\t#{pane_active}",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok();
+    let Some(output) = output.filter(|o| o.status.success()) else {
+        return Vec::new();
+    };
+    parse_tmux_panes(
+        &String::from_utf8_lossy(&output.stdout),
+        expected_session,
+    )
+}
+
+fn parse_tmux_panes(output: &str, expected_session: &str) -> Vec<TmuxPane> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '\t');
+            let id = parts.next()?.to_string();
+            let session = parts.next()?;
+            let command = parts.next()?.to_string();
+            let active = parts.next()? == "1";
+            session_matches(session, expected_session).then_some(TmuxPane {
+                id,
+                command,
+                active,
+            })
+        })
+        .collect()
+}
+
+pub fn pause_worker_panes(
+    session_name: &str,
+    worktree: &str,
+) -> Result<Option<String>, String> {
+    let panes = load_tmux_panes(session_name);
+    let worktree = expand_home(worktree);
+    let mut paused_pane = None;
+
+    for pane in panes.iter().filter(|p| is_worker_process(&p.command)) {
+        let mut command = Command::new("tmux");
+        command.args(["respawn-pane", "-k", "-t", &pane.id]);
+        if !worktree.is_empty() {
+            command.args(["-c", &worktree]);
+        }
+        let ok = command
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !ok {
+            return Err(format!("failed to stop worker in pane {}", pane.id));
+        }
+        paused_pane.get_or_insert_with(|| pane.id.clone());
+    }
+
+    Ok(paused_pane)
+}
+
+pub fn start_worker_in_session(
+    session_name: &str,
+    preferred_pane: Option<&str>,
+    worker_cmd: &str,
+) -> Result<String, String> {
+    let panes = load_tmux_panes(session_name);
+    if panes.iter().any(|p| is_worker_process(&p.command)) {
+        return Err("worker already running".into());
+    }
+
+    let pane = preferred_pane
+        .and_then(|id| {
+            panes
+                .iter()
+                .find(|p| p.id == id && is_shell_process(&p.command))
+        })
+        .or_else(|| {
+            panes
+                .iter()
+                .find(|p| p.active && is_shell_process(&p.command))
+        })
+        .or_else(|| panes.iter().find(|p| is_shell_process(&p.command)))
+        .ok_or_else(|| "no idle shell pane in tmux session".to_string())?;
+
+    let cleared = Command::new("tmux")
+        .args(["send-keys", "-t", &pane.id, "C-u"])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    let started = Command::new("tmux")
+        .args(["send-keys", "-t", &pane.id, worker_cmd, "Enter"])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !cleared || !started {
+        return Err(format!("failed to start worker in pane {}", pane.id));
+    }
+
+    Ok(pane.id.clone())
 }
 
 /// Check if a tmux session name matches an expected name,
@@ -285,16 +404,16 @@ pub fn derive_status(
         };
     };
 
+    if !session.has_active_process {
+        return TaskStatus::Paused;
+    }
+
     if session.attached {
         return TaskStatus::Attached;
     }
 
     if record.attention.needs_input {
         return TaskStatus::Input;
-    }
-
-    if !session.has_active_process {
-        return TaskStatus::Error;
     }
 
     if is_worktree_busy(&record.worktree.path, busy_stale_secs) {
@@ -896,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_status_no_active_process_is_error() {
+    fn derive_status_no_active_process_is_paused() {
         let record = record_with("task-foo", "");
         let mut sessions = HashMap::new();
         sessions.insert(
@@ -909,7 +1028,32 @@ mod tests {
         );
         assert_eq!(
             derive_status(&record, &sessions, DEFAULT_BUSY_STALE_SECS),
-            TaskStatus::Error,
+            TaskStatus::Paused,
+        );
+    }
+
+    #[test]
+    fn parse_tmux_panes_filters_session_and_preserves_commands() {
+        let panes = parse_tmux_panes(
+            "%1\t1-task-foo\tcodex-x86_64\t0\n\
+             %2\t1-task-foo\tzsh\t1\n\
+             %3\ttask-bar\tclaude\t1\n",
+            "task-foo",
+        );
+        assert_eq!(
+            panes,
+            vec![
+                TmuxPane {
+                    id: "%1".into(),
+                    command: "codex-x86_64".into(),
+                    active: false,
+                },
+                TmuxPane {
+                    id: "%2".into(),
+                    command: "zsh".into(),
+                    active: true,
+                },
+            ],
         );
     }
 

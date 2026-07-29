@@ -54,13 +54,6 @@ return packer.startup(function(use)
 
 	-- UI
 	use({ "ellisonleao/gruvbox.nvim" })
-	use({
-		"MeanderingProgrammer/render-markdown.nvim",
-		requires = {
-			"nvim-tree/nvim-web-devicons",
-			opt = true,
-		},
-	})
 	use 'f-person/auto-dark-mode.nvim' -- switch light/dark to match system
 	use 'rose-pine/neovim'
 

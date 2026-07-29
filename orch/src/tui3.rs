@@ -734,7 +734,14 @@ fn fallback_project_name(
 // Rendering.
 
 pub fn render(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+    let screen = frame.area();
+    let layout = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(screen);
+    let area = layout[0];
+    let footer = layout[1];
 
     // Fullscreen take-over: when drilled into a PR, the diff gets the
     // whole terminal. Esc returns to the three-pane layout. The detail
@@ -746,11 +753,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_pr_detail_fullscreen(
                 frame, area, app, *number, *focus, *file_cursor, *scroll,
             );
+            render_shortcut_footer(frame, footer, app);
             if app.show_help {
-                render_help_overlay_pr_detail(frame, area);
+                render_help_overlay_pr_detail(frame, screen);
             }
             if app.message_input.is_some() {
-                render_message_input(frame, area, app);
+                render_message_input(frame, screen, app);
             }
             return;
         }
@@ -787,28 +795,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_log(frame, right[2], app);
     } else {
         render_details(frame, outer[2], app);
-        if let Some(toast) = &app.toast {
-            let toast_area = Rect {
-                x: outer[2].x,
-                y: outer[2].bottom().saturating_sub(1),
-                width: outer[2].width,
-                height: 1,
-            };
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    format!(" {toast}"),
-                    Style::default().fg(palette().muted),
-                )),
-                toast_area,
-            );
-        }
     }
 
+    render_shortcut_footer(frame, footer, app);
     if app.show_help {
-        render_help_overlay(frame, area);
+        render_help_overlay(frame, screen);
     }
     if app.message_input.is_some() {
-        render_message_input(frame, area, app);
+        render_message_input(frame, screen, app);
     }
 }
 
@@ -889,6 +883,67 @@ fn render_horizontal_separator(frame: &mut Frame, area: Rect) {
     );
 }
 
+fn render_shortcut_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let (text, color) = if let Some(toast) = &app.toast {
+        (format!(" {toast}"), palette().gold)
+    } else if matches!(app.pr_view, PrView::Detail { .. }) {
+        (
+            " j/k move · Tab files/diff · [/] file · o open · Esc back · ? keys"
+                .to_string(),
+            palette().muted,
+        )
+    } else {
+        (shortcut_hint(app), palette().muted)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            text,
+            Style::default().fg(color),
+        )),
+        area,
+    );
+}
+
+fn shortcut_hint(app: &App) -> String {
+    let Some(task) = app.selected_task() else {
+        return " ? keys · q quit".to_string();
+    };
+
+    let hint = match app.focus {
+        Pane::List => {
+            let mut actions = vec!["j/k move"];
+            if !task.record.tmux.session_name.is_empty() {
+                actions.push("Enter attach");
+            }
+            match task.status {
+                TaskStatus::Idle => actions.push("s start"),
+                TaskStatus::Paused => actions.push("R resume"),
+                TaskStatus::Ready
+                | TaskStatus::Working
+                | TaskStatus::Input
+                | TaskStatus::Attached
+                | TaskStatus::Error => actions.push("p pause"),
+            }
+            actions.push("? keys");
+            actions.join(" · ")
+        }
+        Pane::Right => {
+            let mut actions = match app.detail_tab {
+                Tab::Overview => Vec::new(),
+                Tab::Prs if task.prs.is_empty() => Vec::new(),
+                Tab::Prs => vec!["j/k move", "Enter diff", "o open"],
+                Tab::Linear if task.linear.is_empty() => Vec::new(),
+                Tab::Linear => vec!["j/k move", "Enter inspect", "o open", "y copy"],
+                Tab::Panes if task.panes.is_empty() => Vec::new(),
+                Tab::Panes => vec!["j/k move", "Enter attach"],
+            };
+            actions.extend(["H/L tabs", "Esc tasks", "? keys"]);
+            actions.join(" · ")
+        }
+    };
+    format!(" {hint}")
+}
+
 fn render_list(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     let focused = app.focus == Pane::List;
@@ -899,10 +954,15 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         Style::default().fg(palette().muted)
     };
+    let position = if app.tasks.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", app.selected + 1, app.tasks.len())
+    };
     lines.push(Line::from(vec![
         Span::styled(" tasks", header_style),
         Span::styled(
-            format!("  {}", app.tasks.len()),
+            format!("  {position}"),
             Style::default().fg(palette().muted),
         ),
     ]));
@@ -991,6 +1051,11 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    let task = match app.selected_task() {
+        Some(t) => t.clone(),
+        None => return,
+    };
+
     // Tab bar.
     let focused = app.focus == Pane::Right;
     let tabs = [Tab::Overview, Tab::Prs, Tab::Linear, Tab::Panes];
@@ -1005,7 +1070,18 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             Style::default().fg(palette().muted)
         };
-        tab_spans.push(Span::styled(tab.label(), style));
+        let count = match tab {
+            Tab::Overview => 0,
+            Tab::Prs => task.prs.len(),
+            Tab::Linear => task.linear.len(),
+            Tab::Panes => task.panes.len(),
+        };
+        let label = if count == 0 {
+            tab.label().to_string()
+        } else {
+            format!("{} {count}", tab.label())
+        };
+        tab_spans.push(Span::styled(label, style));
         if i + 1 < tabs.len() {
             tab_spans.push(Span::styled("  ·  ", Style::default().fg(palette().muted)));
         }
@@ -1037,11 +1113,6 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
         height: area.height.saturating_sub(TAB_BAR_HEIGHT),
     };
 
-    let task = match app.selected_task() {
-        Some(t) => t.clone(),
-        None => return,
-    };
-
     match app.detail_tab {
         Tab::Overview => render_tab_overview(frame, body_area, app, &task),
         Tab::Prs => render_tab_prs(frame, body_area, app, &task),
@@ -1061,24 +1132,8 @@ fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskVie
     } else {
         display_worktree_path(&task.record.worktree.path)
     };
-    let prs_str = if task.prs.is_empty() {
-        "—".to_string()
-    } else {
-        task.prs
-            .iter()
-            .map(|p| format!("#{}", p.number))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let linear_str = if task.linear.is_empty() {
-        "—".to_string()
-    } else {
-        task.linear
-            .iter()
-            .map(|l| l.key.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let prs_str = task.prs.len().to_string();
+    let linear_str = task.linear.len().to_string();
     let panes_str = task.panes.len().to_string();
 
     let mut lines = vec![
@@ -1095,10 +1150,10 @@ fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskVie
         kv_line(" session   ", &session_str),
         kv_line(" worktree  ", &worktree_str),
     ];
-    if prs_str != "—" {
+    if !task.prs.is_empty() {
         lines.push(kv_line(" prs       ", &prs_str));
     }
-    if linear_str != "—" {
+    if !task.linear.is_empty() {
         lines.push(kv_line(" linear    ", &linear_str));
     }
     if task.record.attention.needs_input {
@@ -3669,18 +3724,17 @@ fn lifecycle_op(
     app.refresh_status();
 }
 
-/// Spawn a worker for the task: create a tmux session in the
-/// worktree and start `claude '/orch:worker <md>'`. Idempotent —
-/// no-ops with a friendly message if the session already exists.
+/// Spawn a worker for the task, reusing a paused tmux session when present.
 fn lifecycle_spawn(name: &str, _session: &str) -> Result<String, String> {
-    let session = format!("task-{name}");
-    if find_actual_session(&session).is_some() {
-        return Err(format!("session {session} already exists"));
-    }
     let store = store::Store::default();
     let record = store
         .load_record_by_slug(name)
         .ok_or_else(|| format!("no task '{name}'"))?;
+    let session = if record.tmux.session_name.is_empty() {
+        format!("task-{name}")
+    } else {
+        record.tmux.session_name.clone()
+    };
     let task_file = state::tasks_dir().join(format!("{name}.md"));
     if !task_file.exists() {
         return Err(format!("no task file: {}", task_file.display()));
@@ -3692,63 +3746,81 @@ fn lifecycle_spawn(name: &str, _session: &str) -> Result<String, String> {
         allow_existing_dirty,
     )?;
     let cmd_str = record.agent.worker_kind.worker_cmd(&task_file);
-    let new_ok = Command::new("tmux")
-        .args(["new-session", "-d", "-s", &session, "-c", &work_dir])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !new_ok {
-        return Err("tmux new-session failed".into());
-    }
-    let send_ok = Command::new("tmux")
-        .args(["send-keys", "-t", &session, &cmd_str, "Enter"])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !send_ok {
-        return Err("tmux send-keys failed".into());
-    }
+    let actual_session = find_actual_session(&session);
+    let pane_id = if let Some(actual) = &actual_session {
+        Some(state::start_worker_in_session(
+            actual,
+            record.tmux.last_known_pane_id.as_deref(),
+            &cmd_str,
+        )?)
+    } else {
+        let new_ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, "-c", &work_dir])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !new_ok {
+            return Err("tmux new-session failed".into());
+        }
+        let send_ok = Command::new("tmux")
+            .args(["send-keys", "-t", &session, &cmd_str, "Enter"])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !send_ok {
+            return Err("tmux send-keys failed".into());
+        }
+        None
+    };
     let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.tmux.session_name = session.clone();
+        if let Some(pane_id) = &pane_id {
+            r.tmux.last_known_pane_id = Some(pane_id.clone());
+        }
         r.worktree.path = work_dir.clone();
         r.desired_state = DesiredState::Active;
+        r.paused_at = None;
         if r.started_at.is_none() {
             r.started_at = Some(now);
         }
         r.updated_at = now;
     });
-    Ok(format!("spawned {session}"))
+    if actual_session.is_some() {
+        Ok(format!("resumed {session}"))
+    } else {
+        Ok(format!("spawned {session}"))
+    }
 }
 
-fn lifecycle_resume(name: &str, session: &str) -> Result<String, String> {
-    let store = store::Store::default();
-    let now = cache::now_epoch();
-    store.update_record_by_slug(name, |r| {
-        r.desired_state = DesiredState::Active;
-        r.updated_at = now;
-    });
-    let _ = session;
+fn lifecycle_resume(name: &str, _session: &str) -> Result<String, String> {
     lifecycle_spawn(name, "")
 }
 
 fn lifecycle_pause(name: &str, session: &str) -> Result<String, String> {
+    let store = store::Store::default();
+    let record = store
+        .load_record_by_slug(name)
+        .ok_or_else(|| format!("no task '{name}'"))?;
+    let mut paused_pane = None;
     if !session.is_empty() {
         if let Some(actual) = find_actual_session(session) {
-            let _ = Command::new("tmux")
-                .args(["kill-session", "-t", &actual])
-                .stderr(Stdio::null())
-                .status();
+            paused_pane = state::pause_worker_panes(
+                &actual,
+                &record.worktree.path,
+            )?;
         }
     }
-    let store = store::Store::default();
     let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.desired_state = DesiredState::Paused;
+        if let Some(pane_id) = &paused_pane {
+            r.tmux.last_known_pane_id = Some(pane_id.clone());
+        }
         r.paused_at = Some(now);
         r.updated_at = now;
     });
-    Ok(format!("paused {name}"))
+    Ok(format!("paused {name}; tmux preserved"))
 }
 
 fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
@@ -4839,6 +4911,48 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_hint_tracks_selected_task_lifecycle() {
+        let mut app = test_app();
+
+        assert_eq!(
+            shortcut_hint(&app),
+            " j/k move · Enter attach · p pause · ? keys"
+        );
+        app.selected = 1;
+        assert_eq!(
+            shortcut_hint(&app),
+            " j/k move · Enter attach · R resume · ? keys"
+        );
+        app.selected = 2;
+        assert_eq!(shortcut_hint(&app), " j/k move · s start · ? keys");
+
+        app.selected = 0;
+        app.tasks[0].status = TaskStatus::Paused;
+        assert_eq!(
+            shortcut_hint(&app),
+            " j/k move · Enter attach · R resume · ? keys"
+        );
+    }
+
+    #[test]
+    fn shortcut_hint_tracks_detail_tab_actions() {
+        let mut app = test_app();
+        app.focus = Pane::Right;
+
+        assert_eq!(shortcut_hint(&app), " H/L tabs · Esc tasks · ? keys");
+        app.detail_tab = Tab::Prs;
+        assert_eq!(
+            shortcut_hint(&app),
+            " j/k move · Enter diff · o open · H/L tabs · Esc tasks · ? keys"
+        );
+        app.detail_tab = Tab::Panes;
+        assert_eq!(
+            shortcut_hint(&app),
+            " j/k move · Enter attach · H/L tabs · Esc tasks · ? keys"
+        );
+    }
+
+    #[test]
     fn next_selection_follows_name_when_present() {
         let tasks = test_tasks();
         // Cursor was on tasks[1], now the same task is at index 2 — follow it.
@@ -4934,9 +5048,10 @@ mod tests {
         assert!(s.contains("ach-sanitize"));
         // Right top: tab bar with Overview selected.
         assert!(s.contains("Overview"));
-        assert!(s.contains("PRs"));
-        assert!(s.contains("Linear"));
-        assert!(s.contains("Panes"));
+        assert!(s.contains("PRs 1"));
+        assert!(s.contains("Linear 1"));
+        assert!(s.contains("Panes 2"));
+        assert!(s.contains("j/k move · Enter attach"));
         // Activity is hidden by default.
         assert!(!s.contains("activity"));
         assert!(!s.contains("infra-triage: working"));

@@ -116,13 +116,13 @@ enum Cmd {
         /// Task name (e.g. foo for ~/tasks/foo.md)
         name: String,
     },
-    /// Pause a task: kill its tmux session, mark paused.
+    /// Pause a task: stop its worker, keep tmux and worktree.
     /// Orchestrator will not auto-spawn it.
     Pause {
         /// Task name
         name: String,
     },
-    /// Resume a paused task: clear paused flag, spawn worker.
+    /// Resume a paused task in its existing tmux session.
     Resume {
         /// Task name
         name: String,
@@ -611,6 +611,7 @@ fn extract_section<'a>(content: &'a str, heading: &str) -> Vec<&'a str> {
 /// (piped, scripted) or via `orch status`.
 fn cmd_status() {
     let dir = state::tasks_dir();
+    let sessions = state::load_tmux_sessions();
     println!("## Tasks\n");
 
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -639,10 +640,15 @@ fn cmd_status() {
             })
             .unwrap_or_else(|| format!("task-{name}"));
 
-        let worker = if has_tmux_session(&session) {
-            format!("running ({session})")
-        } else {
-            "none".into()
+        let worker = match sessions
+            .values()
+            .find(|s| state::session_matches(&s.name, &session))
+        {
+            Some(s) if s.has_active_process => {
+                format!("running ({})", s.name)
+            }
+            Some(s) => format!("paused ({})", s.name),
+            None => "none".into(),
         };
 
         println!("  {name}  [worker: {worker}]");
@@ -713,17 +719,16 @@ fn cmd_jump(name: &str) {
 }
 
 fn cmd_spawn(name: &str) {
-    let session = format!("task-{name}");
-    if has_tmux_session(&session) {
-        eprintln!("[spawn] '{name}' already has a tmux session");
-        return;
-    }
-
     state::ensure_state_files();
     let store = store::Store::default();
     let Some(record) = store.load_record_by_slug(name) else {
         eprintln!("[spawn] no task '{name}' (create ~/tasks/{name}.md first)");
         return;
+    };
+    let session = if record.tmux.session_name.is_empty() {
+        format!("task-{name}")
+    } else {
+        record.tmux.session_name.clone()
     };
 
     let task_file = state::tasks_dir().join(format!("{name}.md"));
@@ -741,51 +746,82 @@ fn cmd_spawn(name: &str) {
             }
         };
     let cmd = record.agent.worker_kind.worker_cmd(&task_file);
+    let actual_session = find_actual_session(&session);
 
-    if !tmux(&["new-session", "-d", "-s", &session, "-c", &work_dir]) {
-        eprintln!("[spawn] failed to create tmux session");
-        return;
-    }
-    if !tmux(&["send-keys", "-t", &session, &cmd, "Enter"]) {
-        eprintln!("[spawn] failed to start worker");
-        return;
-    }
+    let pane_id = if let Some(actual) = &actual_session {
+        match state::start_worker_in_session(
+            actual,
+            record.tmux.last_known_pane_id.as_deref(),
+            &cmd,
+        ) {
+            Ok(pane_id) => Some(pane_id),
+            Err(e) => {
+                eprintln!("[spawn] {e}");
+                return;
+            }
+        }
+    } else {
+        if !tmux(&["new-session", "-d", "-s", &session, "-c", &work_dir]) {
+            eprintln!("[spawn] failed to create tmux session");
+            return;
+        }
+        if !tmux(&["send-keys", "-t", &session, &cmd, "Enter"]) {
+            eprintln!("[spawn] failed to start worker");
+            return;
+        }
+        None
+    };
 
     let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.tmux.session_name = session.clone();
+        if let Some(pane_id) = &pane_id {
+            r.tmux.last_known_pane_id = Some(pane_id.clone());
+        }
         r.worktree.path = work_dir.clone();
         r.desired_state = store::DesiredState::Active;
+        r.paused_at = None;
         if r.started_at.is_none() {
             r.started_at = Some(now);
         }
         r.updated_at = now;
     });
 
-    eprintln!("[spawn] {session} started");
+    if actual_session.is_some() {
+        eprintln!("[spawn] {session} resumed");
+    } else {
+        eprintln!("[spawn] {session} started");
+    }
 }
 
 fn cmd_pause(name: &str) {
     let store = store::Store::default();
-    let session_name = store
-        .load_record_by_slug(name)
-        .map(|r| r.tmux.session_name)
-        .unwrap_or_default();
-    if !session_name.is_empty() {
-        if let Some(actual) = find_actual_session(&session_name) {
-            let _ = Command::new("tmux")
-                .args(["kill-session", "-t", &actual])
-                .stderr(Stdio::null())
-                .status();
+    let Some(record) = store.load_record_by_slug(name) else {
+        eprintln!("[pause] no task '{name}'");
+        return;
+    };
+    let mut paused_pane = None;
+    if !record.tmux.session_name.is_empty() {
+        if let Some(actual) = find_actual_session(&record.tmux.session_name) {
+            match state::pause_worker_panes(&actual, &record.worktree.path) {
+                Ok(pane_id) => paused_pane = pane_id,
+                Err(e) => {
+                    eprintln!("[pause] {e}");
+                    return;
+                }
+            }
         }
     }
     let now = cache::now_epoch();
     store.update_record_by_slug(name, |r| {
         r.desired_state = store::DesiredState::Paused;
+        if let Some(pane_id) = &paused_pane {
+            r.tmux.last_known_pane_id = Some(pane_id.clone());
+        }
         r.paused_at = Some(now);
         r.updated_at = now;
     });
-    eprintln!("[pause] {name} paused");
+    eprintln!("[pause] {name} paused; tmux preserved");
 }
 
 /// Find the actual tmux session name for an expected session,
@@ -806,12 +842,6 @@ fn find_actual_session(expected: &str) -> Option<String> {
 }
 
 fn cmd_resume(name: &str) {
-    let store = store::Store::default();
-    let now = cache::now_epoch();
-    store.update_record_by_slug(name, |r| {
-        r.desired_state = store::DesiredState::Active;
-        r.updated_at = now;
-    });
     cmd_spawn(name);
 }
 
