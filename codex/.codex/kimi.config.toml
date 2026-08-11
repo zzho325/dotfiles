@@ -1,0 +1,3 @@
+model_provider = "openrouter"
+model = "moonshotai/kimi-k3"
+model_reasoning_effort = "high"

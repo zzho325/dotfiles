@@ -123,6 +123,27 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/orch-busy-start.sh"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/orch-busy-stop.sh"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

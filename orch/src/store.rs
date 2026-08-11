@@ -57,14 +57,6 @@ pub enum DesiredState {
     Closed,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AttentionInfo {
-    #[serde(default)]
-    pub needs_input: bool,
-    #[serde(default)]
-    pub last_prompt_from_worker: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorktreeInfo {
     #[serde(default)]
@@ -247,8 +239,6 @@ pub struct TaskRecord {
 
     #[serde(default)]
     pub desired_state: DesiredState,
-    #[serde(default)]
-    pub attention: AttentionInfo,
     #[serde(default)]
     pub worktree: WorktreeInfo,
     #[serde(default)]
@@ -630,10 +620,6 @@ fn build_record_from_legacy(
         closed_at: None,
         updated_at: now,
         desired_state,
-        attention: AttentionInfo {
-            needs_input: legacy.needs_input,
-            last_prompt_from_worker: None,
-        },
         worktree: WorktreeInfo {
             path: legacy.worktree,
             base_ref: String::new(),
@@ -675,8 +661,6 @@ struct LegacyMeta {
     #[serde(default)]
     prs: Vec<u32>,
     #[serde(default)]
-    needs_input: bool,
-    #[serde(default)]
     paused: bool,
 }
 
@@ -714,10 +698,6 @@ mod tests {
             closed_at: None,
             updated_at: 2000,
             desired_state: DesiredState::Active,
-            attention: AttentionInfo {
-                needs_input: true,
-                last_prompt_from_worker: Some("ready for review".into()),
-            },
             worktree: WorktreeInfo {
                 path: "/Users/a/work/repo/task-infra-triage".into(),
                 base_ref: "main".into(),
@@ -908,11 +888,11 @@ mod tests {
 
         fs::write(
             dir.join(".state").join("foo.json"),
-            r#"{"session":"task-foo","worktree":"/tmp/wt-foo","prs":[100,200],"needs_input":false,"paused":false}"#,
+            r#"{"session":"task-foo","worktree":"/tmp/wt-foo","prs":[100,200],"paused":false}"#,
         ).unwrap();
         fs::write(
             dir.join(".state").join("bar.json"),
-            r#"{"session":"task-bar","worktree":"/tmp/wt-bar","prs":[],"needs_input":true,"paused":true}"#,
+            r#"{"session":"task-bar","worktree":"/tmp/wt-bar","prs":[],"paused":true}"#,
         ).unwrap();
         // baz has no .state/baz.json — it's a fresh task
 
@@ -948,7 +928,6 @@ mod tests {
         let bar = store.load_record(1).unwrap();
         assert_eq!(bar.slug, "bar");
         assert_eq!(bar.desired_state, DesiredState::Paused);
-        assert!(bar.attention.needs_input);
         assert_eq!(bar.tmux.session_name, "task-bar");
         assert_eq!(bar.worktree.path, "/tmp/wt-bar");
 

@@ -62,7 +62,6 @@
 
 mod cache;
 mod gh;
-mod linear;
 mod remote_agent;
 mod runs;
 mod state;
@@ -168,7 +167,7 @@ enum Cmd {
         #[arg(long)]
         keep_worktree: bool,
     },
-    /// Internal — Claude Code busy-marker hooks. Reads
+    /// Internal — agent activity hooks. Reads
     /// `{session_id, cwd}` JSON on stdin.
     Busy {
         #[command(subcommand)]
@@ -184,7 +183,7 @@ enum Cmd {
         /// Terminal height in cells (default 40)
         #[arg(long, default_value = "40")]
         height: u16,
-        /// Detail tab: overview | prs | linear | panes
+        /// Detail tab: overview | prs | panes
         #[arg(long, default_value = "overview")]
         tab: String,
         /// Pane focus: list | details | log
@@ -193,14 +192,6 @@ enum Cmd {
         /// Selected task index (0-based) — defaults to 0
         #[arg(long, default_value = "0")]
         select: usize,
-        /// Push the Linear detail view for this issue key (e.g.
-        /// ENG-29535). Implies `--tab linear --focus details`.
-        #[arg(long)]
-        linear_detail: Option<String>,
-        /// Set the Linear list cursor to this issue key (e.g. ENG-26405).
-        /// Implies `--tab linear --focus details`.
-        #[arg(long)]
-        linear_cursor: Option<String>,
     },
 }
 
@@ -238,9 +229,9 @@ enum LinearAction {
 
 #[derive(Subcommand)]
 enum BusyAction {
-    /// Write busy marker for the current Claude turn.
+    /// Mark the current agent session as working.
     Start,
-    /// Remove the busy marker.
+    /// Mark the current agent session as ready.
     Stop,
 }
 
@@ -468,6 +459,7 @@ fn run_orchestrator(message: &str) {
             "auto",
         ])
         .env("ORCH_REPO", repo_dir())
+        .env("ORCH_ACTIVITY_DISABLED", "1")
         .env("OLDPWD", repo_dir())
         .env("PATH", daemon_agent_path())
         .env_remove("CLAUDECODE")
@@ -1057,8 +1049,8 @@ fn cmd_close(name: &str, keep_worktree: bool) {
     eprintln!("[close] {name} closed");
 }
 
-// Busy-marker hooks. Failures are silent — the hook fires on every
-// prompt and partial stdin shouldn't surface to the user.
+// Agent activity hooks. Failures are silent because partial hook input
+// shouldn't surface to the user.
 // ORCH_HOOK_DEBUG routes diagnostics to stderr.
 
 fn parse_busy_input(json: &str) -> Option<(String, String)> {
@@ -1071,16 +1063,29 @@ fn parse_busy_input(json: &str) -> Option<(String, String)> {
     Some((session_id, cwd))
 }
 
-fn write_busy_marker(busy_dir: &Path, session_id: &str, cwd: &str) -> bool {
-    let path = busy_dir.join(session_id);
+fn write_activity_status(
+    activity_dir: &Path,
+    session_id: &str,
+    cwd: &str,
+    activity: &str,
+) -> bool {
+    let path = activity_dir.join(session_id);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    // started_at is informational only; staleness is computed from
-    // the marker file's mtime, not this field.
+    let cwd = if cwd.is_empty() {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|value| value["cwd"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    } else {
+        cwd.to_string()
+    };
     let payload = serde_json::json!({
+        "state": activity,
         "cwd": cwd,
-        "started_at": cache::now_epoch(),
+        "updated_at": cache::now_epoch(),
         "pid": std::process::id(),
     });
     state::atomic_write(&path, &payload.to_string())
@@ -1098,6 +1103,9 @@ fn read_stdin_to_string() -> String {
 }
 
 fn cmd_busy_start() {
+    if std::env::var_os("ORCH_ACTIVITY_DISABLED").is_some() {
+        return;
+    }
     let json = read_stdin_to_string();
     let Some((session_id, cwd)) = parse_busy_input(&json) else {
         if busy_debug() {
@@ -1105,8 +1113,8 @@ fn cmd_busy_start() {
         }
         return;
     };
-    let dir = state::busy_dir();
-    if !write_busy_marker(&dir, &session_id, &cwd) && busy_debug() {
+    let dir = state::activity_dir();
+    if !write_activity_status(&dir, &session_id, &cwd, "working") && busy_debug() {
         eprintln!(
             "[orch busy start] atomic_write failed: {}",
             dir.join(&session_id).display(),
@@ -1115,14 +1123,23 @@ fn cmd_busy_start() {
 }
 
 fn cmd_busy_stop() {
+    if std::env::var_os("ORCH_ACTIVITY_DISABLED").is_some() {
+        return;
+    }
     let json = read_stdin_to_string();
-    let Some((session_id, _cwd)) = parse_busy_input(&json) else {
+    let Some((session_id, cwd)) = parse_busy_input(&json) else {
         if busy_debug() {
             eprintln!("[orch busy stop] missing session_id or bad JSON");
         }
         return;
     };
-    let _ = fs::remove_file(state::busy_dir().join(&session_id));
+    let dir = state::activity_dir();
+    if !write_activity_status(&dir, &session_id, &cwd, "ready") && busy_debug() {
+        eprintln!(
+            "[orch busy stop] atomic_write failed: {}",
+            dir.join(&session_id).display(),
+        );
+    }
 }
 
 // Review mailbox — background Codex PR reviews that surface through hooks.
@@ -2014,6 +2031,7 @@ fn cmd_guidance_run(id: &str) {
     let mut command = Command::new(bin);
     command
         .args(args)
+        .env("ORCH_ACTIVITY_DISABLED", "1")
         .env_remove("CLAUDECODE")
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
@@ -2587,7 +2605,7 @@ fn cmd_gc() {
 }
 
 /// Background thread: polls tmux every 2s, writes status cache.
-/// Sweeps stale busy markers every 5 minutes.
+/// Sweeps stale activity statuses every 5 minutes.
 fn spawn_status_loop() {
     use std::thread;
     thread::spawn(|| {
@@ -2613,7 +2631,7 @@ fn spawn_status_loop() {
                         status: match task.status {
                             state::TaskStatus::Ready => "ready",
                             state::TaskStatus::Working => "working",
-                            state::TaskStatus::Input => "input",
+                            state::TaskStatus::Unknown => "unknown",
                             state::TaskStatus::Idle => "idle",
                             state::TaskStatus::Paused => "paused",
                             state::TaskStatus::Attached => "attached",
@@ -2631,161 +2649,15 @@ fn spawn_status_loop() {
             });
             cache::write_lease();
 
-            // Sweep stale busy markers every 150 ticks (~5 min at 2s/tick)
+            // Sweep stale activity statuses every 150 ticks (~5 min at 2s/tick)
             sweep_counter = sweep_counter.wrapping_add(1);
             if sweep_counter % 150 == 0 {
-                state::sweep_stale_markers(stale_secs);
+                state::sweep_stale_activity(stale_secs);
             }
 
             std::thread::sleep(Duration::from_secs(2));
         }
     });
-}
-
-/// Background thread: refreshes Linear issue data every 2 min.
-/// Writes `.orch/cache/linear.json`. Disconnected (no key, network
-/// failure) is cached as a flag so the TUI can show it without
-/// retrying every render.
-fn spawn_linear_loop() {
-    use std::thread;
-    thread::spawn(|| {
-        loop {
-            let api_key = match linear::api_key_from_env() {
-                Some(k) => k,
-                None => {
-                    let mut cache = cache::read_linear();
-                    cache.disconnected = true;
-                    cache.generated_at = cache::now_epoch();
-                    cache::write_linear(&cache);
-                    std::thread::sleep(Duration::from_secs(120));
-                    continue;
-                }
-            };
-
-            // Auto-scan every open task's md file and worktree bookmarks
-            // for Linear keys before fetching, so newly-mentioned or
-            // newly-named keys get linked without an explicit
-            // `orch linear scan`. Idempotent.
-            let store = store::Store::default();
-            let mut records = store.load_open_records();
-            let not_found: HashSet<String> = cache::read_linear().not_found.into_iter().collect();
-            for record in records.iter_mut() {
-                let md_n = scan_task_md_for_keys(record, &not_found);
-                let bm_n = scan_worktree_bookmark_for_keys(record, &not_found);
-                if md_n + bm_n > 0 {
-                    record.updated_at = cache::now_epoch();
-                    store.save_record(record);
-                }
-            }
-
-            // Collect every distinct linear key across open tasks.
-            let mut keys: Vec<String> = Vec::new();
-            for record in &records {
-                for li in &record.links.linear_issues {
-                    if !keys.contains(&li.key) {
-                        keys.push(li.key.clone());
-                    }
-                }
-            }
-
-            if keys.is_empty() {
-                cache::write_linear(&cache::LinearCache {
-                    generated_at: cache::now_epoch(),
-                    issues: std::collections::HashMap::new(),
-                    not_found: Vec::new(),
-                    disconnected: false,
-                });
-                std::thread::sleep(Duration::from_secs(120));
-                continue;
-            }
-
-            let mut cached_issues = std::collections::HashMap::new();
-            let mut not_found = Vec::new();
-            let mut hard_failures = 0u32;
-            for key in &keys {
-                fetch_into_cache(
-                    &api_key,
-                    key,
-                    &mut cached_issues,
-                    &mut not_found,
-                    &mut hard_failures,
-                );
-            }
-            // BFS sub-issues as top-level entries up to depth 5.
-            let mut depth = 0u32;
-            loop {
-                let candidates: Vec<String> = cached_issues
-                    .values()
-                    .flat_map(|c: &cache::CachedLinear| {
-                        c.children.iter().map(|ch| ch.identifier.clone())
-                    })
-                    .filter(|k| !cached_issues.contains_key(k) && !not_found.contains(k))
-                    .collect();
-                if candidates.is_empty() || depth >= 5 {
-                    break;
-                }
-                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for key in &candidates {
-                    if !seen.insert(key.clone()) {
-                        continue;
-                    }
-                    fetch_into_cache(
-                        &api_key,
-                        key,
-                        &mut cached_issues,
-                        &mut not_found,
-                        &mut hard_failures,
-                    );
-                }
-                depth += 1;
-            }
-            let disconnected = hard_failures > 0 && cached_issues.is_empty();
-            cache::write_linear(&cache::LinearCache {
-                generated_at: cache::now_epoch(),
-                issues: cached_issues,
-                not_found,
-                disconnected,
-            });
-
-            std::thread::sleep(Duration::from_secs(120));
-        }
-    });
-}
-
-/// Fetch one Linear key into the cache.
-fn fetch_into_cache(
-    api_key: &str,
-    key: &str,
-    cached_issues: &mut std::collections::HashMap<String, cache::CachedLinear>,
-    not_found: &mut Vec<String>,
-    hard_failures: &mut u32,
-) {
-    // Single retry rescues 502s.
-    let mut last_err: Option<String> = None;
-    for attempt in 0..2 {
-        match linear::fetch_issue(api_key, key) {
-            Ok(Some(issue)) => {
-                cached_issues.insert(key.to_string(), cache::CachedLinear::from_issue(&issue));
-                return;
-            }
-            Ok(None) => {
-                if !not_found.contains(&key.to_string()) {
-                    not_found.push(key.to_string());
-                }
-                return;
-            }
-            Err(e) => {
-                last_err = Some(e.to_string());
-                if attempt == 0 {
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-            }
-        }
-    }
-    *hard_failures += 1;
-    if let Some(e) = last_err {
-        eprintln!("[orch] linear fetch {key} failed (after retry): {e}");
-    }
 }
 
 /// Background thread: reconciles PRs and fetches PR data every 30s.
@@ -2856,14 +2728,13 @@ fn cmd_daemon() {
     }
 
     state::ensure_state_files();
-    state::sweep_stale_markers(state::busy_stale_secs());
+    state::sweep_stale_activity(state::busy_stale_secs());
     eprintln!("[orch] reconciling PRs...");
     state::reconcile_prs();
 
     // Start background cache loops
     spawn_status_loop();
     spawn_pr_loop();
-    spawn_linear_loop();
 
     eprintln!("[orch] daemon started, watching {}", dir.display());
 
@@ -3006,17 +2877,7 @@ fn main() {
             tab,
             focus,
             select,
-            linear_detail,
-            linear_cursor,
-        }) => tui3::render_debug(
-            width,
-            height,
-            &tab,
-            &focus,
-            select,
-            linear_detail.as_deref(),
-            linear_cursor.as_deref(),
-        ),
+        }) => tui3::render_debug(width, height, &tab, &focus, select),
         Some(Cmd::Review { action }) => match action {
             ReviewAction::Start {
                 target,
@@ -3320,26 +3181,33 @@ mod tests {
     }
 
     #[test]
-    fn write_and_remove_busy_marker_round_trip() {
-        let dir = std::env::temp_dir().join("orch-busy-marker-test");
+    fn write_activity_status_overwrites_current_state() {
+        let dir = std::env::temp_dir().join("orch-activity-status-test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        assert!(write_busy_marker(&dir, "sid-1", "/tmp/wt"));
+        assert!(write_activity_status(
+            &dir,
+            "sid-1",
+            "/tmp/wt",
+            "working",
+        ));
         let path = dir.join("sid-1");
         assert!(path.exists());
 
         let content = fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["state"], "working");
         assert_eq!(v["cwd"], "/tmp/wt");
-        assert!(v["started_at"].is_number());
+        assert!(v["updated_at"].is_number());
 
-        // No leftover .tmp file
         assert!(!dir.join("sid-1.tmp").exists());
 
-        // Removal: rebuild path then remove
-        let _ = fs::remove_file(&path);
-        assert!(!path.exists());
+        assert!(write_activity_status(&dir, "sid-1", "", "ready"));
+        let content = fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["state"], "ready");
+        assert_eq!(v["cwd"], "/tmp/wt");
 
         let _ = fs::remove_dir_all(&dir);
     }

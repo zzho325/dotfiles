@@ -11,7 +11,7 @@ use crate::store::{
     DesiredState, LinkSource, PrLink, Store, TaskRecord,
 };
 
-/// Default age (seconds) past which a busy marker is considered stale.
+/// Default age (seconds) past which a working activity status is considered stale.
 /// Tunable via `ORCH_BUSY_STALE_SECS` env var. 30 minutes is comfortably
 /// larger than the longest Claude turn we'd expect in practice.
 pub const DEFAULT_BUSY_STALE_SECS: u64 = 1800;
@@ -78,7 +78,7 @@ pub struct PrData {
 pub enum TaskStatus {
     Ready,
     Working,
-    Input,
+    Unknown,
     Idle,
     Attached,
     Paused,
@@ -312,13 +312,18 @@ fn load_pane_info() -> HashSet<String> {
     active
 }
 
-// Busy markers — written by `orch busy start` (UserPromptSubmit hook),
-// removed by `orch busy stop` (Stop / SessionEnd hook).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentActivity {
+    Ready,
+    Working,
+    Unknown,
+}
 
-pub fn busy_dir() -> PathBuf {
+pub fn activity_dir() -> PathBuf {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
+    // Keep the existing directory so live sessions survive the schema change.
     runtime.join("orch").join("busy")
 }
 
@@ -339,37 +344,62 @@ fn marker_in_worktree(marker_cwd: &str, worktree: &str) -> bool {
     a == b || a.starts_with(&format!("{b}/"))
 }
 
-pub fn is_worktree_busy(worktree: &str, stale_secs: u64) -> bool {
+pub fn worktree_activity(worktree: &str, stale_secs: u64) -> AgentActivity {
+    worktree_activity_in(&activity_dir(), worktree, stale_secs)
+}
+
+fn worktree_activity_in(
+    dir: &Path,
+    worktree: &str,
+    stale_secs: u64,
+) -> AgentActivity {
     if worktree.is_empty() {
-        return false;
+        return AgentActivity::Unknown;
     }
-    let Ok(entries) = fs::read_dir(busy_dir()) else {
-        return false;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return AgentActivity::Unknown;
     };
     let now = SystemTime::now();
+    let mut saw_ready = false;
+    let mut saw_unknown = false;
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue; };
         let Ok(modified) = meta.modified() else { continue; };
-        let age = now
-            .duration_since(modified)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if age >= stale_secs {
-            continue;
-        }
         let Ok(content) = fs::read_to_string(entry.path()) else { continue; };
         let Ok(parsed) =
             serde_json::from_str::<serde_json::Value>(&content) else { continue; };
         let Some(cwd) = parsed["cwd"].as_str() else { continue; };
-        if marker_in_worktree(cwd, worktree) {
-            return true;
+        if !marker_in_worktree(cwd, worktree) {
+            continue;
+        }
+        let age = now
+            .duration_since(modified)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match parsed["state"].as_str() {
+            Some("ready") => saw_ready = true,
+            Some("working") | None if age < stale_secs => {
+                return AgentActivity::Working;
+            }
+            Some("working") | None => {}
+            _ if age < stale_secs => saw_unknown = true,
+            _ => {}
         }
     }
-    false
+
+    if saw_ready && !saw_unknown {
+        AgentActivity::Ready
+    } else {
+        AgentActivity::Unknown
+    }
 }
 
-pub fn sweep_stale_markers(stale_secs: u64) {
-    let Ok(entries) = fs::read_dir(busy_dir()) else {
+pub fn sweep_stale_activity(stale_secs: u64) {
+    sweep_stale_activity_in(&activity_dir(), stale_secs);
+}
+
+fn sweep_stale_activity_in(dir: &Path, stale_secs: u64) {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     let now = SystemTime::now();
@@ -381,6 +411,18 @@ pub fn sweep_stale_markers(stale_secs: u64) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if age >= stale_secs {
+            let is_ready = fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|content| {
+                    serde_json::from_str::<serde_json::Value>(&content).ok()
+                })
+                .and_then(|parsed| {
+                    parsed["state"].as_str().map(|state| state == "ready")
+                })
+                .unwrap_or(false);
+            if is_ready {
+                continue;
+            }
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -388,7 +430,7 @@ pub fn sweep_stale_markers(stale_secs: u64) {
 
 /// Compute the runtime task badge from a v2 record + tmux observation.
 /// Output is the cache contract the TUI consumes: persisted intent in
-/// `desired_state` × live tmux × busy-marker presence.
+/// `desired_state` × live tmux × latest agent activity.
 pub fn derive_status(
     record: &TaskRecord,
     sessions: &HashMap<String, TmuxSession>,
@@ -412,14 +454,10 @@ pub fn derive_status(
         return TaskStatus::Attached;
     }
 
-    if record.attention.needs_input {
-        return TaskStatus::Input;
-    }
-
-    if is_worktree_busy(&record.worktree.path, busy_stale_secs) {
-        TaskStatus::Working
-    } else {
-        TaskStatus::Ready
+    match worktree_activity(&record.worktree.path, busy_stale_secs) {
+        AgentActivity::Ready => TaskStatus::Ready,
+        AgentActivity::Working => TaskStatus::Working,
+        AgentActivity::Unknown => TaskStatus::Unknown,
     }
 }
 
@@ -911,9 +949,7 @@ pub fn remove_worktree(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{
-        self, AttentionInfo, DesiredState, TaskRecord, TmuxInfo, WorktreeInfo,
-    };
+    use crate::store::{self, DesiredState, TaskRecord, TmuxInfo, WorktreeInfo};
 
     fn record_with(session: &str, worktree: &str) -> TaskRecord {
         TaskRecord {
@@ -987,34 +1023,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_status_needs_input() {
-        let record = TaskRecord {
-            tmux: TmuxInfo {
-                session_name: "task-foo".into(),
-                ..Default::default()
-            },
-            attention: AttentionInfo {
-                needs_input: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut sessions = HashMap::new();
-        sessions.insert(
-            "task-foo".into(),
-            TmuxSession {
-                name: "task-foo".into(),
-                attached: false,
-                has_active_process: true,
-            },
-        );
-        assert_eq!(
-            derive_status(&record, &sessions, DEFAULT_BUSY_STALE_SECS),
-            TaskStatus::Input,
-        );
-    }
-
-    #[test]
     fn derive_status_no_active_process_is_paused() {
         let record = record_with("task-foo", "");
         let mut sessions = HashMap::new();
@@ -1058,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_status_ready_without_busy_marker() {
+    fn derive_status_unknown_without_activity() {
         let record = record_with("task-foo", "/tmp/orch-test-no-marker");
         let mut sessions = HashMap::new();
         sessions.insert(
@@ -1071,7 +1079,7 @@ mod tests {
         );
         assert_eq!(
             derive_status(&record, &sessions, DEFAULT_BUSY_STALE_SECS),
-            TaskStatus::Ready,
+            TaskStatus::Unknown,
         );
     }
 
@@ -1115,31 +1123,73 @@ mod tests {
     }
 
     #[test]
-    fn is_worktree_busy_fresh_marker() {
-        let test_runtime = std::env::temp_dir().join("orch-test-busy-fresh");
-        let _ = fs::remove_dir_all(&test_runtime);
-        let busy = test_runtime.join("orch").join("busy");
-        fs::create_dir_all(&busy).unwrap();
+    fn worktree_activity_aggregates_session_statuses() {
+        let dir = std::env::temp_dir().join("orch-test-activity-status");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
 
         let wt = "/tmp/test-wt";
-        let marker = busy.join("test-sid-1");
+        let working_status = dir.join("test-sid-1");
+        let ready_status = dir.join("test-sid-2");
         fs::write(
-            &marker,
-            format!(r#"{{"cwd": "{wt}", "started_at": "x", "pid": 1}}"#),
+            &working_status,
+            format!(r#"{{"state": "working", "cwd": "{wt}"}}"#),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(
+            &ready_status,
+            format!(r#"{{"state": "ready", "cwd": "{wt}"}}"#),
         )
         .unwrap();
 
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", &test_runtime);
-        }
-        assert!(is_worktree_busy(wt, 60));
-        assert!(!is_worktree_busy("/tmp/other", 60));
-        assert!(!is_worktree_busy(wt, 0));
+        assert_eq!(
+            worktree_activity_in(&dir, wt, 60),
+            AgentActivity::Working,
+        );
+        assert_eq!(
+            worktree_activity_in(&dir, "/tmp/other", 60),
+            AgentActivity::Unknown,
+        );
 
-        unsafe {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-        let _ = fs::remove_dir_all(&test_runtime);
+        fs::write(
+            &working_status,
+            format!(r#"{{"state": "ready", "cwd": "{wt}"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            worktree_activity_in(&dir, wt, 60),
+            AgentActivity::Ready,
+        );
+        assert_eq!(
+            worktree_activity_in(&dir, wt, 0),
+            AgentActivity::Ready,
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_stale_activity_preserves_ready() {
+        let dir = std::env::temp_dir().join("orch-test-sweep-activity");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let ready_status = dir.join("ready-sid");
+        let working_status = dir.join("working-sid");
+        fs::write(&ready_status, r#"{"state": "ready", "cwd": "/tmp/wt"}"#)
+            .unwrap();
+        fs::write(
+            &working_status,
+            r#"{"state": "working", "cwd": "/tmp/wt"}"#,
+        )
+        .unwrap();
+
+        sweep_stale_activity_in(&dir, 0);
+
+        assert!(ready_status.exists());
+        assert!(!working_status.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

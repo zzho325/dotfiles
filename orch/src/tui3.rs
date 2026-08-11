@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! ┌─────────────────┬──────────────────────────────────────┐
-//! │ tasks list      │ Overview · PRs · Linear · Panes      │
+//! │ tasks list      │ Overview · PRs · Panes               │
 //! │  #1 task-foo  · │ ─────────────────────────────────── │
 //! │  #2 task-bar  ⚡ │ <selected tab content>              │
 //! │  #3 task-baz  ✓ │                                      │
@@ -24,19 +24,16 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    terminal::{
-        disable_raw_mode, enable_raw_mode,
-        EnterAlternateScreen, LeaveAlternateScreen,
-    },
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     prelude::*,
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
-    Terminal,
 };
 
 use crate::cache;
@@ -129,7 +126,6 @@ pub enum Pane {
 pub enum Tab {
     Overview,
     Prs,
-    Linear,
     Panes,
 }
 
@@ -138,7 +134,6 @@ impl Tab {
         match self {
             Tab::Overview => "Overview",
             Tab::Prs => "PRs",
-            Tab::Linear => "Linear",
             Tab::Panes => "Panes",
         }
     }
@@ -146,8 +141,7 @@ impl Tab {
     fn next(self) -> Self {
         match self {
             Tab::Overview => Tab::Prs,
-            Tab::Prs => Tab::Linear,
-            Tab::Linear => Tab::Panes,
+            Tab::Prs => Tab::Panes,
             Tab::Panes => Tab::Overview,
         }
     }
@@ -156,8 +150,7 @@ impl Tab {
         match self {
             Tab::Overview => Tab::Panes,
             Tab::Prs => Tab::Overview,
-            Tab::Linear => Tab::Prs,
-            Tab::Panes => Tab::Linear,
+            Tab::Panes => Tab::Prs,
         }
     }
 }
@@ -177,7 +170,6 @@ pub struct TaskView {
     pub status: TaskStatus,
     pub prs: Vec<state::PrData>,
     pub panes: Vec<TmuxPaneInfo>,
-    pub linear: Vec<LinearStub>,
 }
 
 impl TaskView {
@@ -188,15 +180,6 @@ impl TaskView {
     pub fn drift(&self) -> bool {
         self.record.drift.any()
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct LinearStub {
-    pub key: String,
-    pub title: String,
-    pub state: String,
-    pub assignee: Option<String>,
-    pub depth: u8,
 }
 
 #[derive(Clone)]
@@ -225,37 +208,7 @@ impl Default for LogPane {
     }
 }
 
-/// Linear tab sub-state. The flat list is the default; pressing Enter
-/// pushes a Detail view (one issue, full page). Esc pops back. Stack
-/// supports drill-into-sub-issue → drill-into-sub-issue chains.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LinearView {
-    List {
-        cursor_key: String,
-        pinned: HashSet<String>,
-    },
-    Detail {
-        /// Drill stack — `last()` is the currently shown issue, `[0]` is
-        /// the key the user drilled in from (restored on Esc).
-        /// `u` walks up to the parent. Esc returns to List.
-        stack: Vec<String>,
-        /// Cursor index into the rendered detail-view sub-issue list
-        /// (sub-issues only — parent/project/url use dedicated keys).
-        sub_cursor: usize,
-    },
-}
-
-impl Default for LinearView {
-    fn default() -> Self {
-        LinearView::List {
-            cursor_key: String::new(),
-            pinned: HashSet::new(),
-        }
-    }
-}
-
-/// PR tab sub-state. Mirrors `LinearView` shape — minus the drill stack
-/// since PRs don't nest.
+/// PR tab sub-state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrView {
     List {
@@ -293,13 +246,6 @@ pub struct App {
     pub detail_tab: Tab,
     /// Pane selected within the Panes tab.
     pub panes_selected: usize,
-    /// Linear tab sub-state.
-    pub linear_view: LinearView,
-    /// Row offset at the top of the Linear list viewport. Mutated by
-    /// `render_linear_list` each frame using a sticky-margin scroll
-    /// (same algorithm as `monitor`'s tui). Survives re-render even
-    /// when rows reshape.
-    pub linear_list_offset: usize,
     /// PR tab sub-state.
     pub pr_view: PrView,
     /// Per-PR persisted detail-view position. Esc-out saves into this
@@ -334,8 +280,6 @@ impl App {
             focus: Pane::List,
             detail_tab: Tab::Overview,
             panes_selected: 0,
-            linear_view: LinearView::default(),
-            linear_list_offset: 0,
             pr_view: PrView::default(),
             pr_detail_state: HashMap::new(),
             log: LogPane::default(),
@@ -360,7 +304,6 @@ impl App {
     fn load_tasks() -> Vec<TaskView> {
         let status_cache = crate::cache::read_status();
         let pr_cache = crate::cache::read_prs();
-        let linear_cache = crate::cache::read_linear();
         let daemon_alive = crate::cache::is_daemon_alive();
 
         let live_sessions = if daemon_alive {
@@ -410,15 +353,12 @@ impl App {
                     .collect();
 
                 let panes = panes_for_session(&record.tmux.session_name);
-                let linear = linear_from_record(&record, &linear_cache);
-
                 TaskView {
                     name,
                     record,
                     status,
                     prs,
                     panes,
-                    linear,
                 }
             })
             .collect()
@@ -563,7 +503,7 @@ fn status_from_str(s: &str) -> TaskStatus {
     match s {
         "ready" => TaskStatus::Ready,
         "working" => TaskStatus::Working,
-        "input" => TaskStatus::Input,
+        "unknown" => TaskStatus::Unknown,
         "attached" => TaskStatus::Attached,
         "paused" => TaskStatus::Paused,
         "error" => TaskStatus::Error,
@@ -626,120 +566,11 @@ fn find_actual_session(expected: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// Build LinearStub list for a task. When the cache has fresh data
-/// for a key, the stub gets the real title/state/assignee. Otherwise
-/// the title is empty and state shows the link provenance, so the
-/// TUI can render keys immediately while the daemon backfills.
-///
-/// Stubs are sorted by project name so the list view can group by
-/// project without re-shuffling the cursor. If some linked issues are
-/// still loading, they inherit the task's single cached project.
-fn linear_from_record(
-    record: &crate::store::TaskRecord,
-    cache: &crate::cache::LinearCache,
-) -> Vec<LinearStub> {
-    let mut stubs: Vec<LinearStub> = record
-        .links
-        .linear_issues
-        .iter()
-        .map(|li| {
-            if let Some(cached) = cache.issues.get(&li.key) {
-                LinearStub {
-                    key: cached.identifier.clone(),
-                    title: cached.title.clone(),
-                    state: cached.state.clone(),
-                    assignee: if cached.assignee.is_empty() {
-                        None
-                    } else {
-                        Some(cached.assignee.clone())
-                    },
-                    depth: 0,
-                }
-            } else if cache.not_found.contains(&li.key) {
-                LinearStub {
-                    key: li.key.clone(),
-                    title: String::new(),
-                    state: "not on Linear".into(),
-                    assignee: None,
-                    depth: 0,
-                }
-            } else {
-                let provenance = match li.source {
-                    crate::store::LinkSource::Manual => "manual",
-                    crate::store::LinkSource::BranchDiscovery => "branch",
-                    crate::store::LinkSource::MarkdownScan => "scan",
-                    crate::store::LinkSource::Migration => "migration",
-                };
-                LinearStub {
-                    key: li.key.clone(),
-                    title: String::new(),
-                    state: format!("{provenance}, loading…"),
-                    assignee: None,
-                    depth: 0,
-                }
-            }
-        })
-        .collect();
-    let fallback_project = fallback_project_name(&stubs, cache);
-    // Stable sort: project name first, no-project rows last, then key.
-    stubs.sort_by(|a, b| {
-        let pa = project_name_for_key(&a.key, cache).or_else(|| fallback_project.clone());
-        let pb = project_name_for_key(&b.key, cache).or_else(|| fallback_project.clone());
-        // None projects sort after Some projects.
-        match (pa.is_none(), pb.is_none()) {
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => pa.cmp(&pb).then(a.key.cmp(&b.key)),
-        }
-    });
-    stubs
-}
-
-fn project_name_for_key(key: &str, cache: &crate::cache::LinearCache) -> Option<String> {
-    let cached = cache.issues.get(key)?;
-    cached
-        .project
-        .as_ref()
-        .map(|p| p.name.clone())
-        .or_else(|| {
-            cached
-                .parent_key
-                .as_ref()
-                .and_then(|parent| cache.issues.get(parent))
-                .and_then(|parent| parent.project.as_ref())
-                .map(|p| p.name.clone())
-        })
-}
-
-fn fallback_project_name(
-    stubs: &[LinearStub],
-    cache: &crate::cache::LinearCache,
-) -> Option<String> {
-    let mut projects: Vec<String> = Vec::new();
-    for stub in stubs {
-        let Some(project) = project_name_for_key(&stub.key, cache) else {
-            continue;
-        };
-        if !projects.contains(&project) {
-            projects.push(project);
-        }
-    }
-    if projects.len() == 1 {
-        projects.pop()
-    } else {
-        None
-    }
-}
-
 // Rendering.
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
-    let layout = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(screen);
+    let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(screen);
     let area = layout[0];
     let footer = layout[1];
 
@@ -748,11 +579,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // tab must still be Prs — if the user pressed `1`/`3`/`4` to jump
     // to another tab while drilled, we treat that as an exit (the
     // dispatcher resets pr_view) so this short-circuit is consistent.
-    if let PrView::Detail { number, focus, file_cursor, scroll } = &app.pr_view {
+    if let PrView::Detail {
+        number,
+        focus,
+        file_cursor,
+        scroll,
+    } = &app.pr_view
+    {
         if app.detail_tab == Tab::Prs {
-            render_pr_detail_fullscreen(
-                frame, area, app, *number, *focus, *file_cursor, *scroll,
-            );
+            render_pr_detail_fullscreen(frame, area, app, *number, *focus, *file_cursor, *scroll);
             render_shortcut_footer(frame, footer, app);
             if app.show_help {
                 render_help_overlay_pr_detail(frame, screen);
@@ -777,10 +612,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let preview_active = app.focus == Pane::Right
         && match app.detail_tab {
             Tab::Prs => pr_preview_target(app).is_some(),
-            Tab::Linear => app
-                .selected_task()
-                .map(|task| !task.linear.is_empty())
-                .unwrap_or(false),
             _ => false,
         };
     if app.show_activity || preview_active {
@@ -920,7 +751,7 @@ fn shortcut_hint(app: &App) -> String {
                 TaskStatus::Paused => actions.push("R resume"),
                 TaskStatus::Ready
                 | TaskStatus::Working
-                | TaskStatus::Input
+                | TaskStatus::Unknown
                 | TaskStatus::Attached
                 | TaskStatus::Error => actions.push("p pause"),
             }
@@ -932,8 +763,6 @@ fn shortcut_hint(app: &App) -> String {
                 Tab::Overview => Vec::new(),
                 Tab::Prs if task.prs.is_empty() => Vec::new(),
                 Tab::Prs => vec!["j/k move", "Enter diff", "o open"],
-                Tab::Linear if task.linear.is_empty() => Vec::new(),
-                Tab::Linear => vec!["j/k move", "Enter inspect", "o open", "y copy"],
                 Tab::Panes if task.panes.is_empty() => Vec::new(),
                 Tab::Panes => vec!["j/k move", "Enter attach"],
             };
@@ -985,7 +814,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             let badge_color = status_color(task.status);
             // P/L counts intentionally omitted from the list — the
             // user only cared about drift state at a glance, and the
-            // detail tabs already surface PR/Linear counts.
+            // Detail tabs already surface PR counts.
             let mut counts = String::new();
             if task.drift() {
                 counts.push_str(" ⚠");
@@ -1058,7 +887,7 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // Tab bar.
     let focused = app.focus == Pane::Right;
-    let tabs = [Tab::Overview, Tab::Prs, Tab::Linear, Tab::Panes];
+    let tabs = [Tab::Overview, Tab::Prs, Tab::Panes];
     let mut tab_spans: Vec<Span> = Vec::new();
     tab_spans.push(Span::raw(" "));
     for (i, tab) in tabs.iter().enumerate() {
@@ -1073,7 +902,6 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
         let count = match tab {
             Tab::Overview => 0,
             Tab::Prs => task.prs.len(),
-            Tab::Linear => task.linear.len(),
             Tab::Panes => task.panes.len(),
         };
         let label = if count == 0 {
@@ -1116,7 +944,6 @@ fn render_details(frame: &mut Frame, area: Rect, app: &mut App) {
     match app.detail_tab {
         Tab::Overview => render_tab_overview(frame, body_area, app, &task),
         Tab::Prs => render_tab_prs(frame, body_area, app, &task),
-        Tab::Linear => render_tab_linear(frame, body_area, app, &task),
         Tab::Panes => render_tab_panes(frame, body_area, app, &task),
     }
 }
@@ -1133,18 +960,23 @@ fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskVie
         display_worktree_path(&task.record.worktree.path)
     };
     let prs_str = task.prs.len().to_string();
-    let linear_str = task.linear.len().to_string();
     let panes_str = task.panes.len().to_string();
 
     let mut lines = vec![
         Line::raw(""),
-        Line::styled(format!(" {}", task.name), Style::default().fg(palette().text)),
+        Line::styled(
+            format!(" {}", task.name),
+            Style::default().fg(palette().text),
+        ),
         Line::from(vec![
             Span::styled(
                 format!(" {}", status_str(task.status)),
                 Style::default().fg(status_color(task.status)),
             ),
-            Span::styled(format!("  ·  {panes_str} panes"), Style::default().fg(palette().subtle)),
+            Span::styled(
+                format!("  ·  {panes_str} panes"),
+                Style::default().fg(palette().subtle),
+            ),
         ]),
         Line::raw(""),
         kv_line(" session   ", &session_str),
@@ -1152,12 +984,6 @@ fn render_tab_overview(frame: &mut Frame, area: Rect, _app: &App, task: &TaskVie
     ];
     if !task.prs.is_empty() {
         lines.push(kv_line(" prs       ", &prs_str));
-    }
-    if !task.linear.is_empty() {
-        lines.push(kv_line(" linear    ", &linear_str));
-    }
-    if task.record.attention.needs_input {
-        lines.push(kv_line(" attention ", "needs input"));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -1265,9 +1091,10 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
             crate::state::CodexStatus::ThumbsUp => {
                 Span::styled("  ·  ✓ codex", Style::default().fg(palette().pine))
             }
-            crate::state::CodexStatus::Commented => {
-                Span::styled("  ·  · codex commented", Style::default().fg(palette().gold))
-            }
+            crate::state::CodexStatus::Commented => Span::styled(
+                "  ·  · codex commented",
+                Style::default().fg(palette().gold),
+            ),
             crate::state::CodexStatus::None => {
                 Span::styled("  ·  · codex", Style::default().fg(palette().muted))
             }
@@ -1291,7 +1118,10 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
         }
         // Mergeable: glyph only on conflict (skip cell noise on green path).
         if pr.mergeable.as_deref() == Some("CONFLICTING") {
-            meta.push(Span::styled("  ⚠ conflict", Style::default().fg(palette().gold)));
+            meta.push(Span::styled(
+                "  ⚠ conflict",
+                Style::default().fg(palette().gold),
+            ));
         }
         lines.push(Line::from(meta));
 
@@ -1318,744 +1148,6 @@ fn render_tab_prs(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
         ));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-}
-
-fn render_tab_linear(frame: &mut Frame, area: Rect, app: &mut App, task: &TaskView) {
-    let cache = crate::cache::read_linear();
-    let focused = app.focus == Pane::Right && app.detail_tab == Tab::Linear;
-    match &app.linear_view {
-        LinearView::Detail { stack, sub_cursor, .. } if !stack.is_empty() => {
-            let stack = stack.clone();
-            let sub_cursor = *sub_cursor;
-            render_linear_detail(frame, area, &stack, sub_cursor, &cache, focused);
-        }
-        LinearView::List { cursor_key, pinned } => {
-            let cursor_key = cursor_key.clone();
-            let pinned = pinned.clone();
-            render_linear_list(
-                frame,
-                area,
-                focused,
-                &mut app.linear_list_offset,
-                task,
-                &cursor_key,
-                &pinned,
-                &cache,
-            );
-        }
-        _ => {
-            let empty = HashSet::new();
-            render_linear_list(
-                frame,
-                area,
-                focused,
-                &mut app.linear_list_offset,
-                task,
-                "",
-                &empty,
-                &cache,
-            );
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RowKind {
-    ProjectHeader,
-    Parent { collapsed_subs: usize },
-    /// `branch[i]` = "ancestor at depth i+1 was last among its siblings".
-    /// `branch.last()` = is_last for the row itself. `branch.len()` = depth.
-    SubIssue { branch: Vec<bool> },
-    MoreMarker,
-}
-
-#[derive(Debug, Clone)]
-struct ListRow {
-    key: String,
-    kind: RowKind,
-    title: String,
-    state_kind: String,
-    state_name: String,
-    project_for_strip: String,
-    not_found: bool,
-}
-
-const AUTO_EXPAND_LIMIT: usize = 6;
-
-/// User identifier (Linear displayName) for the assignee filter.
-/// First checks `ORCH_LINEAR_USER`; falls back to the most common
-/// assignee in the cache (in a personal tool, that's the user).
-/// Empty string disables filtering.
-fn linear_me(cache: &crate::cache::LinearCache) -> String {
-    if let Ok(s) = std::env::var("ORCH_LINEAR_USER") {
-        if !s.is_empty() {
-            return s;
-        }
-    }
-    // Auto-detect: count assignees across cache.issues, pick the
-    // mode. With one user this is the user; the cache is small so
-    // counting per-render is fine.
-    let mut counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for c in cache.issues.values() {
-        if !c.assignee.is_empty() {
-            *counts.entry(c.assignee.clone()).or_insert(0) += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(name, _)| name)
-        .unwrap_or_default()
-}
-
-/// True iff this issue is "mine" — unassigned or assigned to me.
-/// When `me` is empty, every issue passes (filter disabled).
-fn is_mine(assignee: &str, me: &str) -> bool {
-    me.is_empty() || assignee.is_empty() || assignee == me
-}
-
-/// Build the flat row stream. Sub-issues are ALWAYS expanded inline
-/// — the list never reshapes when the cursor moves. Project headers
-/// appear when at least one visible row has a real project. Top-level
-/// stubs that are also a child of another linked stub are shown only
-/// as the sub-issue (deduped) so the cursor doesn't have two rows
-/// claiming the same key. Issues assigned to someone other than
-/// `linear_me()` are dropped (both top-level and as sub-issues).
-fn build_linear_rows(
-    stubs: &[LinearStub],
-    cache: &crate::cache::LinearCache,
-    _cursor_key: &str,
-    _pinned: &HashSet<String>,
-) -> Vec<ListRow> {
-    if stubs.is_empty() {
-        return Vec::new();
-    }
-
-    let me = linear_me(cache);
-    let fallback_project = fallback_project_name(stubs, cache);
-
-    // Collect all keys that appear as a child of another linked stub.
-    // These are skipped at top-level so the cursor sees one row per key.
-    let child_keys: HashSet<String> = stubs
-        .iter()
-        .filter_map(|s| cache.issues.get(&s.key))
-        .flat_map(|c| c.children.iter().map(|ch| ch.identifier.clone()))
-        .collect();
-
-    // Filter "not mine" — issues assigned to someone other than me
-    // (unassigned issues always pass; treated as mine-by-default).
-    let assignee_of = |key: &str| -> String {
-        cache
-            .issues
-            .get(key)
-            .map(|c| c.assignee.clone())
-            .unwrap_or_default()
-    };
-
-    // A stub is shown iff: it's not also someone else's child (dedupe),
-    // it's mine (or unassigned), and Linear actually knows about it
-    // (not in `not_found`). Stale/orphan link entries are silently
-    // hidden — `orch linear rm <task> <key>` cleans them up.
-    let visible = |key: &str| -> bool {
-        if child_keys.contains(key) {
-            return false;
-        }
-        if cache.not_found.contains(&key.to_string()) {
-            return false;
-        }
-        is_mine(&assignee_of(key), &me)
-    };
-
-    let mut projects: Vec<String> = Vec::new();
-    for s in stubs {
-        if !visible(&s.key) {
-            continue;
-        }
-        let p = project_name_for_row(&s.key, cache, &fallback_project);
-        if !projects.contains(&p) {
-            projects.push(p);
-        }
-    }
-    let show_project_headers = projects.iter().any(|p| p != "(no project)");
-
-    let mut rows: Vec<ListRow> = Vec::new();
-    let mut prev_project: Option<String> = None;
-
-    for stub in stubs {
-        if !visible(&stub.key) {
-            continue;
-        }
-        let cached = cache.issues.get(&stub.key);
-        let project_name = project_name_for_row(&stub.key, cache, &fallback_project);
-
-        if show_project_headers && prev_project.as_ref() != Some(&project_name) {
-            rows.push(ListRow {
-                key: format!("__project_{project_name}"),
-                kind: RowKind::ProjectHeader,
-                title: project_name.clone(),
-                state_kind: String::new(),
-                state_name: String::new(),
-                project_for_strip: String::new(),
-                not_found: false,
-            });
-            prev_project = Some(project_name.clone());
-        }
-
-        let is_not_found = cache.not_found.contains(&stub.key);
-        let n_children = cached.map(|c| c.children.len()).unwrap_or(0);
-
-        rows.push(ListRow {
-            key: stub.key.clone(),
-            kind: RowKind::Parent { collapsed_subs: 0 },
-            title: cached.map(|c| c.title.clone()).unwrap_or_else(|| stub.title.clone()),
-            state_kind: cached.map(|c| c.state_kind.clone()).unwrap_or_default(),
-            state_name: cached.map(|c| c.state.clone()).unwrap_or_default(),
-            project_for_strip: project_name.clone(),
-            not_found: is_not_found,
-        });
-
-        if n_children > 0 {
-            append_subissue_rows(
-                &mut rows,
-                &cached.unwrap().children,
-                &project_name,
-                cache,
-                &me,
-                &[],
-            );
-        }
-    }
-
-    rows
-}
-
-fn project_name_for_row(
-    key: &str,
-    cache: &crate::cache::LinearCache,
-    fallback_project: &Option<String>,
-) -> String {
-    project_name_for_key(key, cache)
-        .or_else(|| fallback_project.clone())
-        .unwrap_or_else(|| "(no project)".into())
-}
-
-/// Recursively append sub-issues (and their sub-issues, via the BFS-cached
-/// top-level entries) to the row stream. Filtered by the same `is_mine`
-/// rule as top-level. Recursion bottoms out when a sub-issue isn't in the
-/// cache or has no children.
-fn append_subissue_rows(
-    rows: &mut Vec<ListRow>,
-    children: &[crate::cache::CachedChild],
-    project_name: &str,
-    cache: &crate::cache::LinearCache,
-    me: &str,
-    parents_last: &[bool],
-) {
-    let visible: Vec<_> = children.iter().filter(|ch| is_mine(&ch.assignee, me)).collect();
-    let n = visible.len();
-    for (i, child) in visible.iter().enumerate() {
-        let mut branch = parents_last.to_vec();
-        branch.push(i + 1 == n);
-        rows.push(ListRow {
-            key: child.identifier.clone(),
-            kind: RowKind::SubIssue { branch: branch.clone() },
-            title: child.title.clone(),
-            state_kind: child.state_kind.clone(),
-            state_name: child.state.clone(),
-            project_for_strip: project_name.to_string(),
-            not_found: false,
-        });
-        if let Some(sub_cached) = cache.issues.get(&child.identifier) {
-            if !sub_cached.children.is_empty() {
-                append_subissue_rows(
-                    rows,
-                    &sub_cached.children,
-                    project_name,
-                    cache,
-                    me,
-                    &branch,
-                );
-            }
-        }
-    }
-}
-
-/// Strip a leading `[Project]` prefix from a title when it matches the
-/// enclosing project (case-insensitive). Linear's auto-namespacing
-/// duplicates the project header otherwise.
-fn strip_project_prefix(title: &str, project: &str) -> String {
-    if project.is_empty() {
-        return title.to_string();
-    }
-    let trimmed = title.trim_start();
-    let prefix = format!("[{}]", project);
-    if let Some(rest) = trimmed
-        .to_lowercase()
-        .strip_prefix(&prefix.to_lowercase())
-        .map(|_| trimmed[prefix.len()..].trim_start())
-    {
-        return rest.to_string();
-    }
-    title.to_string()
-}
-
-/// Indices of `j/k`-targetable rows (skips ProjectHeader and MoreMarker).
-fn cursor_targets(rows: &[ListRow]) -> Vec<usize> {
-    rows.iter()
-        .enumerate()
-        .filter(|(_, r)| matches!(r.kind, RowKind::Parent { .. } | RowKind::SubIssue { .. }))
-        .map(|(i, _)| i)
-        .collect()
-}
-
-fn first_target_key(rows: &[ListRow]) -> Option<String> {
-    cursor_targets(rows)
-        .into_iter()
-        .next()
-        .and_then(|i| rows.get(i).map(|r| r.key.clone()))
-}
-
-fn render_linear_list(
-    frame: &mut Frame,
-    area: Rect,
-    focused: bool,
-    list_offset: &mut usize,
-    task: &TaskView,
-    cursor_key: &str,
-    pinned: &HashSet<String>,
-    cache: &crate::cache::LinearCache,
-) {
-    if task.linear.is_empty() {
-        let lines = vec![
-            Line::raw(""),
-            Line::styled(
-                " (no linked Linear issues)",
-                Style::default().fg(palette().subtle),
-            ),
-            Line::styled(
-                " orch linear add <task> ENG-123  ·  orch linear scan <task>",
-                Style::default().fg(palette().muted),
-            ),
-        ];
-        frame.render_widget(Paragraph::new(lines), area);
-        return;
-    }
-
-    let all_rows = build_linear_rows(&task.linear, cache, cursor_key, pinned);
-    let width = area.width as usize;
-
-    // Sticky-margin scroll — same shape as monitor::tui_render::render_list.
-    // Cursor stays at least `margin` rows from each viewport edge, except
-    // at the absolute top/bottom of the list.
-    let footer_reserved = if focused { 2 } else { 0 };
-    let viewport_height = (area.height as usize).saturating_sub(footer_reserved);
-    let cursor_row = all_rows
-        .iter()
-        .position(|r| r.key == cursor_key)
-        .unwrap_or(0);
-    let margin = 3usize.min(viewport_height / 3);
-    let mut offset = *list_offset;
-    if cursor_row < offset + margin {
-        offset = cursor_row.saturating_sub(margin);
-    } else if viewport_height > 0 && cursor_row + margin + 1 > offset + viewport_height {
-        offset = cursor_row + margin + 1 - viewport_height;
-    }
-    offset = offset.min(all_rows.len().saturating_sub(viewport_height));
-    *list_offset = offset;
-    let start = offset;
-    let end = (start + viewport_height).min(all_rows.len());
-    let rows: &[ListRow] = &all_rows[start..end];
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    let mut last_was_header = false;
-    for row in rows {
-        match &row.kind {
-            RowKind::ProjectHeader => {
-                if !lines.is_empty() {
-                    lines.push(Line::raw(""));
-                }
-                lines.push(Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(
-                        row.title.to_lowercase(),
-                        Style::default().fg(palette().iris),
-                    ),
-                ]));
-                last_was_header = true;
-            }
-            RowKind::Parent { collapsed_subs: _ } => {
-                let selected = focused && row.key == cursor_key;
-                let cursor_glyph = if selected { " ▸ " } else { "   " };
-                let cursor_color = if selected { palette().love } else { palette().muted };
-                let state_color = linear_state_color(&row.state_name);
-                let glyph = state_glyph(&row.state_kind);
-                let title = strip_project_prefix(&row.title, &row.project_for_strip);
-                lines.push(compose_row(
-                    cursor_glyph,
-                    cursor_color,
-                    &row.key,
-                    glyph,
-                    state_color,
-                    &title,
-                    if row.not_found { Some(palette().love) } else { None },
-                    None,
-                    width,
-                    selected,
-                ));
-                last_was_header = false;
-            }
-            RowKind::SubIssue { branch } => {
-                let selected = focused && row.key == cursor_key;
-                // `│` continues an ancestor's vertical line when that
-                // ancestor has more siblings below; spaces otherwise.
-                // Row's own depth gets └ (last) / │ (more) / ▸ (cursor).
-                let self_is_last = *branch.last().expect("SubIssue rows have non-empty branch");
-                let self_glyph = if selected {
-                    '▸'
-                } else if self_is_last {
-                    '└'
-                } else {
-                    '│'
-                };
-                let mut prefix = String::from(" ");
-                for ancestor_last in &branch[..branch.len() - 1] {
-                    prefix.push_str("    ");
-                    prefix.push(if *ancestor_last { ' ' } else { '│' });
-                }
-                prefix.push_str("    ");
-                prefix.push(self_glyph);
-                prefix.push(' ');
-                let prefix_color = if selected {
-                    palette().love
-                } else {
-                    palette().muted
-                };
-                let state_color = linear_state_color(&row.state_name);
-                let glyph = state_glyph(&row.state_kind);
-                let title = strip_project_prefix(&row.title, &row.project_for_strip);
-                lines.push(compose_row(
-                    &prefix,
-                    prefix_color,
-                    &row.key,
-                    glyph,
-                    state_color,
-                    &title,
-                    None,
-                    None,
-                    width,
-                    selected,
-                ));
-                last_was_header = false;
-            }
-            RowKind::MoreMarker => {
-                lines.push(Line::from(vec![
-                    Span::styled(" └ ", Style::default().fg(palette().muted)),
-                    Span::styled(row.title.clone(), Style::default().fg(palette().muted)),
-                ]));
-                last_was_header = false;
-            }
-        }
-    }
-    let _ = last_was_header;
-
-    if focused {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            " j/k move · Enter open · o browser",
-            Style::default().fg(palette().muted),
-        ));
-    }
-
-    // No wrap on the list — each row is intended to be one line; long
-    // titles are truncated in compose_row. Wrapping shifted alignment
-    // when titles got cut.
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// One-line row composer used by both Parent and SubIssue rows.
-/// `prefix` (3 cols) + key (padded to 9) + 2 spaces + state glyph + 2 spaces +
-/// title (truncated to fit) + optional right-aligned trailer.
-fn compose_row(
-    prefix: &str,
-    prefix_color: Color,
-    key: &str,
-    state_glyph_str: &str,
-    state_color: Color,
-    title: &str,
-    title_color_override: Option<Color>,
-    trailer: Option<&str>,
-    width: usize,
-    selected: bool,
-) -> Line<'static> {
-    let key_field = format!("{key:<9}");
-    let title_color = title_color_override.unwrap_or(palette().text);
-    let prefix_len = prefix.chars().count();
-    let key_len = 9;
-    let glyph_len = state_glyph_str.chars().count();
-    let trailer_len = trailer
-        .map(|t| t.chars().count() + 3 /* "  ·  " minus a bit */)
-        .unwrap_or(0);
-    let used = prefix_len + key_len + 2 + glyph_len + 2 + trailer_len + 1;
-    let title_room = width.saturating_sub(used);
-    let title_cut = if title.chars().count() > title_room {
-        let take = title_room.saturating_sub(1);
-        let mut buf = String::new();
-        for (i, c) in title.chars().enumerate() {
-            if i >= take {
-                buf.push('…');
-                break;
-            }
-            buf.push(c);
-        }
-        buf
-    } else {
-        title.to_string()
-    };
-    let title_pad = title_room.saturating_sub(title_cut.chars().count());
-
-    let mut spans = vec![
-        Span::styled(prefix.to_string(), Style::default().fg(prefix_color)),
-        Span::styled(key_field, Style::default().fg(palette().iris)),
-        Span::raw("  "),
-        Span::styled(state_glyph_str.to_string(), Style::default().fg(state_color)),
-        Span::raw("  "),
-        Span::styled(title_cut, Style::default().fg(title_color)),
-    ];
-    if let Some(t) = trailer {
-        spans.push(Span::raw(" ".repeat(title_pad)));
-        spans.push(Span::styled(
-            format!("  {t}"),
-            Style::default().fg(palette().muted),
-        ));
-    }
-    let line = Line::from(spans);
-    if selected {
-        line.style(Style::default().bg(palette().highlight_low))
-    } else {
-        line
-    }
-}
-
-
-fn render_linear_detail(
-    frame: &mut Frame,
-    area: Rect,
-    stack: &[String],
-    sub_cursor: usize,
-    cache: &crate::cache::LinearCache,
-    focused: bool,
-) {
-    let key = stack.last().cloned().unwrap_or_default();
-    let cached = cache.issues.get(&key);
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    let Some(c) = cached else {
-        // Sub-issues live as `children` on their parent's cache entry,
-        // not as top-level `issues` keys. Render the limited data we
-        // have rather than a perpetual "loading…".
-        if let Some((parent_key, child)) = find_child_in_cache(cache, &key) {
-            render_child_detail(frame, area, &key, parent_key, child, focused);
-            return;
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            format!(" {key}  loading…"),
-            Style::default().fg(palette().muted),
-        ));
-        if cache.not_found.contains(&key) {
-            lines.push(Line::styled(
-                " not on Linear",
-                Style::default().fg(palette().love),
-            ));
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            " Esc back · o browser",
-            Style::default().fg(palette().muted),
-        ));
-        frame.render_widget(Paragraph::new(lines), area);
-        return;
-    };
-
-    // Row 1: key · priority · state · age
-    let state_color = linear_state_color(&c.state);
-    let priority_label = priority_glyph(c.priority);
-    let mut id_line = vec![Span::styled(
-        format!(" {}", c.identifier),
-        Style::default().fg(palette().iris),
-    )];
-    if !priority_label.is_empty() {
-        id_line.push(Span::styled(
-            format!("  ·  {priority_label}"),
-            Style::default().fg(priority_color(c.priority)),
-        ));
-    }
-    id_line.push(Span::styled(
-        format!("  ·  {} {}", state_glyph(&c.state_kind), c.state),
-        Style::default().fg(state_color),
-    ));
-    let age = relative_age(&c.updated_at);
-    if !age.is_empty() {
-        id_line.push(Span::styled(
-            format!("  ·  {age}"),
-            Style::default().fg(palette().muted),
-        ));
-    }
-    if stack.len() > 1 {
-        id_line.push(Span::styled(
-            format!("  (depth {})", stack.len() - 1),
-            Style::default().fg(palette().muted),
-        ));
-    }
-    lines.push(Line::from(id_line));
-
-    // Row 2: title
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(c.title.clone(), Style::default().fg(palette().text)),
-    ]));
-    lines.push(Line::raw(""));
-
-    // Project / parent / cycle / assignee meta block
-    if let Some(p) = &c.project {
-        lines.push(Line::from(vec![
-            Span::styled(" Project   ", Style::default().fg(palette().muted)),
-            Span::styled(p.name.clone(), Style::default().fg(palette().text)),
-        ]));
-    }
-    if let Some(parent_key) = &c.parent_key {
-        let title = c.parent_title.clone().unwrap_or_default();
-        lines.push(Line::from(vec![
-            Span::styled(" Parent    ", Style::default().fg(palette().muted)),
-            Span::styled(
-                format!("{parent_key}  "),
-                Style::default().fg(palette().iris),
-            ),
-            Span::styled(title, Style::default().fg(palette().text)),
-        ]));
-    }
-    if let Some(cycle) = &c.cycle_name {
-        if !cycle.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(" Cycle     ", Style::default().fg(palette().muted)),
-                Span::styled(cycle.clone(), Style::default().fg(palette().text)),
-            ]));
-        }
-    }
-    if !c.assignee.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(" Assignee  ", Style::default().fg(palette().muted)),
-            Span::styled(format!("@{}", c.assignee), Style::default().fg(palette().text)),
-        ]));
-    }
-
-    // Description block — wrap, trim to fit remaining space.
-    // Budget: total area minus lines so far minus reserved trailing rows.
-    let used = lines.len();
-    let footer_reserved: usize = 2; // blank + footer line
-    let n_children = c.children.len();
-    let kid_block_reserved: usize = if n_children == 0 {
-        0
-    } else {
-        // blank + "Sub-issues (N)" header + N rows
-        2 + n_children
-    };
-    let desc_budget = (area.height as usize)
-        .saturating_sub(used + footer_reserved + kid_block_reserved);
-    if desc_budget >= 3 && !c.description.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            " Description",
-            Style::default().fg(palette().muted),
-        ));
-        let width = (area.width.saturating_sub(2) as usize).max(20);
-        let wrapped = wrap_text(&c.description, width);
-        let body_room = desc_budget - 2;
-        // Reserve one row for "…" if we overflow.
-        let take = if wrapped.len() > body_room {
-            body_room.saturating_sub(1)
-        } else {
-            body_room
-        };
-        for w in wrapped.iter().take(take) {
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(w.clone(), Style::default().fg(palette().subtle)),
-            ]));
-        }
-        if wrapped.len() > take {
-            lines.push(Line::styled(
-                " …",
-                Style::default().fg(palette().muted),
-            ));
-        }
-    }
-
-    // Sub-issues
-    if !c.children.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            format!(" Sub-issues ({n_children})"),
-            Style::default().fg(palette().muted),
-        ));
-        for (i, child) in c.children.iter().enumerate() {
-            let selected = i == sub_cursor;
-            let cursor = if selected && focused { "▸ " } else { "  " };
-            let cursor_color = if selected && focused { palette().love } else { palette().muted };
-            let glyph = state_glyph(&child.state_kind);
-            let glyph_color = linear_state_color(&child.state);
-            let style = if selected && focused {
-                Style::default().fg(palette().text).bg(palette().highlight_low)
-            } else {
-                Style::default().fg(palette().text)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(cursor, Style::default().fg(cursor_color)),
-                Span::styled(
-                    format!("{}  ", child.identifier),
-                    Style::default().fg(palette().iris),
-                ),
-                Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-                Span::styled(child.title.clone(), style),
-            ]));
-        }
-    }
-
-    // Footer
-    lines.push(Line::raw(""));
-    let footer = if c.children.is_empty() {
-        " Esc back · u parent · p project · o browser"
-    } else {
-        " j/k navigate · Enter drill · u parent · p project · o browser · Esc back"
-    };
-    lines.push(Line::styled(footer, Style::default().fg(palette().muted)));
-
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// When the user has the Linear tab focused with a cursored row, the
-/// log pane renders that issue's preview instead of orchestrator
-/// runs. Returns the key + a discriminator (List vs Detail-stack-top)
-/// when a preview should render; None to fall back to log.
-fn linear_preview_target(app: &App, cache: &crate::cache::LinearCache) -> Option<String> {
-    if app.focus != Pane::Right || app.detail_tab != Tab::Linear {
-        return None;
-    }
-    match &app.linear_view {
-        LinearView::List { cursor_key, .. } if !cursor_key.is_empty() => {
-            Some(cursor_key.clone())
-        }
-        LinearView::Detail { stack, sub_cursor } => {
-            // Preview the cursored sub-issue (children of the top-of-stack).
-            let cur = stack.last()?;
-            let kid = cache.issues.get(cur)?.children.get(*sub_cursor)?;
-            Some(kid.identifier.clone())
-        }
-        _ => None,
-    }
 }
 
 /// Full-screen `render_pr_detail`: 40-col file list + toast overlay
@@ -2106,7 +1198,7 @@ fn render_pr_detail_fullscreen(
     }
 }
 
-/// PR detail view — Linear-flavored two-pane: file list left, diff right.
+/// PR detail view: file list left, diff right.
 /// Tab toggles `PrDetailFocus::Files ↔ Diff`.
 ///
 /// Layout (no horizontal rules — content-forward, alignment does the work):
@@ -2136,13 +1228,12 @@ fn render_pr_detail_with_widths(
 
     // Row 0 — title with right-aligned state badge.
     let title = pr.map(|p| p.title.clone()).unwrap_or_default();
-    let state_badge: Option<(&str, ratatui::style::Color)> = pr.and_then(|p| {
-        match p.state.as_str() {
+    let state_badge: Option<(&str, ratatui::style::Color)> =
+        pr.and_then(|p| match p.state.as_str() {
             "MERGED" => Some(("merged", palette().iris)),
             "CLOSED" => Some(("closed", palette().muted)),
             _ => None,
-        }
-    });
+        });
     let id_text = format!(" #{number}");
     let badge_text = state_badge.map(|(t, _)| t).unwrap_or("");
     let reserved = id_text.chars().count()
@@ -2162,7 +1253,12 @@ fn render_pr_detail_with_widths(
     }
     frame.render_widget(
         Paragraph::new(Line::from(row0)),
-        Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        },
     );
 
     // Row 1 — meta strip. Single cadence: `  ·  ` between groups.
@@ -2180,7 +1276,10 @@ fn render_pr_detail_with_widths(
         });
         meta.push(match c.codex.as_str() {
             "ThumbsUp" => Span::styled("  ·  ✓ codex", Style::default().fg(palette().pine)),
-            "Commented" => Span::styled("  ·  · codex commented", Style::default().fg(palette().gold)),
+            "Commented" => Span::styled(
+                "  ·  · codex commented",
+                Style::default().fg(palette().gold),
+            ),
             _ => Span::styled("  ·  · codex", Style::default().fg(palette().muted)),
         });
         let age = relative_age(&c.updated_at);
@@ -2205,12 +1304,20 @@ fn render_pr_detail_with_widths(
             Style::default().fg(palette().muted),
         ));
         if c.mergeable.as_deref() == Some("CONFLICTING") {
-            meta.push(Span::styled("  ·  ⚠ conflict", Style::default().fg(palette().gold)));
+            meta.push(Span::styled(
+                "  ·  ⚠ conflict",
+                Style::default().fg(palette().gold),
+            ));
         }
     }
     frame.render_widget(
         Paragraph::new(Line::from(meta)),
-        Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 },
+        Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: 1,
+        },
     );
 
     // Row 2 — blank gap.
@@ -2218,9 +1325,11 @@ fn render_pr_detail_with_widths(
 
     // Optional row 3 — stale-diff banner.
     let stale = match (pr, diff) {
-        (Some(p), Some(d)) if !p.head_sha.is_empty()
-            && !d.head_sha.is_empty()
-            && p.head_sha != d.head_sha => true,
+        (Some(p), Some(d))
+            if !p.head_sha.is_empty() && !d.head_sha.is_empty() && p.head_sha != d.head_sha =>
+        {
+            true
+        }
         _ => false,
     };
     if stale {
@@ -2229,7 +1338,12 @@ fn render_pr_detail_with_widths(
                 " diff stale (head moved) · r refresh",
                 Style::default().fg(palette().gold),
             )),
-            Rect { x: area.x, y: area.y + body_top, width: area.width, height: 1 },
+            Rect {
+                x: area.x,
+                y: area.y + body_top,
+                width: area.width,
+                height: 1,
+            },
         );
         body_top = body_top.saturating_add(2); // banner + 1 blank
     }
@@ -2246,8 +1360,12 @@ fn render_pr_detail_with_widths(
     // Footer.
     if focused {
         let hint = match focus {
-            PrDetailFocus::Files => " j/k file · Tab diff · ]/[ next/prev · r refresh · o browser · Esc back",
-            PrDetailFocus::Diff => " j/k scroll · H/L hunk · Tab files · ]/[ next/prev · r refresh · o browser · Esc back",
+            PrDetailFocus::Files => {
+                " j/k file · Tab diff · ]/[ next/prev · r refresh · o browser · Esc back"
+            }
+            PrDetailFocus::Diff => {
+                " j/k scroll · H/L hunk · Tab files · ]/[ next/prev · r refresh · o browser · Esc back"
+            }
         };
         frame.render_widget(
             Paragraph::new(Line::styled(hint, Style::default().fg(palette().muted))),
@@ -2264,13 +1382,19 @@ fn render_pr_detail_with_widths(
     let Some(d) = diff else {
         let mut lines = vec![Line::raw("")];
         if pr.map(|p| p.head_sha.is_empty()).unwrap_or(true) {
-            lines.push(Line::styled(" PR metadata not yet fetched.", Style::default().fg(palette().muted)));
+            lines.push(Line::styled(
+                " PR metadata not yet fetched.",
+                Style::default().fg(palette().muted),
+            ));
             lines.push(Line::styled(
                 " Wait for the next PR loop cycle (~30s) or restart `orch daemon`.",
                 Style::default().fg(palette().subtle),
             ));
         } else {
-            lines.push(Line::styled(" diff loading…", Style::default().fg(palette().muted)));
+            lines.push(Line::styled(
+                " diff loading…",
+                Style::default().fg(palette().muted),
+            ));
             lines.push(Line::styled(
                 " (refreshing in the background; press r to retry)",
                 Style::default().fg(palette().subtle),
@@ -2313,7 +1437,10 @@ fn render_pr_detail_with_widths(
 
     if d.files.is_empty() {
         frame.render_widget(
-            Paragraph::new(Line::styled(" no changes", Style::default().fg(palette().muted))),
+            Paragraph::new(Line::styled(
+                " no changes",
+                Style::default().fg(palette().muted),
+            )),
             body_area,
         );
         return;
@@ -2582,7 +1709,6 @@ fn build_pr_diff_lines(
     (lines, hunk_anchors)
 }
 
-
 /// Split `@@ -a,b +c,d @@ context` into ("@@ -a,b +c,d @@", "context").
 fn split_hunk_header(header: &str) -> Option<(&str, &str)> {
     // Find the SECOND "@@".
@@ -2625,7 +1751,7 @@ fn pr_preview_target(app: &App) -> Option<u32> {
 }
 
 /// Render a PR preview into the log-pane area: title, meta strip, churn
-/// stats, top files by churn. Linear-flavored — content-forward, no
+/// stats and top files by churn. Content-forward, with no
 /// dividers.
 fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
     let pr_cache = crate::cache::read_prs();
@@ -2788,235 +1914,6 @@ fn render_pr_preview(frame: &mut Frame, area: Rect, number: u32) {
     frame.render_widget(Paragraph::new(lines), body_area);
 }
 
-/// Render an issue preview into the log-pane area: title, meta line,
-/// description (wrapped, truncated to fit). Source of truth is the
-/// shared `linear.json` cache. Sub-issues aren't fetched as top-level
-/// entries; their preview is rendered from the parent's `children`
-/// data (title, state, assignee — the subset Linear returns inline).
-fn render_linear_preview(frame: &mut Frame, area: Rect, key: &str, cache: &crate::cache::LinearCache) {
-    let cached = cache.issues.get(key);
-
-    let header = format!(" preview: {key}");
-    frame.render_widget(
-        Paragraph::new(Line::styled(header, Style::default().fg(palette().muted))),
-        Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: 1,
-        },
-    );
-
-    let body_area = Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: area.height.saturating_sub(1),
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    let Some(c) = cached else {
-        if let Some((parent_key, child)) = find_child_in_cache(&cache, key) {
-            render_child_preview(frame, body_area, parent_key, child);
-            return;
-        }
-        if cache.not_found.contains(&key.to_string()) {
-            lines.push(Line::styled(
-                " not on Linear",
-                Style::default().fg(palette().love),
-            ));
-        } else {
-            lines.push(Line::styled(
-                " loading…",
-                Style::default().fg(palette().muted),
-            ));
-        }
-        frame.render_widget(Paragraph::new(lines), body_area);
-        return;
-    };
-
-    // Title
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(c.title.clone(), Style::default().fg(palette().text)),
-    ]));
-
-    // Meta: state · age · assignee · project · sub-count
-    let state_color = linear_state_color(&c.state);
-    let mut meta: Vec<Span> = vec![
-        Span::raw(" "),
-        Span::styled(
-            format!("{} {}", state_glyph(&c.state_kind), c.state),
-            Style::default().fg(state_color),
-        ),
-    ];
-    let age = relative_age(&c.updated_at);
-    if !age.is_empty() {
-        meta.push(Span::styled(
-            format!("  ·  {age}"),
-            Style::default().fg(palette().muted),
-        ));
-    }
-    if !c.assignee.is_empty() {
-        meta.push(Span::styled(
-            format!("  ·  @{}", c.assignee),
-            Style::default().fg(palette().muted),
-        ));
-    }
-    if let Some(p) = &c.project {
-        meta.push(Span::styled(
-            format!("  ·  {}", p.name),
-            Style::default().fg(palette().muted),
-        ));
-    }
-    if let Some(parent_key) = &c.parent_key {
-        let title = c.parent_title.clone().unwrap_or_default();
-        meta.push(Span::styled(
-            format!("  ·  parent {parent_key} {title}"),
-            Style::default().fg(palette().muted),
-        ));
-    }
-    lines.push(Line::from(meta));
-
-    if !c.description.is_empty() {
-        lines.push(Line::raw(""));
-        let width = (body_area.width.saturating_sub(2) as usize).max(20);
-        let wrapped = wrap_text(&c.description, width);
-        let body_room = (body_area.height as usize).saturating_sub(lines.len());
-        let take = if wrapped.len() > body_room {
-            body_room.saturating_sub(1)
-        } else {
-            body_room
-        };
-        for w in wrapped.iter().take(take) {
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(w.clone(), Style::default().fg(palette().subtle)),
-            ]));
-        }
-        if wrapped.len() > take && take > 0 {
-            lines.push(Line::styled(
-                " …",
-                Style::default().fg(palette().muted),
-            ));
-        }
-    }
-
-    frame.render_widget(Paragraph::new(lines), body_area);
-}
-
-/// Find a sub-issue in the cache by walking parents' `children` arrays.
-/// Returns `(parent_key, child)` on match. Sub-issues aren't fetched as
-/// top-level cache entries — the only data we have is the inline subset
-/// Linear returned with the parent.
-fn find_child_in_cache<'a>(
-    cache: &'a crate::cache::LinearCache,
-    key: &str,
-) -> Option<(&'a str, &'a crate::cache::CachedChild)> {
-    for (parent_key, parent) in &cache.issues {
-        if let Some(child) = parent
-            .children
-            .iter()
-            .find(|c| c.identifier == key)
-        {
-            return Some((parent_key.as_str(), child));
-        }
-    }
-    None
-}
-
-/// Render the Linear detail view for a sub-issue. Sub-issues only
-/// carry the inline subset Linear returns with the parent (no
-/// description, project, age) — show what we have plus a parent
-/// pointer instead of stalling on "loading…".
-fn render_child_detail(
-    frame: &mut Frame,
-    area: Rect,
-    key: &str,
-    parent_key: &str,
-    child: &crate::cache::CachedChild,
-    _focused: bool,
-) {
-    let mut lines: Vec<Line> = Vec::new();
-    let state_color = linear_state_color(&child.state);
-    lines.push(Line::from(vec![
-        Span::styled(format!(" {key}"), Style::default().fg(palette().iris)),
-        Span::styled(
-            format!(
-                "  ·  {} {}",
-                state_glyph(&child.state_kind),
-                child.state,
-            ),
-            Style::default().fg(state_color),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(child.title.clone(), Style::default().fg(palette().text)),
-    ]));
-    lines.push(Line::raw(""));
-    if !child.assignee.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(" Assignee  ", Style::default().fg(palette().muted)),
-            Span::styled(
-                format!("@{}", child.assignee),
-                Style::default().fg(palette().text),
-            ),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        Span::styled(" Parent    ", Style::default().fg(palette().muted)),
-        Span::styled(parent_key.to_string(), Style::default().fg(palette().text)),
-    ]));
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " (sub-issue inline data — full description requires open in browser)",
-        Style::default().fg(palette().muted),
-    ));
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " Esc back · u parent · o browser",
-        Style::default().fg(palette().muted),
-    ));
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// Render the limited preview available for a sub-issue: title, state,
-/// assignee, and a pointer to the parent.
-fn render_child_preview(
-    frame: &mut Frame,
-    body_area: Rect,
-    parent_key: &str,
-    child: &crate::cache::CachedChild,
-) {
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(child.title.clone(), Style::default().fg(palette().text)),
-    ]));
-    let state_color = linear_state_color(&child.state);
-    let mut meta: Vec<Span> = vec![
-        Span::raw(" "),
-        Span::styled(
-            format!("{} {}", state_glyph(&child.state_kind), child.state),
-            Style::default().fg(state_color),
-        ),
-    ];
-    if !child.assignee.is_empty() {
-        meta.push(Span::styled(
-            format!("  ·  @{}", child.assignee),
-            Style::default().fg(palette().muted),
-        ));
-    }
-    meta.push(Span::styled(
-        format!("  ·  child of {parent_key}"),
-        Style::default().fg(palette().muted),
-    ));
-    lines.push(Line::from(meta));
-    frame.render_widget(Paragraph::new(lines), body_area);
-}
-
 /// Wrap a text into lines fitting within `width`. Preserves blank lines.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
@@ -3047,41 +1944,6 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Linear priority glyph: 1=urgent, 2=high, 3=medium, 4=low, 0=none.
-fn priority_glyph(priority: u8) -> &'static str {
-    match priority {
-        1 => "P0",
-        2 => "P1",
-        3 => "P2",
-        4 => "P3",
-        _ => "",
-    }
-}
-
-fn priority_color(priority: u8) -> Color {
-    match priority {
-        1 | 2 => palette().love,
-        3 => palette().gold,
-        _ => palette().muted,
-    }
-}
-
-/// Two-char ASCII label for a Linear state-kind category. Pure ASCII
-/// for guaranteed 1-cell-per-char rendering across all terminals.
-/// Color carries the state-kind distinction.
-fn state_glyph(kind: &str) -> &'static str {
-    match kind {
-        "started" => "ip",
-        "completed" => "dn",
-        "canceled" => "cx",
-        "unstarted" => "td",
-        "backlog" => "bk",
-        "triage" => "tr",
-        _ => "··",
-    }
-}
-
-/// "4d ago", "12h ago", "30s ago" from an ISO-8601 timestamp.
 fn relative_age(iso: &str) -> String {
     if iso.is_empty() {
         return String::new();
@@ -3185,17 +2047,6 @@ fn render_tab_panes(frame: &mut Frame, area: Rect, app: &App, task: &TaskView) {
 }
 
 fn render_log(frame: &mut Frame, area: Rect, app: &App) {
-    // When cursor is on a Linear-tab list row, the log pane becomes
-    // a preview of that issue (title + meta + description) so the
-    // user can read details without drilling. Restores to the run
-    // log as soon as focus leaves Linear.
-    if app.focus == Pane::Right && app.detail_tab == Tab::Linear {
-        let cache = crate::cache::read_linear();
-        if let Some(key) = linear_preview_target(app, &cache) {
-            render_linear_preview(frame, area, &key, &cache);
-            return;
-        }
-    }
     if let Some(number) = pr_preview_target(app) {
         render_pr_preview(frame, area, number);
         return;
@@ -3289,14 +2140,14 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
     };
 
     // Clear the overlay area first.
-    frame.render_widget(
-        ratatui::widgets::Clear,
-        overlay,
-    );
+    frame.render_widget(ratatui::widgets::Clear, overlay);
 
     let lines: Vec<Line> = if pr_detail {
         vec![
-            Line::styled(" key bindings — PR detail (fullscreen)", Style::default().fg(palette().love)),
+            Line::styled(
+                " key bindings — PR detail (fullscreen)",
+                Style::default().fg(palette().love),
+            ),
             Line::styled("─".repeat(w as usize), Style::default().fg(palette().muted)),
             kv_line("  Esc      ", "back to PR list (saves position)"),
             kv_line("  Tab      ", "toggle Files ↔ Diff focus"),
@@ -3307,7 +2158,10 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
             kv_line("  o        ", "open PR in browser"),
             kv_line("  1-9      ", "attach to task #N"),
             kv_line("  q        ", "quit orch"),
-            Line::styled(" Position is saved per PR — re-Enter restores cursor + scroll", Style::default().fg(palette().muted)),
+            Line::styled(
+                " Position is saved per PR — re-Enter restores cursor + scroll",
+                Style::default().fg(palette().muted),
+            ),
         ]
     } else {
         vec![
@@ -3329,8 +2183,10 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
             Line::styled(" Right zone", Style::default().fg(palette().iris)),
             kv_line("  j k      ", "move cursor in active tab"),
             kv_line("  Enter    ", "open / attach in active tab"),
-            kv_line("  y        ", "Linear: copy cursored ID to clipboard"),
-            Line::styled(" Enter on a PR row → fullscreen lazygit-style diff", Style::default().fg(palette().muted)),
+            Line::styled(
+                " Enter on a PR row → fullscreen lazygit-style diff",
+                Style::default().fg(palette().muted),
+            ),
         ]
     };
 
@@ -3340,10 +2196,7 @@ fn render_help_overlay_inner(frame: &mut Frame, area: Rect, pr_detail: bool) {
         width: overlay.width.saturating_sub(2),
         height: overlay.height.saturating_sub(2),
     };
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        text_area,
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text_area);
 
     // Border around overlay.
     use ratatui::widgets::{Block, Borders};
@@ -3379,7 +2232,7 @@ fn status_str(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Ready => "ready",
         TaskStatus::Working => "working",
-        TaskStatus::Input => "input",
+        TaskStatus::Unknown => "unknown",
         TaskStatus::Idle => "idle",
         TaskStatus::Paused => "paused",
         TaskStatus::Attached => "attach",
@@ -3387,30 +2240,11 @@ fn status_str(status: TaskStatus) -> &'static str {
     }
 }
 
-/// Color a Linear workflow state name. Falls back to the muted color for
-/// unknowns (including the loading-stub `manual, loading…`).
-fn linear_state_color(state: &str) -> Color {
-    let lower = state.to_lowercase();
-    if lower.contains("progress") {
-        palette().foam
-    } else if lower.contains("done") || lower.contains("complete") {
-        palette().pine
-    } else if lower.contains("review") {
-        palette().gold
-    } else if lower.contains("cancel") {
-        palette().love
-    } else if lower.contains("backlog") || lower.contains("todo") {
-        palette().iris
-    } else {
-        palette().muted
-    }
-}
-
 fn status_color(status: TaskStatus) -> Color {
     match status {
         TaskStatus::Ready => palette().pine,
         TaskStatus::Working => palette().foam,
-        TaskStatus::Input => palette().gold,
+        TaskStatus::Unknown => palette().gold,
         TaskStatus::Paused => palette().iris,
         TaskStatus::Idle | TaskStatus::Attached => palette().muted,
         TaskStatus::Error => palette().love,
@@ -3465,21 +2299,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         (KeyCode::Esc, _) => {
-            // Layered Esc: modal cancel, Linear detail -> list,
-            // right focus -> list focus, list focus -> quit.
-            if app.focus == Pane::Right
-                && app.detail_tab == Tab::Linear
-            {
-                if let LinearView::Detail { stack, .. } = &app.linear_view {
-                    let cursor = stack.first().cloned().unwrap_or_default();
-                    app.linear_view = LinearView::List {
-                        cursor_key: cursor,
-                        pinned: HashSet::new(),
-                    };
-                    if was_toasted { app.toast = None; }
-                    return;
-                }
-            }
             // PR drill: pop Detail back to List in one Esc (no stack).
             // Saves position so re-entering restores file_cursor + scroll.
             if app.focus == Pane::Right
@@ -3541,7 +2360,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             cycle_detail_tab(app, true);
         }
         // Navigate tasks from any focus — useful for cycling through
-        // tasks while staying in a detail tab (Linear, PRs, etc) without
+        // tasks while staying in a detail tab without
         // needing to Tab/Esc back to the list.
         (KeyCode::Char(']'), _) => {
             // In PR Detail: next file. Otherwise: next task.
@@ -3553,7 +2372,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             } else if app.selected + 1 < app.tasks.len() {
                 app.selected += 1;
                 app.panes_selected = 0;
-                reset_linear_cursor_for_new_task(app);
+                reset_detail_cursor_for_new_task(app);
             }
         }
         (KeyCode::Char('['), _) => {
@@ -3565,7 +2384,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.selected = app.selected.saturating_sub(1);
                 app.panes_selected = 0;
-                reset_linear_cursor_for_new_task(app);
+                reset_detail_cursor_for_new_task(app);
             }
         }
         // Global log controls.
@@ -3602,13 +2421,13 @@ fn handle_list_key(app: &mut App, key: KeyEvent) {
             if app.selected + 1 < app.tasks.len() {
                 app.selected += 1;
                 app.panes_selected = 0;
-                reset_linear_cursor_for_new_task(app);
+                reset_detail_cursor_for_new_task(app);
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
             app.selected = app.selected.saturating_sub(1);
             app.panes_selected = 0;
-            reset_linear_cursor_for_new_task(app);
+            reset_detail_cursor_for_new_task(app);
         }
         KeyCode::Char('h') | KeyCode::Left if !matches!(app.pr_view, PrView::Detail { .. }) => {
             app.focus = Pane::List;
@@ -3653,8 +2472,6 @@ fn cycle_detail_tab(app: &mut App, forward: bool) {
     };
     if app.detail_tab == Tab::Prs {
         ensure_pr_cursor(app);
-    } else if app.detail_tab == Tab::Linear {
-        ensure_linear_cursor(app);
     }
 }
 
@@ -3708,12 +2525,10 @@ fn reorder_selected(app: &mut App, delta: isize) {
     }
 }
 
-fn lifecycle_op(
-    app: &mut App,
-    label: &str,
-    f: fn(&str, &str) -> Result<String, String>,
-) {
-    let Some(task) = app.selected_task() else { return };
+fn lifecycle_op(app: &mut App, label: &str, f: fn(&str, &str) -> Result<String, String>) {
+    let Some(task) = app.selected_task() else {
+        return;
+    };
     let name = task.name.clone();
     let session = task.record.tmux.session_name.clone();
     match f(&name, &session) {
@@ -3826,7 +2641,7 @@ fn lifecycle_pause(name: &str, session: &str) -> Result<String, String> {
 fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
     let store = store::Store::default();
     let Some(record) = store.load_record_by_slug(name) else {
-        return Err(format!("no task '{name}'"))
+        return Err(format!("no task '{name}'"));
     };
     let id = record.id;
     let worktree_path = record.worktree.path.clone();
@@ -3894,7 +2709,6 @@ fn lifecycle_close(name: &str, session: &str) -> Result<String, String> {
     })
 }
 
-
 /// Right-zone key dispatch. j/k always means "move cursor in active
 /// tab"; Enter always means "act on cursored item".
 fn handle_right_key(app: &mut App, key: KeyEvent) {
@@ -3921,28 +2735,6 @@ fn handle_right_key(app: &mut App, key: KeyEvent) {
                     app.should_quit = true;
                 }
             }
-        }
-        // Linear tab — drill state machine.
-        (Tab::Linear, KeyCode::Char('j')) | (Tab::Linear, KeyCode::Down) => {
-            handle_linear_down(app);
-        }
-        (Tab::Linear, KeyCode::Char('k')) | (Tab::Linear, KeyCode::Up) => {
-            handle_linear_up(app);
-        }
-        (Tab::Linear, KeyCode::Enter) => {
-            handle_linear_enter(app);
-        }
-        (Tab::Linear, KeyCode::Char('u')) => {
-            handle_linear_parent(app);
-        }
-        (Tab::Linear, KeyCode::Char('p')) => {
-            handle_linear_open_project(app);
-        }
-        (Tab::Linear, KeyCode::Char('o')) => {
-            handle_linear_open_browser(app);
-        }
-        (Tab::Linear, KeyCode::Char('y')) => {
-            handle_linear_copy_id(app);
         }
         // PR tab.
         (Tab::Prs, KeyCode::Char('j')) | (Tab::Prs, KeyCode::Down) => {
@@ -3998,14 +2790,7 @@ fn handle_right_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Reset cursor_key when the user moves to a different task, since
-/// the previously-cursored Linear key likely doesn't exist on the
-/// new task. Also collapses pinned-open parents.
-fn reset_linear_cursor_for_new_task(app: &mut App) {
-    // Drop any drilled detail view and clear the list cursor so the
-    // Linear pane re-anchors to the newly selected task's links.
-    app.linear_view = LinearView::default();
-    // Same for PRs — re-anchor cursor to first PR of new task.
+fn reset_detail_cursor_for_new_task(app: &mut App) {
     app.pr_view = PrView::default();
 }
 
@@ -4302,269 +3087,6 @@ fn handle_pr_open_browser(app: &App) {
         .status();
 }
 
-/// Initialize cursor_key to the first linked issue when entering the
-/// Linear tab on a task that has linked issues. No-op if a cursor is
-/// already set or the task has none.
-fn ensure_linear_cursor(app: &mut App) {
-    let first_key = app
-        .tasks
-        .get(app.selected)
-        .and_then(|t| t.linear.first().map(|s| s.key.clone()));
-    if let LinearView::List { cursor_key, .. } = &mut app.linear_view {
-        if cursor_key.is_empty() {
-            if let Some(k) = first_key {
-                *cursor_key = k;
-            }
-        }
-    }
-}
-
-/// Move the linear-list cursor by `delta` rows. Walks the visible
-/// flat row stream (parents + expanded children); skips project headers
-/// and "+ N more" markers. Computes rows from the *current* cursor
-/// state, then commits to the `delta`-th targetable row from the
-/// current position.
-fn move_linear_cursor(app: &mut App, delta: isize) {
-    let cache = crate::cache::read_linear();
-    let stubs = match app.tasks.get(app.selected) {
-        Some(t) => t.linear.clone(),
-        None => return,
-    };
-    if stubs.is_empty() {
-        return;
-    }
-    let (cursor_key, pinned) = match &app.linear_view {
-        LinearView::List { cursor_key, pinned } => (cursor_key.clone(), pinned.clone()),
-        _ => return,
-    };
-    let rows = build_linear_rows(&stubs, &cache, &cursor_key, &pinned);
-    let targets = cursor_targets(&rows);
-    if targets.is_empty() {
-        return;
-    }
-    let cur_pos = targets
-        .iter()
-        .position(|&i| rows[i].key == cursor_key)
-        .unwrap_or(0);
-    let new_pos = (cur_pos as isize + delta)
-        .clamp(0, targets.len() as isize - 1) as usize;
-    let new_key = rows[targets[new_pos]].key.clone();
-    if let LinearView::List { cursor_key, .. } = &mut app.linear_view {
-        *cursor_key = new_key;
-    }
-}
-
-fn handle_linear_down(app: &mut App) {
-    if matches!(app.linear_view, LinearView::Detail { .. }) {
-        if let LinearView::Detail { stack, sub_cursor, .. } = &mut app.linear_view {
-            let cache = crate::cache::read_linear();
-            let n = stack
-                .last()
-                .and_then(|k| cache.issues.get(k))
-                .map(|c| c.children.len())
-                .unwrap_or(0);
-            if *sub_cursor + 1 < n {
-                *sub_cursor += 1;
-            }
-        }
-        return;
-    }
-    move_linear_cursor(app, 1);
-}
-
-fn handle_linear_up(app: &mut App) {
-    if matches!(app.linear_view, LinearView::Detail { .. }) {
-        if let LinearView::Detail { sub_cursor, .. } = &mut app.linear_view {
-            *sub_cursor = sub_cursor.saturating_sub(1);
-        }
-        return;
-    }
-    move_linear_cursor(app, -1);
-}
-
-fn handle_linear_enter(app: &mut App) {
-    let cache = crate::cache::read_linear();
-    match &mut app.linear_view {
-        LinearView::List { cursor_key, .. } => {
-            if !cursor_key.is_empty() {
-                app.linear_view = LinearView::Detail {
-                    stack: vec![cursor_key.clone()],
-                    sub_cursor: 0,
-                };
-            }
-        }
-        LinearView::Detail { stack, sub_cursor, .. } => {
-            // Drill into the cursored sub-issue.
-            let next = stack
-                .last()
-                .and_then(|k| cache.issues.get(k))
-                .and_then(|c| c.children.get(*sub_cursor))
-                .map(|child| child.identifier.clone());
-            if let Some(k) = next {
-                if stack.len() < 8 {
-                    stack.push(k);
-                    *sub_cursor = 0;
-                }
-            }
-        }
-    }
-}
-
-/// `t` toggles the pinned-open status of the cursored parent (or the
-/// parent of a cursored sub-issue). Sub-issues themselves can't be
-/// pinned — `t` on a sub-issue is a no-op.
-fn handle_linear_toggle_expand(app: &mut App) {
-    let cache = crate::cache::read_linear();
-    let stubs = match app.tasks.get(app.selected) {
-        Some(t) => t.linear.clone(),
-        None => return,
-    };
-    let cursor_key = match &app.linear_view {
-        LinearView::List { cursor_key, .. } => cursor_key.clone(),
-        _ => return,
-    };
-    // Resolve cursor → its parent (cursor itself if it's a parent stub).
-    let parent_key = if stubs.iter().any(|s| s.key == cursor_key) {
-        Some(cursor_key)
-    } else {
-        stubs
-            .iter()
-            .find(|s| {
-                cache
-                    .issues
-                    .get(&s.key)
-                    .map(|c| c.children.iter().any(|ch| ch.identifier == cursor_key))
-                    .unwrap_or(false)
-            })
-            .map(|s| s.key.clone())
-    };
-    if let Some(p) = parent_key {
-        if let LinearView::List { pinned, .. } = &mut app.linear_view {
-            if pinned.contains(&p) {
-                pinned.remove(&p);
-            } else {
-                pinned.insert(p);
-            }
-        }
-    }
-}
-
-fn handle_linear_parent(app: &mut App) {
-    let cache = crate::cache::read_linear();
-    if let LinearView::Detail { stack, sub_cursor, .. } = &mut app.linear_view {
-        let parent = stack
-            .last()
-            .and_then(|k| cache.issues.get(k))
-            .and_then(|c| c.parent_key.clone());
-        if let Some(p) = parent {
-            if stack.len() < 8 {
-                stack.push(p);
-                *sub_cursor = 0;
-            }
-        }
-    }
-}
-
-fn handle_linear_open_project(app: &mut App) {
-    let cache = crate::cache::read_linear();
-    let project_slug = match &app.linear_view {
-        LinearView::Detail { stack, .. } => stack
-            .last()
-            .and_then(|k| cache.issues.get(k))
-            .and_then(|c| c.project.as_ref())
-            .map(|p| p.slug_id.clone()),
-        LinearView::List { cursor_key, .. } => cache
-            .issues
-            .get(cursor_key)
-            .and_then(|c| c.project.as_ref())
-            .map(|p| p.slug_id.clone()),
-    };
-    if let Some(slug) = project_slug {
-        if !slug.is_empty() {
-            open_url(&format!("{}/project/{slug}", linear_workspace_url()));
-        }
-    }
-}
-
-fn handle_linear_open_browser(app: &mut App) {
-    let cache = crate::cache::read_linear();
-    let key: Option<String> = match &app.linear_view {
-        LinearView::Detail { stack, .. } => stack.last().cloned(),
-        LinearView::List { cursor_key, .. } if !cursor_key.is_empty() => {
-            Some(cursor_key.clone())
-        }
-        _ => None,
-    };
-    let Some(key) = key else { return };
-
-    // Top-level cache hit — use the canonical URL Linear returned.
-    if let Some(c) = cache.issues.get(&key) {
-        if !c.url.is_empty() {
-            open_url(&c.url);
-            return;
-        }
-    }
-
-    // Sub-issue fallback: derive `https://linear.app/<ws>/issue/<KEY>`
-    // from the parent's URL by stripping the slug. Linear redirects
-    // bare-identifier URLs to the canonical slug.
-    if let Some((parent_key, _)) = find_child_in_cache(&cache, &key) {
-        if let Some(parent) = cache.issues.get(parent_key) {
-            if let Some(prefix) = parent.url.split("/issue/").next() {
-                if !prefix.is_empty() {
-                    open_url(&format!("{prefix}/issue/{key}"));
-                    return;
-                }
-            }
-        }
-    }
-
-    // Last-resort fallback — Linear accepts the bare identifier path
-    // even without a workspace prefix, redirecting to the user's last-
-    // visited workspace. Better than silently failing.
-    open_url(&format!("https://linear.app/issue/{key}"));
-}
-
-fn handle_linear_copy_id(app: &mut App) {
-    let cache = crate::cache::read_linear();
-    let Some(key) = linear_preview_target(app, &cache) else {
-        return;
-    };
-    if copy_to_clipboard(&key) {
-        app.toast = Some(format!("copied {key}"));
-    } else {
-        app.toast = Some("pbcopy failed".to_string());
-    }
-}
-
-fn copy_to_clipboard(s: &str) -> bool {
-    use std::io::Write;
-    let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else {
-        return false;
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(s.as_bytes()).is_err() {
-            return false;
-        }
-    }
-    child.wait().map(|s| s.success()).unwrap_or(false)
-}
-
-fn open_url(url: &str) {
-    let _ = std::process::Command::new("open")
-        .arg(url)
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-fn linear_workspace_url() -> String {
-    std::env::var("ORCH_LINEAR_WORKSPACE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| "https://linear.app".to_string())
-}
-
 fn handle_message_input_key(app: &mut App, key: KeyEvent) {
     let Some(buf) = app.message_input.as_mut() else {
         return;
@@ -4599,7 +3121,9 @@ fn attach_pane(session: &str, pane_id: &str) {
 }
 
 fn attach(session: &str, pane_id: Option<&str>) {
-    let Some(actual) = find_actual_session(session) else { return };
+    let Some(actual) = find_actual_session(session) else {
+        return;
+    };
     let in_tmux = std::env::var("TMUX").is_ok();
     let action = if in_tmux { "switch-client" } else { "attach-session" };
     let _ = Command::new("tmux").args([action, "-t", &actual]).status();
@@ -4691,22 +3215,13 @@ fn send_message(msg: &str) {
 // Debug rendering — dumps the current TUI to stdout at a fixed size.
 // Useful for diagnosing layout without an interactive terminal.
 
-pub fn render_debug(
-    width: u16,
-    height: u16,
-    tab: &str,
-    focus: &str,
-    select: usize,
-    linear_detail: Option<&str>,
-    linear_cursor: Option<&str>,
-) {
+pub fn render_debug(width: u16, height: u16, tab: &str, focus: &str, select: usize) {
     use ratatui::backend::TestBackend;
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("debug backend");
     let mut app = App::new();
     app.detail_tab = match tab.to_lowercase().as_str() {
         "prs" => Tab::Prs,
-        "linear" => Tab::Linear,
         "panes" => Tab::Panes,
         _ => Tab::Overview,
     };
@@ -4717,24 +3232,6 @@ pub fn render_debug(
     };
     if select < app.tasks.len() {
         app.selected = select;
-    }
-    if let Some(key) = linear_detail {
-        app.detail_tab = Tab::Linear;
-        app.focus = Pane::Right;
-        app.linear_view = LinearView::Detail {
-            stack: vec![key.to_string()],
-            sub_cursor: 0,
-        };
-    } else if let Some(key) = linear_cursor {
-        app.detail_tab = Tab::Linear;
-        app.focus = Pane::Right;
-        app.linear_view = LinearView::List {
-            cursor_key: key.to_string(),
-            pinned: HashSet::new(),
-        };
-        app.linear_list_offset = 0;
-    } else if app.detail_tab == Tab::Linear {
-        ensure_linear_cursor(&mut app);
     }
     terminal.draw(|f| render(f, &mut app)).expect("debug draw");
     let buffer = terminal.backend().buffer().clone();
@@ -4833,13 +3330,6 @@ mod tests {
                         active: false,
                     },
                 ],
-                linear: vec![LinearStub {
-                    key: "ENG-29151".into(),
-                    title: "(stub: ENG-29151)".into(),
-                    state: "—".into(),
-                    assignee: None,
-                    depth: 0,
-                }],
             },
             TaskView {
                 name: "ach-sanitize".into(),
@@ -4856,7 +3346,6 @@ mod tests {
                 status: TaskStatus::Paused,
                 prs: vec![],
                 panes: vec![],
-                linear: vec![],
             },
             TaskView {
                 name: "fresh-task".into(),
@@ -4868,7 +3357,6 @@ mod tests {
                 status: TaskStatus::Idle,
                 prs: vec![],
                 panes: vec![],
-                linear: vec![],
             },
         ]
     }
@@ -4880,8 +3368,6 @@ mod tests {
             focus: Pane::List,
             detail_tab: Tab::Overview,
             panes_selected: 0,
-            linear_view: LinearView::default(),
-            linear_list_offset: 0,
             pr_view: PrView::default(),
             pr_detail_state: HashMap::new(),
             log: LogPane {
@@ -4980,48 +3466,6 @@ mod tests {
         assert_eq!(next_selection(5, None, &[]), 0);
     }
 
-    #[test]
-    fn task_navigation_resets_drilled_linear_view() {
-        let mut app = test_app();
-        // Simulate the user drilled into a Linear issue from the
-        // previously-selected task.
-        app.linear_view = LinearView::Detail {
-            stack: vec!["ENG-29215".into()],
-            sub_cursor: 0,
-        };
-        // Move task selection forward.
-        reset_linear_cursor_for_new_task(&mut app);
-        // Drilled state must be discarded so the Linear pane re-anchors.
-        assert!(matches!(app.linear_view, LinearView::Detail { .. }) == false);
-        match &app.linear_view {
-            LinearView::List { cursor_key, pinned } => {
-                assert!(cursor_key.is_empty());
-                assert!(pinned.is_empty());
-            }
-            _ => panic!("expected LinearView::List after reset"),
-        }
-    }
-
-    #[test]
-    fn task_navigation_resets_list_cursor_and_pinned() {
-        let mut app = test_app();
-        // Cursor at a sub-issue, parent pinned open.
-        let mut pinned: HashSet<String> = HashSet::new();
-        pinned.insert("ENG-28816".into());
-        app.linear_view = LinearView::List {
-            cursor_key: "ENG-29215".into(),
-            pinned,
-        };
-        reset_linear_cursor_for_new_task(&mut app);
-        match &app.linear_view {
-            LinearView::List { cursor_key, pinned } => {
-                assert!(cursor_key.is_empty());
-                assert!(pinned.is_empty());
-            }
-            _ => panic!("expected LinearView::List after reset"),
-        }
-    }
-
     fn render_to_string(app: &App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -5049,8 +3493,8 @@ mod tests {
         // Right top: tab bar with Overview selected.
         assert!(s.contains("Overview"));
         assert!(s.contains("PRs 1"));
-        assert!(s.contains("Linear 1"));
         assert!(s.contains("Panes 2"));
+        assert!(!s.contains("Linear"));
         assert!(s.contains("j/k move · Enter attach"));
         // Activity is hidden by default.
         assert!(!s.contains("activity"));
@@ -5131,15 +3575,6 @@ mod tests {
         assert!(s.contains("#25163"));
         assert!(s.contains("Fix bene-matching boundary"));
         assert!(s.contains("ci"));
-    }
-
-    #[test]
-    fn snapshot_detail_tab_linear() {
-        let mut app = test_app();
-        app.focus = Pane::Right;
-        app.detail_tab = Tab::Linear;
-        let s = render_to_string(&app, 100, 25);
-        assert!(s.contains("ENG-29151"));
     }
 
     #[test]
@@ -5225,9 +3660,7 @@ mod tests {
     fn pr_detail_hunk_jump_uses_real_anchors() {
         // Build a synthetic diff cache with two hunks so H/L can move
         // scroll between known anchor rows.
-        use crate::cache::{
-            CachedPrDiff, CachedPrDiffFile, CachedPrDiffHunk, PrDiffCache,
-        };
+        use crate::cache::{CachedPrDiff, CachedPrDiffFile, CachedPrDiffHunk, PrDiffCache};
         let dir = std::env::temp_dir().join("orch-test-hunk-jump");
         // Best-effort isolation — the live cache is at ~/tasks/.orch/cache.
         // We only verify the build_pr_diff_lines anchor math, not the
@@ -5313,98 +3746,6 @@ mod tests {
     }
 
     #[test]
-    fn linear_enter_seeds_ancestor_stack() {
-        // ENG-29151 is a child of ENG-28816 in the live test cache.
-        // Entering on a sub-issue should seed the stack with parents
-        // so Esc walks back through the hierarchy: cursor → parent → list.
-        let mut app = test_app();
-        app.focus = Pane::Right;
-        app.detail_tab = Tab::Linear;
-        app.linear_view = LinearView::List {
-            cursor_key: "ENG-29151".into(),
-            pinned: HashSet::new(),
-        };
-        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
-        match &app.linear_view {
-            LinearView::Detail { stack, sub_cursor } => {
-                // Stack starts with just the cursored issue; `u` walks
-                // up the parent chain. Esc returns to the list with
-                // cursor restored to stack[0].
-                assert_eq!(stack, &vec!["ENG-29151".to_string()]);
-                assert_eq!(*sub_cursor, 0);
-            }
-            _ => panic!("expected Detail view, got {:?}", app.linear_view),
-        }
-    }
-
-    #[test]
-    fn linear_esc_returns_to_list() {
-        let mut app = test_app();
-        app.focus = Pane::Right;
-        app.detail_tab = Tab::Linear;
-        app.linear_view = LinearView::Detail {
-            stack: vec!["ENG-1".into(), "ENG-2".into()],
-            sub_cursor: 0,
-        };
-        // Single Esc collapses the whole stack back to List with the
-        // cursor restored to where the user drilled in from.
-        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
-        match &app.linear_view {
-            LinearView::List { cursor_key, .. } => {
-                assert_eq!(cursor_key, "ENG-1");
-            }
-            _ => panic!("expected List, got {:?}", app.linear_view),
-        }
-        // Esc again returns focus to list zone
-        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
-        assert_eq!(app.focus, Pane::List);
-        // Esc from list quits
-        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
-        assert!(app.should_quit);
-    }
-
-    #[test]
-    fn linear_drill_stack_capped() {
-        // Stack pushes are capped at 8 to prevent runaway.
-        let mut app = test_app();
-        app.focus = Pane::Right;
-        app.detail_tab = Tab::Linear;
-        app.linear_view = LinearView::Detail {
-            stack: (0..8).map(|i| format!("ENG-{i}")).collect(),
-            sub_cursor: 0,
-        };
-        // Pushing parent should no-op since stack is at cap; with no
-        // cache entry the parent_key lookup is None anyway, but cap
-        // logic is still tested.
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('u')));
-        match &app.linear_view {
-            LinearView::Detail { stack, .. } => assert_eq!(stack.len(), 8),
-            _ => panic!("expected Detail"),
-        }
-    }
-
-    #[test]
-    fn priority_glyph_mapping() {
-        assert_eq!(priority_glyph(0), "");
-        assert_eq!(priority_glyph(1), "P0");
-        assert_eq!(priority_glyph(2), "P1");
-        assert_eq!(priority_glyph(3), "P2");
-        assert_eq!(priority_glyph(4), "P3");
-    }
-
-    #[test]
-    fn state_glyph_mapping() {
-        // Two-char ASCII labels — guaranteed monospace alignment.
-        assert_eq!(state_glyph("started"), "ip");
-        assert_eq!(state_glyph("completed"), "dn");
-        assert_eq!(state_glyph("canceled"), "cx");
-        assert_eq!(state_glyph("unstarted"), "td");
-        assert_eq!(state_glyph("backlog"), "bk");
-        assert_eq!(state_glyph("triage"), "tr");
-        assert_eq!(state_glyph("unknown"), "··");
-    }
-
-    #[test]
     fn wrap_text_preserves_blank_lines() {
         let s = "line one is here\n\nline two is also here";
         let out = wrap_text(s, 10);
@@ -5423,97 +3764,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_linear_anchor_subissues() {
-        let mut app = test_app();
-        app.focus = Pane::Right;
-        app.detail_tab = Tab::Linear;
-        let task = &mut app.tasks[0];
-        task.linear = vec![
-            LinearStub {
-                key: "ENG-29151".into(),
-                title: "Fix bene-matching boundary".into(),
-                state: "In Progress".into(),
-                assignee: Some("@ashley".into()),
-                depth: 0,
-            },
-            LinearStub {
-                key: "ENG-30210".into(),
-                title: "Tighten name normalize".into(),
-                state: "Backlog".into(),
-                assignee: None,
-                depth: 1,
-            },
-            LinearStub {
-                key: "ENG-30444".into(),
-                title: "Investigate ALERT".into(),
-                state: "Done".into(),
-                assignee: Some("@ashley".into()),
-                depth: 1,
-            },
-        ];
-        let s = render_to_string(&app, 100, 25);
-        // Minimal-list view: stubs render as one-line rows with key +
-        // state glyph + title. Test stubs don't populate cache.issues,
-        // so state_kind is empty and the glyph defaults to muted "·".
-        assert!(s.contains("ENG-29151"));
-    }
-
-    #[test]
-    fn linear_rows_inherit_single_cached_project_for_loading_links() {
-        let stubs = vec![
-            LinearStub {
-                key: "ENG-30528".into(),
-                title: "Fix deposit sweep overdraft allocation".into(),
-                state: "In Progress".into(),
-                assignee: Some("azhou".into()),
-                depth: 0,
-            },
-            LinearStub {
-                key: "ENG-31255".into(),
-                title: String::new(),
-                state: "branch, loading…".into(),
-                assignee: None,
-                depth: 0,
-            },
-        ];
-        let mut cache = crate::cache::LinearCache::default();
-        cache.issues.insert(
-            "ENG-30528".into(),
-            crate::cache::CachedLinear {
-                identifier: "ENG-30528".into(),
-                title: "Fix deposit sweep overdraft allocation".into(),
-                state: "In Progress".into(),
-                state_kind: "started".into(),
-                project: Some(crate::cache::CachedProject {
-                    name: "Ashley Personal".into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        );
-
-        let rows = build_linear_rows(&stubs, &cache, "", &HashSet::new());
-
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.key == "ENG-31255")
-                .map(|row| row.project_for_strip.as_str()),
-            Some("Ashley Personal"),
-        );
-        assert!(!rows.iter().any(|row| row.title == "(no project)"));
-    }
-
-    #[test]
-    fn snapshot_linear_empty() {
-        let mut app = test_app();
-        app.focus = Pane::Right;
-        app.detail_tab = Tab::Linear;
-        app.tasks[0].linear.clear();
-        let s = render_to_string(&app, 100, 25);
-        assert!(s.contains("(no linked Linear issues)"));
-    }
-
-    #[test]
     fn tab_cycling_next_prev() {
         let mut app = test_app();
         app.focus = Pane::List;
@@ -5521,8 +3771,6 @@ mod tests {
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')));
         assert_eq!(app.detail_tab, Tab::Prs);
         assert_eq!(app.focus, Pane::List);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')));
-        assert_eq!(app.detail_tab, Tab::Linear);
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')));
         assert_eq!(app.detail_tab, Tab::Panes);
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')));
@@ -5672,11 +3920,7 @@ mod tests {
 
     #[test]
     fn total_wrapped_rows_handles_long_and_empty() {
-        let lines = vec![
-            "short".to_string(),
-            "".to_string(),
-            "x".repeat(100),
-        ];
+        let lines = vec!["short".to_string(), "".to_string(), "x".repeat(100)];
         // Width 50: "short"=1, ""=1, 100/50=2  -> total 4
         assert_eq!(total_wrapped_rows(&lines, 50), 4);
         // Width 0 falls back to line count

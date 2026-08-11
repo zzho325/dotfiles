@@ -12,7 +12,7 @@ agents/.agents/skills_local/
 claude/.claude/CLAUDE.md
 claude/.claude/settings.local.json
 codex/.codex/AGENTS.md
-monitor.db
+codex/.codex/config.toml
 
 # Rust build artifacts
 orch/target/

@@ -1,5 +1,3 @@
 #!/bin/sh
-# Wrapper: forwards Claude Code's Stop / SessionEnd hook input to
-# `orch busy stop`, which removes the marker written by
-# `orch-busy-start.sh`. See `orch busy --help`.
+# Wrapper: records the current agent session as ready.
 exec "$HOME/bin/orch" busy stop

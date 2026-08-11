@@ -1,0 +1,37 @@
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+approval_policy = "on-request"
+sandbox_mode = "danger-full-access"
+network_access = true
+suppress_unstable_features_warning = true
+web_search = "live"
+allow_login_shell = true
+service_tier = "default"
+
+[shell_environment_policy]
+inherit = "all"
+
+[tui]
+status_line = ["git-branch", "context-used"]
+theme = "rose-pine-dawn-soft-diff"
+status_line_use_colors = true
+session_picker_view = "dense"
+vim_mode_default = true
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4
+"gpt-5.6-sol" = 4
+
+[features]
+multi_agent = true
+voice_transcription = true
+hooks = true
+
+[model_providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+wire_api = "responses"
+
+[notice]
+hide_rate_limit_model_nudge = true

@@ -1,5 +1,3 @@
 #!/bin/sh
-# Wrapper: forwards Claude Code's UserPromptSubmit hook input to
-# `orch busy start`, which writes a marker at
-# $XDG_RUNTIME_DIR/orch/busy/<session_id>. See `orch busy --help`.
+# Wrapper: records the current agent session as working.
 exec "$HOME/bin/orch" busy start
